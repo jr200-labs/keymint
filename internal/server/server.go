@@ -194,11 +194,22 @@ type errorResponse struct {
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	keyName := r.PathValue("key")
 
+	// Sanitize the path segment to a bounded label value for metrics
+	// + spans. Without this, an attacker hitting /token/<random-uuid>
+	// in a loop would explode Prometheus label cardinality and OOM
+	// the pod. The unsanitized name still appears in the user-facing
+	// error message and structured log fields where cardinality is
+	// not a concern.
+	metricKey := metrics.UnknownKey
+	if _, ok := s.cfg.Keys[keyName]; ok {
+		metricKey = keyName
+	}
+
 	// Open a span for the whole handler. Span attributes are filled in
 	// as we learn more (subject, outcome).
 	ctx, span := tracer.Start(r.Context(), "server.handleMint",
 		trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(attribute.String("keymint.key", keyName)),
+		trace.WithAttributes(attribute.String("keymint.key", metricKey)),
 	)
 	defer span.End()
 
@@ -207,7 +218,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		s.metrics.MintInFlight.Inc()
 		defer s.metrics.MintInFlight.Dec()
 		defer func() {
-			s.metrics.MintDuration.WithLabelValues(keyName).Observe(time.Since(start).Seconds())
+			s.metrics.MintDuration.WithLabelValues(metricKey).Observe(time.Since(start).Seconds())
 		}()
 	}
 
@@ -216,7 +227,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// Pre-auth rate limit: per-remote-IP. Cheap, scoped to attacker so
 	// flooders cannot exhaust authenticated callers' budget.
 	if !s.preAuthLimit.allow(remoteIP(r)) {
-		s.recordOutcome(span, keyName, metrics.OutcomeRateLimited)
+		s.recordOutcome(span, metricKey, metrics.OutcomeRateLimited)
 		span.SetStatus(codes.Error, "rate limited (pre-auth)")
 		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 		return
@@ -225,7 +236,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// 1. Extract bearer token
 	bearer, ok := bearerToken(r)
 	if !ok {
-		s.recordOutcome(span, keyName, metrics.OutcomeBadAuth)
+		s.recordOutcome(span, metricKey, metrics.OutcomeBadAuth)
 		span.SetStatus(codes.Error, "missing bearer")
 		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 		return
@@ -237,7 +248,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		if s.metrics != nil {
 			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
 		}
-		s.recordOutcome(span, keyName, metrics.OutcomeTokenReviewError)
+		s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "tokenreview failed")
 		log.Warn("tokenreview failed", zap.Error(err))
@@ -253,7 +264,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// Post-auth rate limit: per-subject. Caps any single legitimate
 	// service that goes haywire.
 	if !s.subjectLimit.allow(subject) {
-		s.recordOutcome(span, keyName, metrics.OutcomeRateLimited)
+		s.recordOutcome(span, metricKey, metrics.OutcomeRateLimited)
 		span.SetStatus(codes.Error, "rate limited (per-subject)")
 		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 		return
@@ -261,17 +272,18 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Allowlist check
 	if !s.subjectMayMint(subject, keyName) {
-		s.recordOutcome(span, keyName, metrics.OutcomeForbidden)
+		s.recordOutcome(span, metricKey, metrics.OutcomeForbidden)
 		span.SetStatus(codes.Error, "forbidden")
 		log.Warn("subject not permitted")
 		writeJSONError(w, http.StatusForbidden, fmt.Sprintf("subject %q not permitted to mint key %q", subject, keyName))
 		return
 	}
 
-	// 4. Look up key
+	// 4. Look up key (already validated when computing metricKey, but
+	// keep an explicit branch for the 404 outcome).
 	keyEntry, ok := s.cfg.Keys[keyName]
 	if !ok {
-		s.recordOutcome(span, keyName, metrics.OutcomeUnknownKey)
+		s.recordOutcome(span, metricKey, metrics.OutcomeUnknownKey)
 		span.SetStatus(codes.Error, "unknown key")
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("key %q not found", keyName))
 		return
@@ -280,14 +292,14 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// 5. Mint
 	token, expiresAt, err := s.mint(ctx, keyEntry)
 	if err != nil {
-		s.recordOutcome(span, keyName, metrics.OutcomeMintError)
+		s.recordOutcome(span, metricKey, metrics.OutcomeMintError)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "mint failed")
 		log.Error("mint failed", zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "mint failed")
 		return
 	}
-	s.recordOutcome(span, keyName, metrics.OutcomeSuccess)
+	s.recordOutcome(span, metricKey, metrics.OutcomeSuccess)
 	span.SetStatus(codes.Ok, "")
 	log.Info("minted")
 
@@ -466,23 +478,48 @@ type tokenReviewResponse struct {
 	} `json:"status"`
 }
 
+// reviewResult carries the outcome of one TokenReview call. We
+// separate infra failures (returned as the outer Go error so the
+// circuit breaker counts them) from caller-side auth rejections
+// (carried in authError so the breaker doesn't count an attacker's
+// invalid tokens against its failure budget).
+type reviewResult struct {
+	subject   string
+	authError error
+}
+
 // Review POSTs a TokenReview to the API server and returns the
 // resolved username on success. The pod's own SA token is re-read
 // from disk on each call so kubelet-rotated projected tokens stay
 // valid for the lifetime of the process. Wrapped in a circuit
-// breaker so the handler fails fast when the apiserver degrades.
+// breaker so the handler fails fast when the apiserver degrades —
+// but caller-side auth rejections are NOT counted as breaker
+// failures, so a flood of invalid tokens cannot trip it and DoS
+// legitimate callers.
 func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, error) {
 	out, err := r.breaker.Execute(func() (interface{}, error) {
 		return r.reviewLocked(ctx, token)
 	})
 	if err != nil {
+		// Infra-level failure or breaker open.
 		return "", err
 	}
-	return out.(string), nil
+	res := out.(reviewResult)
+	if res.authError != nil {
+		// Caller's token was rejected by the apiserver. Surface to
+		// the handler as an error, but the breaker already saw a
+		// successful call so its failure counter is untouched.
+		return "", res.authError
+	}
+	return res.subject, nil
 }
 
 // reviewLocked is the inner implementation invoked by the circuit breaker.
-func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (string, error) {
+// It returns:
+//   - (reviewResult{subject:...}, nil)             on a successfully validated token
+//   - (reviewResult{authError:...}, nil)           on a token the apiserver rejected
+//   - (reviewResult{}, err)                        on infra failure (breaker counts this)
+func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (reviewResult, error) {
 	body, err := json.Marshal(tokenReviewRequest{
 		APIVersion: "authentication.k8s.io/v1",
 		Kind:       "TokenReview",
@@ -492,19 +529,19 @@ func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (stri
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("server: marshal tokenreview: %w", err)
+		return reviewResult{}, fmt.Errorf("server: marshal tokenreview: %w", err)
 	}
 
 	saTokenBytes, err := os.ReadFile(r.saTokenPath)
 	if err != nil {
-		return "", fmt.Errorf("server: read sa token: %w", err)
+		return reviewResult{}, fmt.Errorf("server: read sa token: %w", err)
 	}
 	saToken := strings.TrimSpace(string(saTokenBytes))
 
 	url := r.apiServer + "/apis/authentication.k8s.io/v1/tokenreviews"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("server: build tokenreview request: %w", err)
+		return reviewResult{}, fmt.Errorf("server: build tokenreview request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+saToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -512,35 +549,44 @@ func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (stri
 
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("server: tokenreview POST: %w", err)
+		return reviewResult{}, fmt.Errorf("server: tokenreview POST: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("server: read tokenreview response: %w", err)
+		return reviewResult{}, fmt.Errorf("server: read tokenreview response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("server: tokenreview returned %d: %s", resp.StatusCode, string(respBody))
+		// Apiserver-side issue (HTTP 5xx, our SA token is wrong, etc.).
+		// 401/403 here would mean keymint's own SA token is bad — that
+		// IS an infra problem the breaker should react to.
+		return reviewResult{}, fmt.Errorf("server: tokenreview returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var out tokenReviewResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return "", fmt.Errorf("server: parse tokenreview response: %w", err)
+		return reviewResult{}, fmt.Errorf("server: parse tokenreview response: %w", err)
 	}
+
+	// From here on, the apiserver gave us a normal 2xx + parseable
+	// body. Anything wrong with the *caller's* token is an auth
+	// rejection, NOT an infra failure — surface it via authError so
+	// the breaker doesn't count it.
 	if !out.Status.Authenticated {
-		if out.Status.Error != "" {
-			return "", fmt.Errorf("server: tokenreview not authenticated: %s", out.Status.Error)
+		msg := out.Status.Error
+		if msg == "" {
+			msg = "tokenreview not authenticated"
 		}
-		return "", errors.New("server: tokenreview not authenticated")
+		return reviewResult{authError: fmt.Errorf("server: %s", msg)}, nil
 	}
 	if !audienceIntersect(out.Status.Audiences, r.expectedAudiences) {
-		return "", fmt.Errorf("server: tokenreview returned audiences %v, none match expected %v", out.Status.Audiences, r.expectedAudiences)
+		return reviewResult{authError: fmt.Errorf("server: tokenreview returned audiences %v, none match expected %v", out.Status.Audiences, r.expectedAudiences)}, nil
 	}
 	if out.Status.User.Username == "" {
-		return "", errors.New("server: tokenreview returned empty username")
+		return reviewResult{authError: errors.New("server: tokenreview returned empty username")}, nil
 	}
-	return out.Status.User.Username, nil
+	return reviewResult{subject: out.Status.User.Username}, nil
 }
 
 // audienceIntersect returns true if any audience in got is also in

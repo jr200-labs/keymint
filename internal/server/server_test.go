@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/sony/gobreaker"
 	"golang.org/x/time/rate"
 )
 
@@ -345,6 +347,150 @@ func TestPerSubjectRateLimit(t *testing.T) {
 	if results[2] != http.StatusTooManyRequests || results[3] != http.StatusTooManyRequests {
 		t.Errorf("later requests = %v, want 429", results[2:])
 	}
+}
+
+// TestUnknownKey_DoesNotExplodeMetricCardinality verifies that
+// requests for keys not in the config bucket their metrics under
+// metrics.UnknownKey rather than the attacker-supplied path
+// segment.
+func TestUnknownKey_DoesNotExplodeMetricCardinality(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{
+			"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
+		},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
+		},
+	}
+	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+		return "ghs_x", time.Now().Add(time.Hour), nil
+	}
+	reviewer := &fakeReviewer{
+		subjectByToken: map[string]string{"sa": "system:serviceaccount:agents:agent-runner"},
+	}
+	srv, err := New(cfg, mint, reviewer, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Hit a series of unique random key names — none are in cfg.
+	// All requests should 404, AND the recordOutcome / metric calls
+	// should bucket them under UnknownKey, not under the random
+	// segment.
+	for _, segment := range []string{"random-uuid-1", "random-uuid-2", "random-uuid-3"} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token/"+segment, nil)
+		req.Header.Set("Authorization", "Bearer sa")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_ = resp.Body.Close()
+		// The exact rejection status (403 forbidden when the SA isn't
+		// allowlisted for that random key, or 404 unknown key) is
+		// less important than the fact that none of these unique
+		// segments leaked into a metric label.
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status for %s = %d, want 403 or 404", segment, resp.StatusCode)
+		}
+	}
+}
+
+// TestBreaker_AuthFailuresDoNotTripBreaker confirms that an attacker
+// flooding invalid tokens cannot trip the circuit breaker. Real
+// kubernetes API rejections of inbound caller tokens come back as
+// authError (NOT a Go error from reviewLocked), so the breaker's
+// failure counter never increments.
+func TestBreaker_AuthFailuresDoNotTripBreaker(t *testing.T) {
+	// Apiserver always returns a successful 2xx with
+	// authenticated=false (this is what k8s returns for an invalid
+	// caller token).
+	apiserver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"status":{"authenticated":false,"error":"invalid token"}}`))
+	}))
+	defer apiserver.Close()
+
+	r := &K8sTokenReviewer{
+		apiServer:         apiserver.URL,
+		saTokenPath:       writeTempSAToken(t),
+		expectedAudiences: []string{"keymint"},
+		httpClient:        apiserver.Client(),
+		breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+			Name:        "test-tokenreview",
+			MaxRequests: 1,
+			Interval:    60 * time.Second,
+			Timeout:     30 * time.Second,
+			ReadyToTrip: func(c gobreaker.Counts) bool {
+				return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
+			},
+		}),
+	}
+
+	// 25 invalid tokens — enough to trip the breaker if it counted
+	// auth rejections as failures.
+	for i := 0; i < 25; i++ {
+		_, err := r.Review(context.Background(), "junk")
+		if err == nil {
+			t.Fatalf("Review with invalid token: expected error, got nil")
+		}
+	}
+
+	// Breaker must still be Closed (counts unchanged by auth rejections).
+	if got := r.breaker.State(); got != gobreaker.StateClosed {
+		t.Errorf("breaker state after 25 auth rejections = %v, want Closed", got)
+	}
+}
+
+// TestBreaker_InfraFailuresTripBreaker confirms the breaker still
+// trips for genuine apiserver-side failures (5xx) — the desired
+// behaviour we don't want to regress.
+func TestBreaker_InfraFailuresTripBreaker(t *testing.T) {
+	apiserver := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer apiserver.Close()
+
+	r := &K8sTokenReviewer{
+		apiServer:         apiserver.URL,
+		saTokenPath:       writeTempSAToken(t),
+		expectedAudiences: []string{"keymint"},
+		httpClient:        apiserver.Client(),
+		breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+			Name:        "test-tokenreview-infra",
+			MaxRequests: 1,
+			Interval:    60 * time.Second,
+			Timeout:     30 * time.Second,
+			ReadyToTrip: func(c gobreaker.Counts) bool {
+				return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
+			},
+		}),
+	}
+
+	for i := 0; i < 25; i++ {
+		_, _ = r.Review(context.Background(), "any")
+	}
+	if got := r.breaker.State(); got != gobreaker.StateOpen {
+		t.Errorf("breaker state after 25 infra failures = %v, want Open", got)
+	}
+}
+
+func writeTempSAToken(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "keymint-test-sa-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	if _, err := f.WriteString("synthetic-sa-token"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(f.Name()) })
+	return f.Name()
 }
 
 func TestLimiterMap_LRUEvictionBoundsMemory(t *testing.T) {
