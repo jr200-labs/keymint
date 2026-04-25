@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
 	keymintMetrics "github.com/jr200-labs/keymint/internal/metrics"
@@ -59,6 +60,16 @@ const (
 	// don't spawn a goroutine + log a warning per inbound request.
 	// The next request after the cooldown re-attempts.
 	refreshFailureCooldown = 15 * time.Second
+
+	// Cache sizing. Both the parsed-key cache and the issued-token
+	// cache key entries by (AppID, InstallationID, APIBaseURL,
+	// PrivateKeyFile, fsnotify generation). PEM/secret rotations
+	// produce stale keys with new generations; the LRU+TTL bounds
+	// memory so accumulated stale entries never leak.
+	keyCacheSize   = 256
+	keyCacheTTL    = 24 * time.Hour
+	tokenCacheSize = 1024
+	tokenCacheTTL  = 70 * time.Minute // GitHub installation tokens live 1h
 )
 
 // newServeCmd implements `keymint serve` — the in-cluster HTTP service
@@ -130,9 +141,12 @@ SOPS files.`,
 				return err
 			}
 
-			var cacheMu sync.RWMutex
-			keyCache := make(map[string]keyCacheEntry)
-			tokenCache := make(map[string]cachedToken)
+			// Bounded caches: TTL-based eviction so PEM rotations
+			// (each yields a new generation in cacheKey) don't
+			// accumulate stale entries forever, and a hard size
+			// cap as a defence-in-depth against unbounded key churn.
+			keyCache := expirable.NewLRU[string, keyCacheEntry](keyCacheSize, nil, keyCacheTTL)
+			tokenCache := expirable.NewLRU[string, cachedToken](tokenCacheSize, nil, tokenCacheTTL)
 			var sf singleflight.Group
 			// refreshCooldownUntil tracks the wall-clock time before
 			// which a background refresh for a given cacheKey should
@@ -163,10 +177,7 @@ SOPS files.`,
 					return nil, fmt.Errorf("serve: stat key file %s: %w", path, err)
 				}
 
-				cacheMu.RLock()
-				cached, hit := keyCache[cacheKey]
-				cacheMu.RUnlock()
-				if hit && cached.mtime.Equal(st.ModTime()) && cached.size == st.Size() {
+				if cached, hit := keyCache.Get(cacheKey); hit && cached.mtime.Equal(st.ModTime()) && cached.size == st.Size() {
 					return cached.key, nil
 				}
 
@@ -178,9 +189,7 @@ SOPS files.`,
 				if err != nil {
 					return nil, err
 				}
-				cacheMu.Lock()
-				keyCache[cacheKey] = keyCacheEntry{key: priv, mtime: st.ModTime(), size: st.Size()}
-				cacheMu.Unlock()
+				keyCache.Add(cacheKey, keyCacheEntry{key: priv, mtime: st.ModTime(), size: st.Size()})
 				return priv, nil
 			}
 
@@ -212,9 +221,7 @@ SOPS files.`,
 					return cachedToken{}, err
 				}
 				ct := cachedToken{Token: tok.Token, ExpiresAt: tok.ExpiresAt}
-				cacheMu.Lock()
-				tokenCache[cacheKey] = ct
-				cacheMu.Unlock()
+				tokenCache.Add(cacheKey, ct)
 				return ct, nil
 			}
 
@@ -234,9 +241,7 @@ SOPS files.`,
 					k.AppID, k.InstallationID, k.APIBaseURL,
 					k.PrivateKeyFile, gen)
 
-				cacheMu.RLock()
-				ct, hasToken := tokenCache[cacheKey]
-				cacheMu.RUnlock()
+				ct, hasToken := tokenCache.Get(cacheKey)
 
 				if hasToken {
 					timeLeft := time.Until(ct.ExpiresAt)
@@ -285,12 +290,9 @@ SOPS files.`,
 				v, err, _ := sf.Do(cacheKey, func() (any, error) {
 					// Re-check cache under singleflight — a parallel
 					// caller may have just refreshed it.
-					cacheMu.RLock()
-					if ct, ok := tokenCache[cacheKey]; ok && time.Until(ct.ExpiresAt) > backgroundRefresh {
-						cacheMu.RUnlock()
+					if ct, ok := tokenCache.Get(cacheKey); ok && time.Until(ct.ExpiresAt) > backgroundRefresh {
 						return ct, nil
 					}
-					cacheMu.RUnlock()
 
 					// Detach from the inbound HTTP context: singleflight
 					// shares the result with all coalesced waiters, so
@@ -308,9 +310,7 @@ SOPS files.`,
 					// life left at all, prefer handing it back over
 					// failing the request — callers can use it now
 					// and the next call will retry the refresh.
-					cacheMu.RLock()
-					stale, hasStale := tokenCache[cacheKey]
-					cacheMu.RUnlock()
+					stale, hasStale := tokenCache.Get(cacheKey)
 					if hasStale && time.Until(stale.ExpiresAt) > 0 {
 						zap.L().Warn("synchronous refresh failed; serving previously-cached token",
 							zap.String("cache_key", cacheKey),

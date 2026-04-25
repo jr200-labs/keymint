@@ -52,42 +52,68 @@ var defaultHTTPClient = &http.Client{
 }
 
 // egressConcurrency caps the number of in-flight POSTs to GitHub
-// (across all keys / installations). Beyond this, callers block
-// until a slot frees, preventing a flood of distinct keys from
-// spawning unbounded simultaneous outbound requests and tripping
-// GitHub's secondary rate limits.
+// per distinct API base URL. Public github.com and each GitHub
+// Enterprise host get their own semaphore so a slow / hung GHE
+// instance cannot starve token minting against unrelated healthy
+// endpoints. The PER-endpoint cap is intentionally generous (50)
+// since the breaker provides the real overload protection.
 const egressConcurrency = 50
 
-var egressSem = make(chan struct{}, egressConcurrency)
+// egressSems is a sync.Map keyed by API base URL → chan struct{}
+// (the per-endpoint semaphore). Lazily allocated.
+var egressSems sync.Map
 
-// githubBreaker guards the /access_tokens call so a sustained
-// GitHub outage fails fast (and doesn't pile up egress slots
-// blocking on dead connections).
-//
-// Only infra-level failures count against it: 5xx, transport
-// errors, JWT-rejected (401/403) does NOT — that's an operator
-// configuration problem, not GitHub being down.
-var githubBreaker = gobreaker.NewCircuitBreaker(gobreaker.Settings{
-	Name:        "github-access-tokens",
-	MaxRequests: 1,
-	Interval:    60 * time.Second,
-	Timeout:     30 * time.Second,
-	ReadyToTrip: func(c gobreaker.Counts) bool {
-		// Trip when ≥10 attempts and >50% failed.
-		return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
-	},
-})
+// githubBreakers is a sync.Map keyed by API base URL →
+// *gobreaker.CircuitBreaker. Same partitioning rationale as
+// egressSems: a degraded GHE host must not trip a breaker shared
+// with public github.com.
+var githubBreakers sync.Map
 
-// GithubBreakerState exposes the breaker's current state for
-// metric reporting. Callers map: 0 closed / 1 half-open / 2 open.
-func GithubBreakerState() gobreaker.State { return githubBreaker.State() }
+func breakerForAPI(apiBase string) *gobreaker.CircuitBreaker {
+	if v, ok := githubBreakers.Load(apiBase); ok {
+		return v.(*gobreaker.CircuitBreaker)
+	}
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "github-access-tokens:" + apiBase,
+		MaxRequests: 1,
+		Interval:    60 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			// Trip when ≥10 attempts and >50% failed.
+			return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
+		},
+	})
+	actual, loaded := githubBreakers.LoadOrStore(apiBase, cb)
+	if loaded {
+		return actual.(*gobreaker.CircuitBreaker)
+	}
+	return cb
+}
 
-// acquireEgress blocks until an outbound slot is available or ctx is
-// cancelled. Returns a release func.
-func acquireEgress(ctx context.Context) (func(), error) {
+// GithubBreakerState exposes the WORST current state across all
+// per-endpoint breakers (Open beats HalfOpen beats Closed). The
+// metric reporter callers map: 0 closed / 1 half-open / 2 open.
+func GithubBreakerState() gobreaker.State {
+	worst := gobreaker.StateClosed
+	githubBreakers.Range(func(_, v any) bool {
+		st := v.(*gobreaker.CircuitBreaker).State()
+		if st > worst {
+			worst = st
+		}
+		return true
+	})
+	return worst
+}
+
+// acquireEgress blocks until an outbound slot is available on the
+// per-endpoint semaphore for apiBase, or ctx is cancelled. Returns
+// a release func.
+func acquireEgress(ctx context.Context, apiBase string) (func(), error) {
+	v, _ := egressSems.LoadOrStore(apiBase, make(chan struct{}, egressConcurrency))
+	sem := v.(chan struct{})
 	select {
-	case egressSem <- struct{}{}:
-		return func() { <-egressSem }, nil
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -291,7 +317,7 @@ func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, erro
 // surfaced to the caller WITHOUT incrementing the breaker's
 // failure counter.
 func exchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (Token, error) {
-	out, err := githubBreaker.Execute(func() (interface{}, error) {
+	out, err := breakerForAPI(apiBase).Execute(func() (interface{}, error) {
 		return doExchangeForInstallationToken(ctx, appJWT, req, apiBase)
 	})
 	if err != nil {
@@ -329,7 +355,7 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 		client = defaultHTTPClient
 	}
 
-	release, err := acquireEgress(ctx)
+	release, err := acquireEgress(ctx, apiBase)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: acquire egress slot: %w", err)
 	}
@@ -363,10 +389,17 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 	}
 
 	if resp.StatusCode != http.StatusCreated {
-		// 4xx is a caller-side problem (bad JWT, wrong installation,
-		// suspended app). 5xx is GitHub-side. Let the breaker only
-		// see 5xx + transport failures.
+		// 4xx is generally a caller-side problem (bad JWT, wrong
+		// installation, suspended app) and shouldn't trip the
+		// breaker. 5xx is GitHub-side. The exception is 429
+		// "Too Many Requests" / secondary rate limits — keymint
+		// continuing to hammer at full throttle would invite
+		// harder, longer-lasting bans, so 429 is reported as an
+		// infra failure that the breaker counts and opens on.
 		errMsg := fmt.Errorf("mint: GitHub returned %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			return exchangeResult{}, errMsg
+		}
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			return exchangeResult{callerErr: errMsg}, nil
 		}

@@ -169,6 +169,14 @@ the deploy accordingly:
   failures. 4xx responses (bad JWT, suspended app) are
   caller-config bugs and don't count against it.
 
+- **Per-endpoint isolation.** The GitHub circuit breaker, egress concurrency semaphore, and rate-limit metrics are partitioned by API base URL. A degraded GHE host cannot trip a breaker shared with public github.com, exhaust the egress slots for an unrelated endpoint, or be charged against another host's rate-limit gauge. `429 Too Many Requests` is treated as an infra failure (not a 4xx caller error) so the breaker actually opens against secondary rate-limits and avoids escalating bans.
+
+- **Lock-free per-key rate limiter.** Both pre-auth (per-IP) and post-auth (per-subject) limiters use `sync.Map.LoadOrStore`; there is no global mutex on the miss path. A flood of unique spoofed source IPs cannot serialise the HTTP ingest pipeline behind one lock.
+
+- **Case-insensitive Bearer scheme.** Per RFC 7235 §2.1, `Authorization: bearer ...` and `BEARER ...` are accepted alongside `Bearer ...`, so callers behind proxies that normalise the scheme are not spuriously rejected.
+
+- **Bounded token / key caches.** Both the parsed-key and minted-token caches are `expirable.LRU` instances (256 / 1024 entries; 24h / 70min TTL respectively). PEM rotations and config reloads no longer accumulate stale generation entries indefinitely.
+
 - **Cryptographic audit fingerprint.** Each minted installation token is hashed with SHA-256 and the hex digest is emitted as a `token_fingerprint` field on the structured log line and as a `keymint.token_fingerprint` OpenTelemetry span attribute. If a token ever leaks (in CI logs, a screenshot, etc.), security teams can hash it locally and grep audit logs to pinpoint the exact pod, ServiceAccount, and minute that issued it — without ever persisting the raw token.
 
 - **Ed25519 + RSA private keys.** `ParsePrivateKey` accepts both PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY") PEM blocks; PKCS#8 may be either RSA or Ed25519. The signing path picks `RS256` for RSA keys and `EdDSA` for Ed25519 automatically. GitHub Apps support both; Ed25519 keys are smaller and faster to sign with.
