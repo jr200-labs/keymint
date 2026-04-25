@@ -150,6 +150,32 @@ the deploy accordingly:
   `IdleConnTimeout`, `TLSHandshakeTimeout`, and
   `ResponseHeaderTimeout` instead of inheriting stdlib defaults.
 
+- **TokenReview cache.** Successful `TokenReview` results are cached
+  for ~60 s in an LRU keyed by the SHA-256 of the bearer token so
+  bursty callers don't amplify into the kubernetes API. Revoked
+  ServiceAccounts lose access on the next TTL boundary.
+
+- **Hot config reload.** keymint watches `--config` via fsnotify.
+  When the file changes (operator updates Keys / Allowlist) the new
+  config is validated and the in-process snapshot is swapped
+  atomically. Pod restarts are not required for routine admin
+  changes. (Note: `expected_audiences` is read at startup only —
+  changes there require a restart.)
+
+- **GitHub API circuit breaker.** Calls to
+  `/app/installations/<id>/access_tokens` are wrapped in a circuit
+  breaker that opens for 30 s after sustained 5xx or transport
+  failures. 4xx responses (bad JWT, suspended app) are
+  caller-config bugs and don't count against it.
+
+- **GitHub rate-limit observability.** Each `/access_tokens`
+  response's `X-RateLimit-Remaining` and `X-RateLimit-Reset`
+  headers are exported as Prometheus gauges
+  (`keymint_github_ratelimit_remaining{api_base_url}`,
+  `keymint_github_ratelimit_reset_unix{api_base_url}`). Breaker
+  state is exposed as `keymint_github_breaker_state` (0 closed,
+  1 half-open, 2 open).
+
 ## Observability
 
 Service mode emits structured (zap) logs, OpenTelemetry traces, and

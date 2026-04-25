@@ -38,6 +38,12 @@ const (
 // label cardinality bounded.
 const UnknownKey = "unknown_key"
 
+// CacheResult label values for TokenReviewCacheTotal.
+const (
+	CacheHit  = "hit"
+	CacheMiss = "miss"
+)
+
 // Metrics holds all Prometheus instruments for the keymint binary.
 type Metrics struct {
 	// MintRequestsTotal counts inbound mint requests by outcome and key.
@@ -58,6 +64,25 @@ type Metrics struct {
 	// JWTClockOffsetSeconds is the most recent observed clock drift between
 	// keymint and GitHub, in seconds. Negative means keymint is ahead.
 	JWTClockOffsetSeconds prometheus.Gauge
+
+	// TokenReviewCacheTotal counts TokenReview lookups by result
+	// ("hit" / "miss"). Operators graph hit ratio to see how
+	// effectively the cache is shielding the apiserver.
+	TokenReviewCacheTotal *prometheus.CounterVec
+
+	// GitHubRateLimitRemaining mirrors the X-RateLimit-Remaining
+	// header from the most recent /access_tokens response, labelled
+	// by GitHub API base URL so public github.com and any GHE hosts
+	// are tracked separately.
+	GitHubRateLimitRemaining *prometheus.GaugeVec
+
+	// GitHubRateLimitResetUnix mirrors the X-RateLimit-Reset header
+	// (Unix-seconds epoch when the bucket refills).
+	GitHubRateLimitResetUnix *prometheus.GaugeVec
+
+	// GitHubBreakerState exposes the gobreaker state around the
+	// /access_tokens call: 0=closed, 1=half-open, 2=open.
+	GitHubBreakerState prometheus.Gauge
 }
 
 // New constructs and registers the metrics against the default
@@ -112,6 +137,37 @@ func New() *Metrics {
 				Help:      "Most recent observed clock drift between this pod and GitHub (seconds).",
 			},
 		),
+		TokenReviewCacheTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "tokenreview_cache_total",
+				Help:      "TokenReview cache lookups by result (hit/miss).",
+			},
+			[]string{"result"},
+		),
+		GitHubRateLimitRemaining: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "github_ratelimit_remaining",
+				Help:      "GitHub X-RateLimit-Remaining for the most recent /access_tokens response, by API base URL.",
+			},
+			[]string{"api_base_url"},
+		),
+		GitHubRateLimitResetUnix: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "github_ratelimit_reset_unix",
+				Help:      "GitHub X-RateLimit-Reset (Unix epoch seconds) for the most recent /access_tokens response.",
+			},
+			[]string{"api_base_url"},
+		),
+		GitHubBreakerState: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "github_breaker_state",
+				Help:      "Circuit breaker state around GitHub /access_tokens: 0=closed, 1=half-open, 2=open.",
+			},
+		),
 	}
 
 	prometheus.MustRegister(
@@ -121,6 +177,10 @@ func New() *Metrics {
 		m.TokenReviewsTotal,
 		m.GitHubAPILatency,
 		m.JWTClockOffsetSeconds,
+		m.TokenReviewCacheTotal,
+		m.GitHubRateLimitRemaining,
+		m.GitHubRateLimitResetUnix,
+		m.GitHubBreakerState,
 	)
 
 	return m

@@ -493,6 +493,127 @@ func writeTempSAToken(t *testing.T) string {
 	return f.Name()
 }
 
+// TestReviewCache_BypassesApiserverOnHit asserts that two
+// successive Reviews of the same bearer token only hit the
+// underlying TokenReviewer once.
+func TestReviewCache_BypassesApiserverOnHit(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
+		},
+	}
+	calls := 0
+	reviewer := &countingReviewer{
+		fn: func(_ context.Context, token string) (string, error) {
+			calls++
+			if token == "valid" {
+				return "system:serviceaccount:agents:agent-runner", nil
+			}
+			return "", errors.New("rejected")
+		},
+	}
+	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+		return "ghs_x", time.Now().Add(time.Hour), nil
+	}
+	srv, err := New(cfg, mintFn, reviewer, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	for i := 0; i < 5; i++ {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token/org-a", nil)
+		req.Header.Set("Authorization", "Bearer valid")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("TokenReviewer hit %d times, want 1 (subsequent calls should be cached)", calls)
+	}
+}
+
+type countingReviewer struct {
+	fn func(context.Context, string) (string, error)
+}
+
+func (c *countingReviewer) Review(ctx context.Context, t string) (string, error) {
+	return c.fn(ctx, t)
+}
+
+// TestReload_AtomicallySwapsConfig confirms a Reload() call updates
+// the visible Keys + Allowlist without dropping in-flight requests.
+func TestReload_AtomicallySwapsConfig(t *testing.T) {
+	cfg1 := &config.Config{
+		Keys: map[string]config.Key{"old-key": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"old-key"}},
+		},
+		ExpectedAudiences: []string{"keymint"},
+	}
+	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+		return "ghs_x", time.Now().Add(time.Hour), nil
+	}
+	reviewer := &fakeReviewer{
+		subjectByToken: map[string]string{"sa": "system:serviceaccount:agents:agent-runner"},
+	}
+	srv, err := New(cfg1, mintFn, reviewer, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := srv.currentConfig().Keys["old-key"]; !ok {
+		t.Errorf("initial config missing old-key")
+	}
+
+	// Swap to a new config with a different key set.
+	cfg2 := &config.Config{
+		Keys: map[string]config.Key{"new-key": {AppID: 2, InstallationID: 2, PrivateKeyFile: "/y"}},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"new-key"}},
+		},
+		ExpectedAudiences: []string{"keymint"},
+	}
+	if err := srv.Reload(cfg2); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if _, ok := srv.currentConfig().Keys["old-key"]; ok {
+		t.Errorf("old-key should be gone after reload")
+	}
+	if _, ok := srv.currentConfig().Keys["new-key"]; !ok {
+		t.Errorf("new-key missing after reload")
+	}
+	if !srv.currentAllowed()["system:serviceaccount:agents:agent-runner"]["new-key"] {
+		t.Errorf("allowlist not rebuilt for new-key")
+	}
+}
+
+// TestReload_RejectsInvalidConfig asserts a bad reload doesn't
+// blow away the existing snapshot.
+func TestReload_RejectsInvalidConfig(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"good": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+	}
+	srv, err := New(cfg, func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil }, &fakeReviewer{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Reload(&config.Config{Keys: nil}); err == nil {
+		t.Errorf("expected validation error from empty config")
+	}
+	// Original snapshot intact.
+	if _, ok := srv.currentConfig().Keys["good"]; !ok {
+		t.Errorf("good config replaced by failed reload")
+	}
+}
+
 func TestLimiterMap_LRUEvictionBoundsMemory(t *testing.T) {
 	// Insert more keys than limiterMapSize and confirm the map size
 	// stays bounded — the LRU evicts the oldest entries.
