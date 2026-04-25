@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,15 +26,19 @@ type fakeReviewer struct {
 	err            error
 }
 
-func (f *fakeReviewer) Review(_ context.Context, token string) (string, error) {
+// Review reflects the production tri-state contract: nil err for both
+// successful auth and authoritative rejection; non-nil err only for
+// "infrastructure" failures (which fakeReviewer doesn't simulate
+// here — see f.err if you want to force one).
+func (f *fakeReviewer) Review(_ context.Context, token string) (string, bool, error) {
 	if f.err != nil {
-		return "", f.err
+		return "", false, f.err
 	}
 	subj, ok := f.subjectByToken[token]
 	if !ok {
-		return "", errors.New("unauthorized")
+		return "", false, nil
 	}
-	return subj, nil
+	return subj, true, nil
 }
 
 func newTestServer(t *testing.T, cfg *config.Config, mint MintFunc, reviewer TokenReviewer) *httptest.Server {
@@ -433,11 +436,15 @@ func TestBreaker_AuthFailuresDoNotTripBreaker(t *testing.T) {
 	}
 
 	// 25 invalid tokens — enough to trip the breaker if it counted
-	// auth rejections as failures.
+	// auth rejections as failures. New contract: rejection returns
+	// (subject="", ok=false, err=nil) so the breaker stays closed.
 	for i := 0; i < 25; i++ {
-		_, err := r.Review(context.Background(), "junk")
-		if err == nil {
-			t.Fatalf("Review with invalid token: expected error, got nil")
+		_, ok, err := r.Review(context.Background(), "junk")
+		if err != nil {
+			t.Fatalf("auth rejection should not surface as Go err, got %v", err)
+		}
+		if ok {
+			t.Fatalf("auth rejection: ok should be false")
 		}
 	}
 
@@ -473,7 +480,7 @@ func TestBreaker_InfraFailuresTripBreaker(t *testing.T) {
 	}
 
 	for i := 0; i < 25; i++ {
-		_, _ = r.Review(context.Background(), "any")
+		_, _, _ = r.Review(context.Background(), "any")
 	}
 	if got := r.breaker.State(); got != gobreaker.StateOpen {
 		t.Errorf("breaker state after 25 infra failures = %v, want Open", got)
@@ -508,12 +515,12 @@ func TestReviewCache_BypassesApiserverOnHit(t *testing.T) {
 	}
 	calls := 0
 	reviewer := &countingReviewer{
-		fn: func(_ context.Context, token string) (string, error) {
+		fn: func(_ context.Context, token string) (string, bool, error) {
 			calls++
 			if token == "valid" {
-				return "system:serviceaccount:agents:agent-runner", nil
+				return "system:serviceaccount:agents:agent-runner", true, nil
 			}
-			return "", errors.New("rejected")
+			return "", false, nil
 		},
 	}
 	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
@@ -544,10 +551,10 @@ func TestReviewCache_BypassesApiserverOnHit(t *testing.T) {
 }
 
 type countingReviewer struct {
-	fn func(context.Context, string) (string, error)
+	fn func(context.Context, string) (string, bool, error)
 }
 
-func (c *countingReviewer) Review(ctx context.Context, t string) (string, error) {
+func (c *countingReviewer) Review(ctx context.Context, t string) (string, bool, error) {
 	return c.fn(ctx, t)
 }
 
@@ -630,9 +637,12 @@ func TestReviewCache_NegativeCacheBypassesApiserver(t *testing.T) {
 	}
 	calls := 0
 	reviewer := &countingReviewer{
-		fn: func(_ context.Context, _ string) (string, error) {
+		fn: func(_ context.Context, _ string) (string, bool, error) {
 			calls++
-			return "", errors.New("apiserver: invalid token")
+			// Authoritative rejection (auth failure), not infra:
+			// nil error, ok=false. The negative cache should
+			// absorb subsequent identical bad tokens.
+			return "", false, nil
 		},
 	}
 	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
@@ -790,15 +800,33 @@ func TestLimiterMap_ConcurrentInitSharesOneLimiter(t *testing.T) {
 	}
 }
 
-func TestLimiterMap_LRUEvictionBoundsMemory(t *testing.T) {
-	// Insert more keys than limiterMapSize and confirm the map size
-	// stays bounded — the LRU evicts the oldest entries.
-	m := newLimiterMap(rate.Every(time.Second), 1)
-	for i := 0; i < limiterMapSize*2; i++ {
-		m.allow(fmt.Sprintf("ip-%d", i))
+// TestLimiterMap_JanitorEvictsIdleButKeepsActive asserts the
+// idle-only GC strategy: limiters whose burst bucket is full
+// (untouched recently) get dropped, and limiters whose bucket is
+// depleted (active or under attack) stay — so an attacker cannot
+// evict their *own* limiter to reset the rate cap by simply
+// flooding more unique keys.
+func TestLimiterMap_JanitorEvictsIdleButKeepsActive(t *testing.T) {
+	m := newLimiterMap(rate.Every(time.Second), 5)
+
+	// "active" key gets immediately depleted (5 fast Allow() calls
+	// drain its 5-token bucket).
+	for i := 0; i < 5; i++ {
+		m.allow("active")
 	}
-	if got := m.cache.Len(); got > limiterMapSize {
-		t.Errorf("cache.Len() = %d, want <= %d", got, limiterMapSize)
+	// "idle" key is touched once but only briefly; its bucket is
+	// almost full at the time of the GC pass.
+	m.allow("idle")
+	// Wait long enough for the idle key's bucket to refill to burst.
+	time.Sleep(1100 * time.Millisecond)
+
+	m.gcIdle()
+
+	if _, ok := m.limiters.Load("active"); !ok {
+		t.Errorf("active limiter (depleted bucket) was evicted; rate cap reset")
+	}
+	if _, ok := m.limiters.Load("idle"); ok {
+		t.Errorf("idle limiter (full bucket) was kept; janitor not GC'ing")
 	}
 }
 
