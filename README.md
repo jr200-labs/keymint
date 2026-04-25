@@ -33,6 +33,22 @@ Early scaffold. Implementation lands in a sequence of small PRs:
 | 6  | Container image release wiring |
 | 7  | Homebrew formula |
 
+## Contributing
+
+This repo follows the jr200-labs convention:
+
+- **`master` is protected** — direct pushes are blocked. Land changes via PR.
+- **Squash-and-merge only** — merge commits and rebase merges are
+  disabled. Each PR collapses to one commit on `master`. Branches are
+  deleted automatically after merge.
+- **Conventional Commits** — the squashed commit title becomes the PR
+  title, so PR titles must follow the
+  [Conventional Commits](https://www.conventionalcommits.org) spec
+  (`feat: ...`, `fix(scope): ...`, etc.). CI runs `commitlint` on
+  individual commits in the branch as well.
+- **release-please** drives versioning. Never bump versions by hand;
+  push conventional commits and let the Release PR open itself.
+
 ## Development setup
 
 Install pre-commit hooks once after cloning. Hooks run `gofmt`, `go vet`,
@@ -67,6 +83,21 @@ Produces `build/keymint-$(GOOS)-$(GOARCH)` — static, CGO-disabled.
 make test       # unit tests
 make test-race  # with race detector + coverage
 ```
+
+## Using as a git credential helper
+
+Once `keymint mint <key>` works, you can wire it as a credential
+helper so `git push` and `gh` calls against your configured orgs
+authenticate automatically:
+
+```sh
+git config --global credential.https://github.com.helper "keymint helper"
+git config --global credential.https://github.com.useHttpPath true
+```
+
+`useHttpPath = true` is required: by default git only sends `host` to
+credential helpers, so every `github.com` remote looks identical and
+keymint cannot tell which org's App should sign the token.
 
 ## Releasing
 
