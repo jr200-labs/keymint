@@ -32,6 +32,12 @@ const (
 	TokenReviewRejected = "rejected"
 )
 
+// UnknownKey is the sentinel label value used when a request asks
+// for a key that is not in the keymint config. Using a fixed string
+// instead of the attacker-controlled URL segment keeps Prometheus
+// label cardinality bounded.
+const UnknownKey = "unknown_key"
+
 // Metrics holds all Prometheus instruments for the keymint binary.
 type Metrics struct {
 	// MintRequestsTotal counts inbound mint requests by outcome and key.

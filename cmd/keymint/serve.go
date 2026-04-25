@@ -237,7 +237,16 @@ SOPS files.`,
 						return ct, nil
 					}
 					cacheMu.RUnlock()
-					return doMint(ctx, cacheKey, k)
+
+					// Detach from the inbound HTTP context: singleflight
+					// shares the result with all coalesced waiters, so
+					// if the *first* caller disconnects, its
+					// context.Canceled would otherwise propagate to
+					// every other live waiter and fail their requests.
+					// context.WithoutCancel preserves trace/baggage
+					// values but drops Done/Err; doMint applies
+					// mintTimeout internally.
+					return doMint(context.WithoutCancel(ctx), cacheKey, k)
 				})
 				if err != nil {
 					return "", time.Time{}, err
