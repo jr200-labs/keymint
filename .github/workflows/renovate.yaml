@@ -6,10 +6,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   renovate:
     uses: jr200-labs/github-action-templates/.github/workflows/renovate.yaml@master
     secrets:
-      app_private_key: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}
+      INTEGRATION_APP_PRIVATE_KEY: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}
