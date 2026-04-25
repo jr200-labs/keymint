@@ -120,6 +120,36 @@ the deploy accordingly:
   Enterprise base URL configured per key. A sick GHE clock cannot
   poison signing for unrelated endpoints.
 
+- **Bounded rate limiters.** Both pre-auth (per-IP) and post-auth
+  (per-subject) rate limiters live behind LRUs sized to a few
+  thousand entries. A flood of unique IPs or subjects evicts older
+  buckets instead of growing memory without bound.
+
+- **Hot key rotation.** Operators rotating the kubernetes Secret
+  carrying an App PEM are picked up automatically — keymint
+  compares mtime+size of the on-disk file before reusing a parsed
+  RSA key, and reloads when either changes.
+
+- **TokenReview circuit breaker.** Calls to the kubernetes API are
+  guarded by a circuit breaker that opens for 30s when failure
+  ratio crosses 50% over a 60s window, so apiserver degradation
+  fails fast instead of stalling the request handler pool.
+
+- **Bounded GitHub egress concurrency.** A semaphore caps in-flight
+  POSTs to GitHub at 50 across all keys; bursts queue rather than
+  fan out without limit and trigger secondary rate limits.
+
+- **Background token refresh.** Tokens are returned from cache while
+  ≥5 min remain; between 5 min and 1 min remaining keymint hands
+  back the still-valid cached token and refreshes asynchronously
+  via singleflight; below 1 min it refreshes synchronously. No
+  guaranteed latency spike at the 5-min mark.
+
+- **Tuned outbound HTTP transports.** Both the kubernetes-API client
+  and the GitHub-API client set explicit `MaxIdleConnsPerHost`,
+  `IdleConnTimeout`, `TLSHandshakeTimeout`, and
+  `ResponseHeaderTimeout` instead of inheriting stdlib defaults.
+
 ## Observability
 
 Service mode emits structured (zap) logs, OpenTelemetry traces, and

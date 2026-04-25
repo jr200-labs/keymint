@@ -35,11 +35,12 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/metrics"
+	"github.com/sony/gobreaker"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -67,29 +68,39 @@ type Server struct {
 	metrics        *metrics.Metrics
 }
 
-// limiterMap holds a per-key rate.Limiter, lazily allocated on first
-// observation. Each Server keeps two of these — one keyed by remote
-// IP (cheap pre-auth gate) and one keyed by the resolved
-// ServiceAccount subject (post-auth, generous).
+// limiterMap holds a per-key rate.Limiter behind an LRU so a slow
+// flood of unique keys (random IPs, invalid auth) cannot grow the
+// map without bound.
+//
+// Each Server keeps two — one keyed by remote IP (cheap pre-auth
+// gate) and one keyed by the resolved ServiceAccount subject
+// (post-auth, generous).
 type limiterMap struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-	rps      rate.Limit
-	burst    int
+	cache *lru.Cache[string, *rate.Limiter]
+	rps   rate.Limit
+	burst int
 }
 
+// limiterMapSize is the per-instance cap. Once exceeded the
+// least-recently-used limiter is evicted; a new one for that key
+// is allocated on the next observation.
+const limiterMapSize = 4096
+
 func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
-	return &limiterMap{limiters: make(map[string]*rate.Limiter), rps: rps, burst: burst}
+	c, err := lru.New[string, *rate.Limiter](limiterMapSize)
+	if err != nil {
+		// lru.New only fails on size <= 0 — treat as a programmer error.
+		panic(fmt.Sprintf("server: limiterMap LRU init: %v", err))
+	}
+	return &limiterMap{cache: c, rps: rps, burst: burst}
 }
 
 func (m *limiterMap) allow(key string) bool {
-	m.mu.Lock()
-	l, ok := m.limiters[key]
-	if !ok {
-		l = rate.NewLimiter(m.rps, m.burst)
-		m.limiters[key] = l
+	if l, ok := m.cache.Get(key); ok {
+		return l.Allow()
 	}
-	m.mu.Unlock()
+	l := rate.NewLimiter(m.rps, m.burst)
+	m.cache.Add(key, l)
 	return l.Allow()
 }
 
@@ -350,6 +361,7 @@ type K8sTokenReviewer struct {
 	saTokenPath       string // re-read on every call — kubelet rotates this file
 	expectedAudiences []string
 	httpClient        *http.Client
+	breaker           *gobreaker.CircuitBreaker
 }
 
 // NewK8sTokenReviewer constructs a reviewer using the standard
@@ -388,19 +400,47 @@ func NewK8sTokenReviewer(expectedAudiences []string) (*K8sTokenReviewer, error) 
 		return nil, fmt.Errorf("server: stat service account token: %w", err)
 	}
 
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs:    rootCAs,
+			MinVersion: tls.VersionTLS12,
+		},
+		// Bound resource consumption when talking to the apiserver.
+		// Without these, defaults leak idle conns under apiserver
+		// slowness and TLS handshakes cost CPU under sudden load.
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+
+	// Circuit breaker around TokenReview. If the apiserver degrades
+	// (consistently slow or 5xx), open the breaker and fail-fast for
+	// 30s so we don't pile up 10-second-stalled goroutines and exhaust
+	// the request handling pool.
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "kubernetes-tokenreview",
+		MaxRequests: 1,
+		Interval:    60 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			// Trip when failure ratio is high *and* we've seen enough
+			// requests for it to be statistically meaningful.
+			return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
+		},
+	})
+
 	return &K8sTokenReviewer{
 		apiServer:         fmt.Sprintf("https://%s", net.JoinHostPort(host, port)),
 		saTokenPath:       saTokenPath,
 		expectedAudiences: append([]string(nil), expectedAudiences...),
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs:    rootCAs,
-					MinVersion: tls.VersionTLS12,
-				},
-			},
+			Timeout:   10 * time.Second,
+			Transport: transport,
 		},
+		breaker: cb,
 	}, nil
 }
 
@@ -429,8 +469,20 @@ type tokenReviewResponse struct {
 // Review POSTs a TokenReview to the API server and returns the
 // resolved username on success. The pod's own SA token is re-read
 // from disk on each call so kubelet-rotated projected tokens stay
-// valid for the lifetime of the process.
+// valid for the lifetime of the process. Wrapped in a circuit
+// breaker so the handler fails fast when the apiserver degrades.
 func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, error) {
+	out, err := r.breaker.Execute(func() (interface{}, error) {
+		return r.reviewLocked(ctx, token)
+	})
+	if err != nil {
+		return "", err
+	}
+	return out.(string), nil
+}
+
+// reviewLocked is the inner implementation invoked by the circuit breaker.
+func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (string, error) {
 	body, err := json.Marshal(tokenReviewRequest{
 		APIVersion: "authentication.k8s.io/v1",
 		Kind:       "TokenReview",

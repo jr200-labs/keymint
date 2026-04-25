@@ -229,6 +229,41 @@ func TestClockOffset_PerEndpoint(t *testing.T) {
 	}
 }
 
+func TestEgressSemaphore_BoundsConcurrency(t *testing.T) {
+	// Synthetic experiment: spawn many concurrent acquires and
+	// confirm we never exceed the cap. release one, the next can
+	// proceed.
+	if cap(egressSem) != egressConcurrency {
+		t.Fatalf("egressSem capacity = %d, want %d", cap(egressSem), egressConcurrency)
+	}
+
+	releases := make([]func(), 0, egressConcurrency)
+	for i := 0; i < egressConcurrency; i++ {
+		release, err := acquireEgress(context.Background())
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		releases = append(releases, release)
+	}
+
+	// One more must block; assert it via a short context timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := acquireEgress(ctx); err == nil {
+		t.Errorf("expected acquire to block + ctx.Done, got nil error")
+	}
+
+	// Release all — fresh acquire should succeed immediately.
+	for _, r := range releases {
+		r()
+	}
+	release, err := acquireEgress(context.Background())
+	if err != nil {
+		t.Errorf("post-release acquire: %v", err)
+	}
+	release()
+}
+
 func TestMint_ValidatesRequiredFields(t *testing.T) {
 	key := generateTestKey(t)
 	cases := []struct {

@@ -31,6 +31,42 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// defaultHTTPClient has explicit Transport tuning so we don't inherit
+// http.DefaultClient / DefaultTransport behaviour: 2 idle conns per
+// host (the stdlib default) is far too low for a token broker that
+// fans out to api.github.com under any meaningful load.
+var defaultHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
+
+// egressConcurrency caps the number of in-flight POSTs to GitHub
+// (across all keys / installations). Beyond this, callers block
+// until a slot frees, preventing a flood of distinct keys from
+// spawning unbounded simultaneous outbound requests and tripping
+// GitHub's secondary rate limits.
+const egressConcurrency = 50
+
+var egressSem = make(chan struct{}, egressConcurrency)
+
+// acquireEgress blocks until an outbound slot is available or ctx is
+// cancelled. Returns a release func.
+func acquireEgress(ctx context.Context) (func(), error) {
+	select {
+	case egressSem <- struct{}{}:
+		return func() { <-egressSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // DefaultGitHubAPI is the public GitHub REST API base URL. Override
 // via Request.APIBaseURL to point at GitHub Enterprise Server.
 const DefaultGitHubAPI = "https://api.github.com"
@@ -196,8 +232,14 @@ func exchangeForInstallationToken(ctx context.Context, appJWT string, req Reques
 
 	client := req.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTPClient
 	}
+
+	release, err := acquireEgress(ctx)
+	if err != nil {
+		return Token{}, fmt.Errorf("mint: acquire egress slot: %w", err)
+	}
+	defer release()
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
