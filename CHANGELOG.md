@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/jr200-labs/keymint/compare/v1.0.0...v1.0.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* **ci:** top-level permissions + correct secret name (build + renovate) ([#19](https://github.com/jr200-labs/keymint/issues/19)) ([cb5b1d9](https://github.com/jr200-labs/keymint/commit/cb5b1d96e6f4c9fa56c2eacbc2c908e82471efc6))
+
 ## 1.0.0 (2026-04-25)
 
 
