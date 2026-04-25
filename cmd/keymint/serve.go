@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -257,6 +258,21 @@ SOPS files.`,
 					return doMint(context.WithoutCancel(ctx), cacheKey, k)
 				})
 				if err != nil {
+					// Synchronous refresh failed (GitHub timeout, 5xx,
+					// etc.). If the previously cached token has any
+					// life left at all, prefer handing it back over
+					// failing the request — callers can use it now
+					// and the next call will retry the refresh.
+					cacheMu.RLock()
+					stale, hasStale := tokenCache[cacheKey]
+					cacheMu.RUnlock()
+					if hasStale && time.Until(stale.ExpiresAt) > 0 {
+						zap.L().Warn("synchronous refresh failed; serving previously-cached token",
+							zap.String("cache_key", cacheKey),
+							zap.Duration("remaining", time.Until(stale.ExpiresAt)),
+							zap.Error(err))
+						return stale.Token, stale.ExpiresAt, nil
+					}
 					return "", time.Time{}, err
 				}
 				ct = v.(cachedToken)
@@ -390,11 +406,28 @@ SOPS files.`,
 	return cmd
 }
 
-// watchConfigFile runs an fsnotify loop on the given path, invoking
-// onChange whenever the file's contents change. Handles both Write
-// events and Rename/Remove sequences (kubectl apply / Kustomize
-// secret rotation use the latter).
+// watchConfigFile runs an fsnotify loop on the parent directory of
+// the given path, invoking onChange whenever the target file (or
+// the kubernetes ConfigMap/Secret `..data` symlink) is created or
+// rewritten.
+//
+// We watch the directory rather than the file directly because
+// kubernetes mounts ConfigMaps/Secrets via an atomic symlink swap:
+//
+//	/etc/keymint/config.yaml -> ..data/config.yaml
+//	/etc/keymint/..data      -> ..2026_04_25_03_07_00.123456789
+//
+// On rotation kubelet creates a new timestamped directory, atomically
+// swings the ..data symlink to it, and removes the old one. A direct
+// w.Add(/etc/keymint/config.yaml) would receive a Rename or Remove
+// for the old inode and never see the new one (re-Add can race the
+// brief window where the symlink target doesn't exist). Watching the
+// parent and filtering on the target filename / ..data sidesteps the
+// race entirely.
 func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
+	dir := filepath.Dir(path)
+	target := filepath.Base(path)
+
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		zap.L().Error("config watcher init failed", zap.Error(err))
@@ -402,9 +435,9 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 	}
 	defer func() { _ = w.Close() }()
 
-	if err := w.Add(path); err != nil {
+	if err := w.Add(dir); err != nil {
 		zap.L().Error("config watcher add failed",
-			zap.String("path", path), zap.Error(err))
+			zap.String("dir", dir), zap.Error(err))
 		return
 	}
 
@@ -416,16 +449,16 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 			if !ok {
 				return
 			}
+			base := filepath.Base(event.Name)
+			// Only react to the file we care about. ConfigMap /
+			// Secret atomic-swap fires Create on ..data; an
+			// in-place edit (rare in k8s, common in dev) fires
+			// Write on the target.
+			if base != target && base != "..data" {
+				continue
+			}
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
 				onChange()
-			}
-			if event.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
-				// File was replaced; the old inode no longer matches.
-				// Re-add the path so we keep watching the new file.
-				_ = w.Remove(path)
-				if err := w.Add(path); err == nil {
-					onChange()
-				}
 			}
 		case err, ok := <-w.Errors:
 			if !ok {
