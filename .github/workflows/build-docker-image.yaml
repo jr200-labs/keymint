@@ -1,10 +1,14 @@
 name: build-docker-image
 
+# Triggered by `release-published` repository_dispatch from
+# release-please.yaml when a tag is cut, or manually via
+# workflow_dispatch for ad-hoc dev builds. The single
+# release-published event type is used by every artifact-publishing
+# workflow so this caller can be a verbatim copy across repos.
+
 on:
   repository_dispatch:
-    types:
-      - dispatch-build-docker-image
-
+    types: [release-published]
   workflow_dispatch:
     inputs:
       checkout-ref:
@@ -24,6 +28,11 @@ on:
         default: |-
           [ "linux/amd64", "linux/arm64" ]
 
+# Only the caller's TOP-LEVEL permissions cascade into reusable
+# workflows. The reusable's nested jobs need packages:write (push to
+# ghcr.io) and contents:write — without this block the call
+# startup-fails with "is requesting 'packages: write', but is only
+# allowed 'packages: read'".
 permissions:
   contents: write
   packages: write
