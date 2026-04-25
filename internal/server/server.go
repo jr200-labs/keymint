@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/jr200-labs/keymint/internal/config"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 // MintFunc is the contract for producing an installation token given
@@ -51,6 +53,7 @@ type Server struct {
 	mint           MintFunc
 	tokenReviewer  TokenReviewer
 	allowedSubject map[string]map[string]bool // subject -> keys -> true
+	limiter        *rate.Limiter
 }
 
 // TokenReviewer abstracts the k8s TokenReview call so tests can
@@ -87,6 +90,7 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer) (*Server, er
 		mint:           mint,
 		tokenReviewer:  reviewer,
 		allowedSubject: allowed,
+		limiter:        rate.NewLimiter(rate.Limit(100), 200),
 	}, nil
 }
 
@@ -99,6 +103,20 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusInternalServerError, "config missing")
+		return
+	}
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		if _, err := os.Stat(saTokenPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "sa token missing")
+			return
+		}
+		if _, err := os.Stat(saCAPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "sa ca missing")
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
@@ -113,6 +131,11 @@ type errorResponse struct {
 }
 
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.Allow() {
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+
 	keyName := r.PathValue("key")
 	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
 
@@ -230,7 +253,7 @@ func NewK8sTokenReviewer() (*K8sTokenReviewer, error) {
 	}
 
 	return &K8sTokenReviewer{
-		apiServer: fmt.Sprintf("https://%s:%s", host, port),
+		apiServer: fmt.Sprintf("https://%s", net.JoinHostPort(host, port)),
 		saToken:   strings.TrimSpace(string(saTokenBytes)),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
@@ -291,7 +314,7 @@ func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, er
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("server: read tokenreview response: %w", err)
 	}

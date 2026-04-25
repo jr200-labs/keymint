@@ -47,5 +47,5 @@ func Decrypt(ctx context.Context, path string) ([]byte, error) {
 	if path == "" {
 		return nil, fmt.Errorf("sops: empty path")
 	}
-	return runner(ctx, "-d", path)
+	return runner(ctx, "-d", "--", path)
 }

@@ -15,23 +15,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
-
-// gitURLOwnerPattern extracts the owner segment from any common git
-// URL form on github.com:
-//
-//	https://github.com/owner/repo(.git)?
-//	git@github.com:owner/repo(.git)?
-//	ssh://git@github.com/owner/repo(.git)?
-//
-// All three put the owner directly after the host, separated by
-// either `/` (HTTPS, ssh://) or `:` (SCP-style SSH).
-var gitURLOwnerPattern = regexp.MustCompile(`github\.com[/:]([^/]+)/`)
 
 // Config is the top-level configuration structure.
 type Config struct {
@@ -71,8 +62,7 @@ type Key struct {
 	// GitHubOwner is the GitHub user or organization this Key signs
 	// tokens for. Used by the git credential helper to route a given
 	// remote URL to the right Key by extracting the owner segment
-	// from the URL and comparing exactly. Example: "whengas",
-	// "jr200-labs".
+	// from the URL and comparing exactly. Example: "example-org".
 	GitHubOwner string `yaml:"github_owner,omitempty"`
 
 	// APIBaseURL overrides the GitHub REST API base URL for this Key.
@@ -172,13 +162,32 @@ func (c *Config) Validate() error {
 //
 // Used by the git credential helper to route remotes to the right
 // App. Handles HTTPS and SCP-style / ssh:// URL forms.
-func (c *Config) FindByGitHubURL(url string) (string, *Key, bool) {
-	owner := parseGitHubOwner(url)
+func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
+	if !strings.Contains(gitURL, "://") && strings.Contains(gitURL, ":") {
+		gitURL = "ssh://" + strings.Replace(gitURL, ":", "/", 1)
+	}
+	u, err := url.Parse(gitURL)
+	if err != nil {
+		return "", nil, false
+	}
+	host := u.Host
+	if strings.Contains(host, ":") {
+		h, _, err := net.SplitHostPort(host)
+		if err == nil {
+			host = h
+		}
+	}
+
+	owner := parseGitHubOwner(gitURL)
 	if owner == "" {
 		return "", nil, false
 	}
 	for name, k := range c.Keys {
-		if k.GitHubOwner == owner {
+		isGitHub := strings.EqualFold(host, "github.com") || (k.APIBaseURL != "" && strings.Contains(k.APIBaseURL, host))
+		if !isGitHub {
+			continue
+		}
+		if strings.EqualFold(k.GitHubOwner, owner) {
 			key := k
 			return name, &key, true
 		}
@@ -186,10 +195,20 @@ func (c *Config) FindByGitHubURL(url string) (string, *Key, bool) {
 	return "", nil, false
 }
 
-func parseGitHubOwner(url string) string {
-	m := gitURLOwnerPattern.FindStringSubmatch(url)
-	if len(m) == 2 {
-		return m[1]
+func parseGitHubOwner(gitURL string) string {
+	// Convert SCP-style SSH URLs (git@host:owner/repo) to standard URI format
+	if !strings.Contains(gitURL, "://") && strings.Contains(gitURL, ":") {
+		gitURL = "ssh://" + strings.Replace(gitURL, ":", "/", 1)
+	}
+
+	u, err := url.Parse(gitURL)
+	if err != nil {
+		return ""
+	}
+
+	pathParts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(pathParts) > 0 && pathParts[0] != "" {
+		return pathParts[0]
 	}
 	return ""
 }

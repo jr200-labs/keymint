@@ -13,11 +13,11 @@ import (
 func TestGet_HappyPath(t *testing.T) {
 	cfg := &config.Config{
 		Keys: map[string]config.Key{
-			"whengas": {
+			"org-a": {
 				AppID:          1,
 				InstallationID: 1,
-				PrivateKeyFile: "/tmp/whengas.pem",
-				GitHubOwner:    "whengas",
+				PrivateKeyFile: "/tmp/org-a.pem",
+				GitHubOwner:    "example-org-a",
 			},
 		},
 	}
@@ -25,7 +25,7 @@ func TestGet_HappyPath(t *testing.T) {
 	called := 0
 	mintFn := func(_ context.Context, k config.Key) (string, error) {
 		called++
-		if k.GitHubOwner != "whengas" {
+		if k.GitHubOwner != "example-org-a" {
 			t.Errorf("mint called with wrong key: %v", k)
 		}
 		return "ghs_synthetic", nil
@@ -34,7 +34,7 @@ func TestGet_HappyPath(t *testing.T) {
 	in := strings.NewReader(strings.Join([]string{
 		"protocol=https",
 		"host=github.com",
-		"path=whengas/whengas-iac.git",
+		"path=example-org-a/example-repo.git",
 		"",
 	}, "\n"))
 	out := &bytes.Buffer{}
@@ -57,7 +57,7 @@ func TestGet_HappyPath(t *testing.T) {
 func TestGet_NoMatchingKey(t *testing.T) {
 	cfg := &config.Config{
 		Keys: map[string]config.Key{
-			"whengas": {GitHubOwner: "whengas"},
+			"org-a": {GitHubOwner: "org-a"},
 		},
 	}
 
@@ -83,7 +83,7 @@ func TestGet_NoMatchingKey(t *testing.T) {
 
 func TestGet_MissingPath(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {GitHubOwner: "whengas"}},
+		Keys: map[string]config.Key{"org-a": {GitHubOwner: "example-org-a"}},
 	}
 	in := strings.NewReader("protocol=https\nhost=github.com\n\n")
 	out := &bytes.Buffer{}
@@ -96,7 +96,7 @@ func TestGet_MissingPath(t *testing.T) {
 
 func TestGet_MissingHost(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {GitHubOwner: "whengas"}},
+		Keys: map[string]config.Key{"org-a": {GitHubOwner: "example-org-a"}},
 	}
 	in := strings.NewReader("protocol=https\n\n")
 	out := &bytes.Buffer{}
@@ -109,12 +109,12 @@ func TestGet_MissingHost(t *testing.T) {
 
 func TestGet_MintError(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {GitHubOwner: "whengas"}},
+		Keys: map[string]config.Key{"org-a": {GitHubOwner: "example-org-a"}},
 	}
 	mintFn := func(_ context.Context, _ config.Key) (string, error) {
 		return "", errors.New("synthetic mint failure")
 	}
-	in := strings.NewReader("protocol=https\nhost=github.com\npath=whengas/repo.git\n\n")
+	in := strings.NewReader("protocol=https\nhost=github.com\npath=example-org-a/example-repo.git\n\n")
 	out := &bytes.Buffer{}
 
 	err := Get(context.Background(), in, out, cfg, mintFn)
@@ -128,7 +128,7 @@ func TestGet_MalformedLine(t *testing.T) {
 	// "be liberal in what you accept" guidance.
 	cfg := &config.Config{
 		Keys: map[string]config.Key{
-			"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x", GitHubOwner: "whengas"},
+			"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x", GitHubOwner: "example-org-a"},
 		},
 	}
 	mintFn := func(_ context.Context, _ config.Key) (string, error) {
@@ -138,7 +138,7 @@ func TestGet_MalformedLine(t *testing.T) {
 		"garbage line with no equals",
 		"protocol=https",
 		"host=github.com",
-		"path=whengas/repo.git",
+		"path=example-org-a/example-repo.git",
 		"",
 	}, "\n"))
 	out := &bytes.Buffer{}
@@ -168,8 +168,8 @@ func TestReconstructURL(t *testing.T) {
 		attrs map[string]string
 		want  string
 	}{
-		{"full", map[string]string{"protocol": "https", "host": "github.com", "path": "whengas/repo.git"}, "https://github.com/whengas/repo.git"},
-		{"default protocol", map[string]string{"host": "github.com", "path": "whengas/repo.git"}, "https://github.com/whengas/repo.git"},
+		{"full", map[string]string{"protocol": "https", "host": "github.com", "path": "example-org-a/example-repo.git"}, "https://github.com/example-org-a/example-repo.git"},
+		{"default protocol", map[string]string{"host": "github.com", "path": "example-org-a/example-repo.git"}, "https://github.com/example-org-a/example-repo.git"},
 		{"no path", map[string]string{"protocol": "https", "host": "github.com"}, "https://github.com"},
 		{"no host", map[string]string{"protocol": "https"}, ""},
 	}

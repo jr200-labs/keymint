@@ -34,15 +34,15 @@ the mint call only.
 Example config (~/.config/keymint/config.yaml):
 
     keys:
-      whengas:
-        app_id:           3495091
-        install_id:       126859631
-        private_key_sops: ~/.config/keymint/whengas.sops.pem
-        github_owner:     whengas
+      org-a:
+        app_id:           12345
+        install_id:       67890
+        private_key_sops: ~/.config/keymint/org-a.sops.pem
+        github_owner:     example-org
 
 Then:
 
-    keymint mint whengas
+    keymint mint org-a
 `,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {

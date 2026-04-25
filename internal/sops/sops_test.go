@@ -29,7 +29,7 @@ func TestDecrypt_ShellsOutWithCorrectArgs(t *testing.T) {
 	if string(got) != "plaintext-pem" {
 		t.Errorf("got %q, want plaintext-pem", got)
 	}
-	wantArgs := []string{"-d", "/path/to/key.sops.pem"}
+	wantArgs := []string{"-d", "--", "/path/to/key.sops.pem"}
 	if !equal(capturedArgs, wantArgs) {
 		t.Errorf("args = %v, want %v", capturedArgs, wantArgs)
 	}

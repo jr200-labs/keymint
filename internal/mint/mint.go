@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -38,6 +39,9 @@ const DefaultGitHubAPI = "https://api.github.com"
 // rejects JWTs older than 10 minutes; we set a slightly shorter window
 // to leave headroom for clock skew.
 const jwtLifetime = 9 * time.Minute
+
+// clockOffset holds the drift in seconds between local time and GitHub API.
+var clockOffset int64
 
 // Request describes a single token-mint operation.
 type Request struct {
@@ -120,7 +124,8 @@ func Mint(ctx context.Context, req Request) (Token, error) {
 		return Token{}, errors.New("mint: InstallationID is required")
 	}
 
-	signed, err := signAppJWT(req.AppID, req.PrivateKey, time.Now())
+	now := time.Now().Add(time.Duration(atomic.LoadInt64(&clockOffset)) * time.Second)
+	signed, err := signAppJWT(req.AppID, req.PrivateKey, now)
 	if err != nil {
 		return Token{}, err
 	}
@@ -178,7 +183,14 @@ func exchangeForInstallationToken(ctx context.Context, appJWT string, req Reques
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	if dateHdr := resp.Header.Get("Date"); dateHdr != "" {
+		if ghTime, err := time.Parse(time.RFC1123, dateHdr); err == nil {
+			offset := int64(time.Until(ghTime).Seconds())
+			atomic.StoreInt64(&clockOffset, offset)
+		}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return Token{}, fmt.Errorf("mint: read response: %w", err)
 	}
