@@ -84,6 +84,42 @@ make test       # unit tests
 make test-race  # with race detector + coverage
 ```
 
+## Service-mode security requirements
+
+Service mode enforces several invariants. Operators must configure
+the deploy accordingly:
+
+- **Audience-bound TokenReview.** The keymint config must set
+  `expected_audiences:` to a non-empty list. keymint forwards those
+  audiences into the `TokenReview` API and rejects any inbound token
+  whose audiences don't intersect with them. Configure callers'
+  projected ServiceAccount volumes with a matching `audience:` value
+  (e.g. `keymint`).
+
+  ```yaml
+  expected_audiences: [keymint]
+  ```
+
+- **SA token rotation.** keymint re-reads its own pod's projected SA
+  token from `/var/run/secrets/kubernetes.io/serviceaccount/token` on
+  every `TokenReview` call. Use a projected SA volume so the kubelet
+  rotates the token in place; do not bake the token into an env var.
+
+- **Two-tier rate limiting.** Inbound requests are rate-limited
+  per-remote-IP before authentication (10 r/s, burst 20) and
+  per-resolved-ServiceAccount after authentication (100 r/s, burst
+  200). A flooder cannot exhaust an authenticated caller's bucket.
+
+- **Single-flight token caching.** When a cached installation token
+  expires, only one in-flight request actually mints a new one;
+  others wait and reuse its result. Prevents thundering-herd
+  scenarios from triggering GitHub's secondary rate limits.
+
+- **Per-endpoint clock-drift tracking.** GitHub `Date`-header drift
+  is cached separately for `api.github.com` and any GitHub
+  Enterprise base URL configured per key. A sick GHE clock cannot
+  poison signing for unrelated endpoints.
+
 ## Observability
 
 Service mode emits structured (zap) logs, OpenTelemetry traces, and

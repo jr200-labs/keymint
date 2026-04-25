@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,6 +181,51 @@ func TestMint_GitHubError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "401") {
 		t.Errorf("error should mention 401: %v", err)
+	}
+}
+
+func TestClockOffset_PerEndpoint(t *testing.T) {
+	// Two pretend GHE endpoints with very different clocks. After
+	// minting against each, their cached offsets must remain distinct
+	// — a sick clock on one endpoint must not poison the other.
+	clockOffsets = sync.Map{} // reset
+
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Date", time.Now().Add(2*time.Hour).UTC().Format(time.RFC1123))
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(Token{Token: "t1", ExpiresAt: time.Now().Add(time.Hour)})
+	}))
+	defer server1.Close()
+
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// "good" clock: matches local
+		w.Header().Set("Date", time.Now().UTC().Format(time.RFC1123))
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(Token{Token: "t2", ExpiresAt: time.Now().Add(time.Hour)})
+	}))
+	defer server2.Close()
+
+	key := generateTestKey(t)
+	for _, srv := range []string{server1.URL, server2.URL} {
+		if _, err := Mint(context.Background(), Request{
+			AppID: 1, InstallationID: 1, PrivateKey: key, APIBaseURL: srv,
+		}); err != nil {
+			t.Fatalf("mint to %s: %v", srv, err)
+		}
+	}
+
+	off1 := loadClockOffset(server1.URL)
+	off2 := loadClockOffset(server2.URL)
+	if off1 < time.Hour {
+		t.Errorf("server1 offset = %v, expected ≥ 1h drift", off1)
+	}
+	// off2 should be near zero (a few seconds at most)
+	if off2 > 10*time.Second || off2 < -10*time.Second {
+		t.Errorf("server2 offset = %v, expected near zero", off2)
+	}
+	// Most importantly: distinct.
+	if off1 == off2 {
+		t.Errorf("offsets collapsed to a single value (%v); per-endpoint scoping broken", off1)
 	}
 }
 

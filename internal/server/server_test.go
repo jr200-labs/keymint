@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
+	"golang.org/x/time/rate"
 )
 
 // fakeReviewer is a TokenReviewer that returns canned values without
@@ -275,6 +276,73 @@ func TestNew_Validation(t *testing.T) {
 	}
 	if _, err := New(&config.Config{}, mint, nil, nil); err == nil {
 		t.Errorf("expected error for nil reviewer")
+	}
+}
+
+func TestAudienceIntersect(t *testing.T) {
+	cases := []struct {
+		name string
+		got  []string
+		want []string
+		hit  bool
+	}{
+		{"both empty", nil, nil, false},
+		{"got empty", nil, []string{"keymint"}, false},
+		{"want empty", []string{"keymint"}, nil, false},
+		{"single match", []string{"keymint"}, []string{"keymint"}, true},
+		{"multi got, one match", []string{"a", "b", "keymint"}, []string{"keymint", "vault"}, true},
+		{"no match", []string{"vault"}, []string{"keymint"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audienceIntersect(tc.got, tc.want); got != tc.hit {
+				t.Errorf("audienceIntersect(%v, %v) = %v, want %v", tc.got, tc.want, got, tc.hit)
+			}
+		})
+	}
+}
+
+func TestPerSubjectRateLimit(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{
+			"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
+		},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
+		},
+	}
+	reviewer := &fakeReviewer{
+		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
+	}
+	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+		return "ghs_x", time.Now().Add(time.Hour), nil
+	}
+	srv, err := New(cfg, mint, reviewer, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Override per-subject limit to a tiny bucket so the test fits.
+	srv.subjectLimit = newLimiterMap(rate.Every(time.Hour), 2)
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	results := make([]int, 4)
+	for i := range results {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token/org-a", nil)
+		req.Header.Set("Authorization", "Bearer sa-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		results[i] = resp.StatusCode
+		_ = resp.Body.Close()
+	}
+	if results[0] != http.StatusOK || results[1] != http.StatusOK {
+		t.Errorf("first two requests = %v, want both 200", results[:2])
+	}
+	if results[2] != http.StatusTooManyRequests || results[3] != http.StatusTooManyRequests {
+		t.Errorf("later requests = %v, want 429", results[2:])
 	}
 }
 

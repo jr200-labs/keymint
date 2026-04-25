@@ -21,6 +21,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/version"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 // newServeCmd implements `keymint serve` — the in-cluster HTTP service
@@ -87,7 +88,7 @@ SOPS files.`,
 				return err
 			}
 
-			reviewer, err := server.NewK8sTokenReviewer()
+			reviewer, err := server.NewK8sTokenReviewer(cfg.ExpectedAudiences)
 			if err != nil {
 				return err
 			}
@@ -99,53 +100,72 @@ SOPS files.`,
 			}
 			keyCache := make(map[string]*rsa.PrivateKey)
 			tokenCache := make(map[string]cachedToken)
+			var sf singleflight.Group
 
 			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
 				cacheKey := fmt.Sprintf("%d-%d", k.AppID, k.InstallationID)
 
+				// Fast path: usable cached token already.
 				cacheMu.RLock()
 				if ct, ok := tokenCache[cacheKey]; ok && time.Now().Add(5*time.Minute).Before(ct.ExpiresAt) {
 					cacheMu.RUnlock()
 					return ct.Token, ct.ExpiresAt, nil
 				}
-				privateKey := keyCache[cacheKey]
 				cacheMu.RUnlock()
 
-				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
-				defer cancel()
+				// Slow path: collapse N concurrent misses for the same
+				// key into a single PEM-load + Mint round-trip via
+				// singleflight. Other callers wait for the first to
+				// complete and reuse its result.
+				v, err, _ := sf.Do(cacheKey, func() (any, error) {
+					// Re-check cache under the singleflight lock; a
+					// previous collapsed call may have already filled it.
+					cacheMu.RLock()
+					if ct, ok := tokenCache[cacheKey]; ok && time.Now().Add(5*time.Minute).Before(ct.ExpiresAt) {
+						cacheMu.RUnlock()
+						return ct, nil
+					}
+					privateKey := keyCache[cacheKey]
+					cacheMu.RUnlock()
 
-				if privateKey == nil {
-					pemBytes, err := readPEM(ctx, k)
-					if err != nil {
-						return "", time.Time{}, err
+					ctx, cancel := context.WithTimeout(ctx, mintTimeout)
+					defer cancel()
+
+					if privateKey == nil {
+						pemBytes, err := readPEM(ctx, k)
+						if err != nil {
+							return cachedToken{}, err
+						}
+						privateKey, err = mint.ParsePrivateKey(pemBytes)
+						if err != nil {
+							return cachedToken{}, err
+						}
+						cacheMu.Lock()
+						keyCache[cacheKey] = privateKey
+						cacheMu.Unlock()
 					}
-					privateKey, err = mint.ParsePrivateKey(pemBytes)
+
+					tok, err := mint.Mint(ctx, mint.Request{
+						AppID:          k.AppID,
+						InstallationID: k.InstallationID,
+						PrivateKey:     privateKey,
+						APIBaseURL:     k.APIBaseURL,
+					})
 					if err != nil {
-						return "", time.Time{}, err
+						return cachedToken{}, err
 					}
+
+					ct := cachedToken{Token: tok.Token, ExpiresAt: tok.ExpiresAt}
 					cacheMu.Lock()
-					keyCache[cacheKey] = privateKey
+					tokenCache[cacheKey] = ct
 					cacheMu.Unlock()
-				}
-
-				tok, err := mint.Mint(ctx, mint.Request{
-					AppID:          k.AppID,
-					InstallationID: k.InstallationID,
-					PrivateKey:     privateKey,
-					APIBaseURL:     k.APIBaseURL,
+					return ct, nil
 				})
 				if err != nil {
 					return "", time.Time{}, err
 				}
-
-				cacheMu.Lock()
-				tokenCache[cacheKey] = cachedToken{
-					Token:     tok.Token,
-					ExpiresAt: tok.ExpiresAt,
-				}
-				cacheMu.Unlock()
-
-				return tok.Token, tok.ExpiresAt, nil
+				ct := v.(cachedToken)
+				return ct.Token, ct.ExpiresAt, nil
 			}
 
 			srv, err := server.New(cfg, mintFn, reviewer, m)
