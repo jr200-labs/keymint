@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
+	"github.com/jr200-labs/keymint/internal/mint"
 	"github.com/jr200-labs/keymint/internal/server"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -25,6 +29,8 @@ func newServeCmd() *cobra.Command {
 		shutdownTimeout time.Duration
 		logLevel        string
 		logHuman        bool
+		certFile        string
+		keyFile         string
 	)
 
 	cmd := &cobra.Command{
@@ -64,13 +70,59 @@ SOPS files.`,
 				return err
 			}
 
+			var cacheMu sync.RWMutex
+			type cachedToken struct {
+				Token     string
+				ExpiresAt time.Time
+			}
+			keyCache := make(map[string]*rsa.PrivateKey)
+			tokenCache := make(map[string]cachedToken)
+
 			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
+				cacheKey := fmt.Sprintf("%d-%d", k.AppID, k.InstallationID)
+
+				cacheMu.RLock()
+				if ct, ok := tokenCache[cacheKey]; ok && time.Now().Add(5*time.Minute).Before(ct.ExpiresAt) {
+					cacheMu.RUnlock()
+					return ct.Token, ct.ExpiresAt, nil
+				}
+				privateKey := keyCache[cacheKey]
+				cacheMu.RUnlock()
+
 				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
 				defer cancel()
-				tok, err := mintForKey(ctx, k)
+
+				if privateKey == nil {
+					pemBytes, err := readPEM(ctx, k)
+					if err != nil {
+						return "", time.Time{}, err
+					}
+					privateKey, err = mint.ParsePrivateKey(pemBytes)
+					if err != nil {
+						return "", time.Time{}, err
+					}
+					cacheMu.Lock()
+					keyCache[cacheKey] = privateKey
+					cacheMu.Unlock()
+				}
+
+				tok, err := mint.Mint(ctx, mint.Request{
+					AppID:          k.AppID,
+					InstallationID: k.InstallationID,
+					PrivateKey:     privateKey,
+					APIBaseURL:     k.APIBaseURL,
+				})
 				if err != nil {
 					return "", time.Time{}, err
 				}
+
+				cacheMu.Lock()
+				tokenCache[cacheKey] = cachedToken{
+					Token:     tok.Token,
+					ExpiresAt: tok.ExpiresAt,
+				}
+				cacheMu.Unlock()
+
 				return tok.Token, tok.ExpiresAt, nil
 			}
 
@@ -83,6 +135,9 @@ SOPS files.`,
 				Addr:              listen,
 				Handler:           srv.Routes(),
 				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				WriteTimeout:      30 * time.Second,
+				IdleTimeout:       120 * time.Second,
 			}
 
 			log.Info("keymint serve starting",
@@ -91,7 +146,13 @@ SOPS files.`,
 				zap.Int("allowlist_entries", len(cfg.Allowlist)),
 			)
 
-			err = httpServer.ListenAndServe()
+			if certFile != "" && keyFile != "" {
+				log.Info("serving with TLS")
+				err = httpServer.ListenAndServeTLS(certFile, keyFile)
+			} else {
+				log.Warn("serving plaintext HTTP (no TLS config provided)")
+				err = httpServer.ListenAndServe()
+			}
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
@@ -105,5 +166,7 @@ SOPS files.`,
 	cmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 15*time.Second, "graceful shutdown grace period (reserved)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: disabled|panic|fatal|error|warn|info|debug|trace")
 	cmd.Flags().BoolVar(&logHuman, "log-human", false, "human-readable log format (default: JSON)")
+	cmd.Flags().StringVar(&certFile, "tls-cert", "", "path to TLS certificate file")
+	cmd.Flags().StringVar(&keyFile, "tls-key", "", "path to TLS private key file")
 	return cmd
 }

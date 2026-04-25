@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -230,7 +231,7 @@ func NewK8sTokenReviewer() (*K8sTokenReviewer, error) {
 	}
 
 	return &K8sTokenReviewer{
-		apiServer: fmt.Sprintf("https://%s:%s", host, port),
+		apiServer: fmt.Sprintf("https://%s", net.JoinHostPort(host, port)),
 		saToken:   strings.TrimSpace(string(saTokenBytes)),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
@@ -291,7 +292,7 @@ func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, er
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("server: read tokenreview response: %w", err)
 	}
