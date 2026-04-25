@@ -3,12 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
-	"github.com/jr200-labs/keymint/internal/mint"
-	"github.com/jr200-labs/keymint/internal/sops"
 	"github.com/spf13/cobra"
 )
 
@@ -38,10 +35,10 @@ Example config (~/.config/keymint/config.yaml):
 
     keys:
       whengas:
-        app_id:        3495091
-        install_id:    126859631
+        app_id:           3495091
+        install_id:       126859631
         private_key_sops: ~/.config/keymint/whengas.sops.pem
-        github_url_match: github.com/whengas
+        github_owner:     whengas
 
 Then:
 
@@ -64,22 +61,7 @@ Then:
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
-			pemBytes, err := readPEM(ctx, entry)
-			if err != nil {
-				return err
-			}
-
-			privateKey, err := mint.ParsePrivateKey(pemBytes)
-			if err != nil {
-				return err
-			}
-
-			tok, err := mint.Mint(ctx, mint.Request{
-				AppID:          entry.AppID,
-				InstallationID: entry.InstallationID,
-				PrivateKey:     privateKey,
-				APIBaseURL:     entry.APIBaseURL,
-			})
+			tok, err := mintForKey(ctx, entry)
 			if err != nil {
 				return err
 			}
@@ -93,15 +75,4 @@ Then:
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "overall mint timeout (decrypt + JWT + GitHub round-trip)")
 
 	return cmd
-}
-
-// readPEM resolves the PEM bytes for a key entry.
-//
-// Precedence: private_key_sops takes priority over private_key_file.
-// Validation in config.Load ensures at least one is set.
-func readPEM(ctx context.Context, k config.Key) ([]byte, error) {
-	if k.PrivateKeySOPS != "" {
-		return sops.Decrypt(ctx, k.PrivateKeySOPS)
-	}
-	return os.ReadFile(k.PrivateKeyFile)
 }
