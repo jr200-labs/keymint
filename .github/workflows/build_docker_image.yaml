@@ -1,0 +1,45 @@
+name: build-docker-image
+
+on:
+  repository_dispatch:
+    types:
+      - dispatch-build-docker-image
+
+  workflow_dispatch:
+    inputs:
+      checkout-ref:
+        description: "checkout ref"
+        required: false
+        type: string
+        default: "refs/heads/master"
+      tag:
+        description: docker-image-tag
+        required: false
+        type: string
+        default: dev
+      platforms:
+        description: platform-filter-json
+        required: false
+        type: string
+        default: |-
+          [ "linux/amd64", "linux/arm64" ]
+
+jobs:
+  configure:
+    uses: jr200-labs/github-action-templates/.github/workflows/preconfigure.yaml@master
+    with:
+      event_name: ${{ toJson(github.event_name) }}
+      event: ${{ toJson(github.event) }}
+
+  main:
+    needs: configure
+    uses: jr200-labs/github-action-templates/.github/workflows/build_docker_image_multiplatform.yaml@master
+    with:
+      checkout-ref: ${{ fromJson(needs.configure.outputs.context).checkout-ref }}
+      registry_name: ghcr.io
+      image_name: ${{ github.repository }}
+      tag: ${{ fromJson(needs.configure.outputs.context).tag }}
+      platforms: ${{ fromJson(needs.configure.outputs.context).platforms }}
+    secrets:
+      registry_username: ${{ github.actor }}
+      registry_token: ${{ secrets.GITHUB_TOKEN }}
