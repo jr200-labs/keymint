@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -149,6 +150,7 @@ type Server struct {
 // (post-auth, generous).
 type limiterMap struct {
 	cache *lru.Cache[string, *rate.Limiter]
+	mu    sync.Mutex // serialises miss-path Get+Add against itself
 	rps   rate.Limit
 	burst int
 }
@@ -167,12 +169,26 @@ func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
 	return &limiterMap{cache: c, rps: rps, burst: burst}
 }
 
+// allow checks the per-key limiter, allocating one on first use.
+//
+// The hit path stays lock-free (lru.Cache.Get is internally
+// synchronised). The miss path uses a mutex with a double-checked
+// re-Get under the lock so a thundering herd of concurrent first
+// requests for the same key all share *one* limiter instead of
+// each instantiating their own and silently bypassing the rate
+// cap.
 func (m *limiterMap) allow(key string) bool {
 	if l, ok := m.cache.Get(key); ok {
 		return l.Allow()
 	}
+	m.mu.Lock()
+	if l, ok := m.cache.Get(key); ok {
+		m.mu.Unlock()
+		return l.Allow()
+	}
 	l := rate.NewLimiter(m.rps, m.burst)
 	m.cache.Add(key, l)
+	m.mu.Unlock()
 	return l.Allow()
 }
 
