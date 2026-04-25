@@ -62,8 +62,7 @@ type Key struct {
 	// GitHubOwner is the GitHub user or organization this Key signs
 	// tokens for. Used by the git credential helper to route a given
 	// remote URL to the right Key by extracting the owner segment
-	// from the URL and comparing exactly. Example: "whengas",
-	// "jr200-labs".
+	// from the URL and comparing exactly. Example: "example-org".
 	GitHubOwner string `yaml:"github_owner,omitempty"`
 
 	// APIBaseURL overrides the GitHub REST API base URL for this Key.

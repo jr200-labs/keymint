@@ -61,10 +61,10 @@ func TestHealthz(t *testing.T) {
 func TestMint_HappyPath(t *testing.T) {
 	cfg := &config.Config{
 		Keys: map[string]config.Key{
-			"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
+			"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
 		},
 		Allowlist: []config.AllowEntry{
-			{Subject: "system:serviceaccount:nclaw:nclaw-runner", Keys: []string{"whengas"}},
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
 		},
 	}
 	expires := time.Date(2026, 4, 25, 13, 0, 0, 0, time.UTC)
@@ -75,13 +75,13 @@ func TestMint_HappyPath(t *testing.T) {
 		return "ghs_synthetic", expires, nil
 	}
 	reviewer := &fakeReviewer{
-		subjectByToken: map[string]string{"valid-sa-token": "system:serviceaccount:nclaw:nclaw-runner"},
+		subjectByToken: map[string]string{"valid-sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 
 	srv := newTestServer(t, cfg, mint, reviewer)
 	defer srv.Close()
 
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/token/whengas", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/token/org-a", nil)
 	req.Header.Set("Authorization", "Bearer valid-sa-token")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -106,14 +106,14 @@ func TestMint_HappyPath(t *testing.T) {
 }
 
 func TestMint_MissingAuth(t *testing.T) {
-	cfg := &config.Config{Keys: map[string]config.Key{"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
+	cfg := &config.Config{Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
 	srv := newTestServer(t, cfg,
 		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
 		&fakeReviewer{},
 	)
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL+"/token/whengas", "", nil)
+	resp, err := http.Post(srv.URL+"/token/org-a", "", nil)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestMint_MissingAuth(t *testing.T) {
 }
 
 func TestMint_TokenReviewRejects(t *testing.T) {
-	cfg := &config.Config{Keys: map[string]config.Key{"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
+	cfg := &config.Config{Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
 	reviewer := &fakeReviewer{}
 	srv := newTestServer(t, cfg,
 		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
@@ -132,7 +132,7 @@ func TestMint_TokenReviewRejects(t *testing.T) {
 	)
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/whengas", nil)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/org-a", nil)
 	req.Header.Set("Authorization", "Bearer not-a-real-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -146,13 +146,13 @@ func TestMint_TokenReviewRejects(t *testing.T) {
 
 func TestMint_SubjectNotInAllowlist(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
 		Allowlist: []config.AllowEntry{
-			{Subject: "system:serviceaccount:other:other", Keys: []string{"whengas"}},
+			{Subject: "system:serviceaccount:other:other", Keys: []string{"org-a"}},
 		},
 	}
 	reviewer := &fakeReviewer{
-		subjectByToken: map[string]string{"caller-token": "system:serviceaccount:nclaw:nclaw-runner"},
+		subjectByToken: map[string]string{"caller-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
 		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
@@ -160,7 +160,7 @@ func TestMint_SubjectNotInAllowlist(t *testing.T) {
 	)
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/whengas", nil)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/org-a", nil)
 	req.Header.Set("Authorization", "Bearer caller-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -175,16 +175,16 @@ func TestMint_SubjectNotInAllowlist(t *testing.T) {
 func TestMint_SubjectAllowedButWrongKey(t *testing.T) {
 	cfg := &config.Config{
 		Keys: map[string]config.Key{
-			"whengas":    {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
-			"jr200-labs": {AppID: 2, InstallationID: 2, PrivateKeyFile: "/y"},
+			"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"},
+			"org-b": {AppID: 2, InstallationID: 2, PrivateKeyFile: "/y"},
 		},
 		Allowlist: []config.AllowEntry{
-			// authorized for whengas only
-			{Subject: "system:serviceaccount:nclaw:nclaw-runner", Keys: []string{"whengas"}},
+			// authorized for org-a only
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
 		},
 	}
 	reviewer := &fakeReviewer{
-		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:nclaw:nclaw-runner"},
+		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
 		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "ghs_x", time.Now(), nil },
@@ -192,8 +192,8 @@ func TestMint_SubjectAllowedButWrongKey(t *testing.T) {
 	)
 	defer srv.Close()
 
-	// Asking for jr200-labs should 403 — same subject, different key.
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/jr200-labs", nil)
+	// Asking for org-b should 403 — same subject, different key.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/org-b", nil)
 	req.Header.Set("Authorization", "Bearer sa-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -207,13 +207,13 @@ func TestMint_SubjectAllowedButWrongKey(t *testing.T) {
 
 func TestMint_UnknownKey(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
 		Allowlist: []config.AllowEntry{
-			{Subject: "system:serviceaccount:nclaw:nclaw-runner", Keys: []string{"whengas"}},
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
 		},
 	}
 	reviewer := &fakeReviewer{
-		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:nclaw:nclaw-runner"},
+		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
 		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "ghs_x", time.Now(), nil },
@@ -237,13 +237,13 @@ func TestMint_UnknownKey(t *testing.T) {
 
 func TestMint_MintFailureBecomes500(t *testing.T) {
 	cfg := &config.Config{
-		Keys: map[string]config.Key{"whengas": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
 		Allowlist: []config.AllowEntry{
-			{Subject: "system:serviceaccount:nclaw:nclaw-runner", Keys: []string{"whengas"}},
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
 		},
 	}
 	reviewer := &fakeReviewer{
-		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:nclaw:nclaw-runner"},
+		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	failingMint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
 		return "", time.Time{}, errors.New("synthetic mint failure")
@@ -251,7 +251,7 @@ func TestMint_MintFailureBecomes500(t *testing.T) {
 	srv := newTestServer(t, cfg, failingMint, reviewer)
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/whengas", nil)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/org-a", nil)
 	req.Header.Set("Authorization", "Bearer sa-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

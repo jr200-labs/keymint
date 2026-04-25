@@ -39,11 +39,5 @@ Two modes:
 ## What this repo does NOT contain
 
 - Helm chart — consumers deploy via stakater/application or their own chart
-- Project-specific config — entirely generic, no whengas/jr200-labs hardcoded
+- Project-specific config — keymint is generic, no caller-specific data
 - Webhook server — token mint only
-
-## Linked work
-
-Built as part of the `Agent identity & merge gate` initiative at
-https://linear.app/whengas/project/agent-identity-and-merge-gate-c8fb12319ebc.
-The parent ticket is WG-105; this repo's scaffolding is WG-119.

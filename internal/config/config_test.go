@@ -20,18 +20,18 @@ func writeYAML(t *testing.T, body string) string {
 func TestLoad_HappyPath(t *testing.T) {
 	path := writeYAML(t, `
 keys:
-  whengas:
+  org-a:
     app_id: 12345
     install_id: 67890
-    private_key_sops: /home/me/.config/keymint/whengas.sops.pem
-    github_owner: whengas
+    private_key_sops: /home/me/.config/keymint/org-a.sops.pem
+    github_owner: example-org
   org-b:
     app_id: 99999
     install_id: 11111
     private_key_file: /etc/keymint/keys/org-b
 allowlist:
-  - subject: system:serviceaccount:nclaw:nclaw-runner
-    keys: [whengas, org-b]
+  - subject: system:serviceaccount:agents:agent-runner
+    keys: [org-a, org-b]
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -40,8 +40,8 @@ allowlist:
 	if got := len(cfg.Keys); got != 2 {
 		t.Errorf("len(Keys) = %d, want 2", got)
 	}
-	if cfg.Keys["whengas"].AppID != 12345 {
-		t.Errorf("whengas AppID = %d, want 12345", cfg.Keys["whengas"].AppID)
+	if cfg.Keys["org-a"].AppID != 12345 {
+		t.Errorf("org-a AppID = %d, want 12345", cfg.Keys["org-a"].AppID)
 	}
 	if len(cfg.Allowlist) != 1 {
 		t.Errorf("len(Allowlist) = %d, want 1", len(cfg.Allowlist))
@@ -58,9 +58,9 @@ func TestLoad_RejectsEmptyKeys(t *testing.T) {
 func TestLoad_RejectsMissingAppID(t *testing.T) {
 	path := writeYAML(t, `
 keys:
-  whengas:
+  org-a:
     install_id: 67890
-    private_key_sops: /tmp/whengas.sops.pem
+    private_key_sops: /tmp/org-a.sops.pem
 `)
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "app_id") {
 		t.Errorf("expected app_id error, got %v", err)
@@ -70,9 +70,9 @@ keys:
 func TestLoad_RejectsMissingInstallID(t *testing.T) {
 	path := writeYAML(t, `
 keys:
-  whengas:
+  org-a:
     app_id: 12345
-    private_key_sops: /tmp/whengas.sops.pem
+    private_key_sops: /tmp/org-a.sops.pem
 `)
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "install_id") {
 		t.Errorf("expected install_id error, got %v", err)
@@ -82,7 +82,7 @@ keys:
 func TestLoad_RejectsNoKeySource(t *testing.T) {
 	path := writeYAML(t, `
 keys:
-  whengas:
+  org-a:
     app_id: 12345
     install_id: 67890
 `)
@@ -94,13 +94,13 @@ keys:
 func TestLoad_RejectsAllowlistUnknownKey(t *testing.T) {
 	path := writeYAML(t, `
 keys:
-  whengas:
+  org-a:
     app_id: 12345
     install_id: 67890
-    private_key_sops: /tmp/whengas.sops.pem
+    private_key_sops: /tmp/org-a.sops.pem
 allowlist:
-  - subject: system:serviceaccount:nclaw:nclaw-runner
-    keys: [whengas, ghost]
+  - subject: system:serviceaccount:agents:agent-runner
+    keys: [org-a, ghost]
 `)
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Errorf("expected unknown-key error, got %v", err)
@@ -110,9 +110,9 @@ allowlist:
 func TestFindByGitHubURL(t *testing.T) {
 	cfg := &Config{
 		Keys: map[string]Key{
-			"whengas":    {GitHubOwner: "whengas"},
-			"jr200-labs": {GitHubOwner: "jr200-labs"},
-			"no-match":   {},
+			"org-a":    {GitHubOwner: "example-org-a"},
+			"org-b":    {GitHubOwner: "example-org-b"},
+			"no-match": {},
 		},
 	}
 	cases := []struct {
@@ -120,10 +120,10 @@ func TestFindByGitHubURL(t *testing.T) {
 		wantName string
 		wantHit  bool
 	}{
-		{"https://github.com/whengas/whengas-iac.git", "whengas", true},
-		{"git@github.com:jr200-labs/keymint.git", "jr200-labs", true},
-		{"ssh://git@github.com/whengas/whengas-api.git", "whengas", true},
-		{"https://gitlab.com/whengas/whengas-iac.git", "", false},
+		{"https://github.com/example-org-a/some-repo.git", "org-a", true},
+		{"git@github.com:example-org-b/another-repo.git", "org-b", true},
+		{"ssh://git@github.com/example-org-a/yet-another.git", "org-a", true},
+		{"https://gitlab.com/example-org-a/some-repo.git", "", false},
 		{"https://github.com/strangerorg/repo.git", "", false},
 		{"", "", false},
 	}
