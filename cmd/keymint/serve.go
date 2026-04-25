@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
 	keymintMetrics "github.com/jr200-labs/keymint/internal/metrics"
@@ -19,6 +20,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/server"
 	"github.com/jr200-labs/keymint/internal/tracing"
 	"github.com/jr200-labs/keymint/internal/version"
+	"github.com/sony/gobreaker"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
@@ -175,6 +177,12 @@ SOPS files.`,
 					InstallationID: k.InstallationID,
 					PrivateKey:     priv,
 					APIBaseURL:     k.APIBaseURL,
+					OnRateLimit: func(apiBase string, remaining int64, resetAt time.Time) {
+						m.GitHubRateLimitRemaining.WithLabelValues(apiBase).Set(float64(remaining))
+						if !resetAt.IsZero() {
+							m.GitHubRateLimitResetUnix.WithLabelValues(apiBase).Set(float64(resetAt.Unix()))
+						}
+					},
 				})
 				if err != nil {
 					return cachedToken{}, err
@@ -284,6 +292,35 @@ SOPS files.`,
 				IdleTimeout:       120 * time.Second,
 			}
 
+			// Hot-reload: watch the config file for changes and call
+			// srv.Reload on each Write. fsnotify also fires Rename
+			// (which is what kubectl apply / kustomize secret-rotate
+			// look like under the hood) — re-establish the watch in
+			// that case.
+			watcherStop := make(chan struct{})
+			go watchConfigFile(configPath, watcherStop, func() {
+				newCfg, err := config.Load(configPath)
+				if err != nil {
+					log.Error("config reload failed; keeping previous config", zap.Error(err))
+					return
+				}
+				if err := srv.Reload(newCfg); err != nil {
+					log.Error("config reload validation failed; keeping previous config", zap.Error(err))
+					return
+				}
+				log.Info("config hot-reloaded",
+					zap.Int("keys", len(newCfg.Keys)),
+					zap.Int("allowlist_entries", len(newCfg.Allowlist)),
+				)
+			})
+			defer close(watcherStop)
+
+			// Pump the GitHub breaker state into a Prometheus gauge
+			// so operators can alert when it opens.
+			breakerStop := make(chan struct{})
+			go pumpGitHubBreakerState(m, breakerStop)
+			defer close(breakerStop)
+
 			log.Info("keymint serve starting",
 				zap.String("listen", listen),
 				zap.String("metrics_listen", metricsListen),
@@ -351,4 +388,76 @@ SOPS files.`,
 	cmd.Flags().StringVar(&certFile, "tls-cert", "", "path to TLS certificate file")
 	cmd.Flags().StringVar(&keyFile, "tls-key", "", "path to TLS private key file")
 	return cmd
+}
+
+// watchConfigFile runs an fsnotify loop on the given path, invoking
+// onChange whenever the file's contents change. Handles both Write
+// events and Rename/Remove sequences (kubectl apply / Kustomize
+// secret rotation use the latter).
+func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		zap.L().Error("config watcher init failed", zap.Error(err))
+		return
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Add(path); err != nil {
+		zap.L().Error("config watcher add failed",
+			zap.String("path", path), zap.Error(err))
+		return
+	}
+
+	for {
+		select {
+		case <-stop:
+			return
+		case event, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+				onChange()
+			}
+			if event.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
+				// File was replaced; the old inode no longer matches.
+				// Re-add the path so we keep watching the new file.
+				_ = w.Remove(path)
+				if err := w.Add(path); err == nil {
+					onChange()
+				}
+			}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			zap.L().Warn("config watcher error", zap.Error(err))
+		}
+	}
+}
+
+// pumpGitHubBreakerState publishes mint.GithubBreakerState() into
+// the Prometheus gauge every few seconds. Cheap, lockless reads.
+func pumpGitHubBreakerState(m *keymintMetrics.Metrics, stop <-chan struct{}) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	publish := func() {
+		switch mint.GithubBreakerState() {
+		case gobreaker.StateClosed:
+			m.GitHubBreakerState.Set(0)
+		case gobreaker.StateHalfOpen:
+			m.GitHubBreakerState.Set(1)
+		case gobreaker.StateOpen:
+			m.GitHubBreakerState.Set(2)
+		}
+	}
+	publish()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			publish()
+		}
+	}
 }

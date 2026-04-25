@@ -25,10 +25,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/sony/gobreaker"
 )
 
 // defaultHTTPClient has explicit Transport tuning so we don't inherit
@@ -55,6 +57,28 @@ var defaultHTTPClient = &http.Client{
 const egressConcurrency = 50
 
 var egressSem = make(chan struct{}, egressConcurrency)
+
+// githubBreaker guards the /access_tokens call so a sustained
+// GitHub outage fails fast (and doesn't pile up egress slots
+// blocking on dead connections).
+//
+// Only infra-level failures count against it: 5xx, transport
+// errors, JWT-rejected (401/403) does NOT — that's an operator
+// configuration problem, not GitHub being down.
+var githubBreaker = gobreaker.NewCircuitBreaker(gobreaker.Settings{
+	Name:        "github-access-tokens",
+	MaxRequests: 1,
+	Interval:    60 * time.Second,
+	Timeout:     30 * time.Second,
+	ReadyToTrip: func(c gobreaker.Counts) bool {
+		// Trip when ≥10 attempts and >50% failed.
+		return c.Requests >= 10 && c.TotalFailures*2 > c.Requests
+	},
+})
+
+// GithubBreakerState exposes the breaker's current state for
+// metric reporting. Callers map: 0 closed / 1 half-open / 2 open.
+func GithubBreakerState() gobreaker.State { return githubBreaker.State() }
 
 // acquireEgress blocks until an outbound slot is available or ctx is
 // cancelled. Returns a release func.
@@ -105,6 +129,14 @@ type Request struct {
 	// exchange. Empty means use http.DefaultClient. Useful for tests
 	// and for callers that want to inject custom transports.
 	HTTPClient *http.Client
+
+	// OnRateLimit, if non-nil, is invoked once per successful
+	// /access_tokens response with the values parsed out of the
+	// X-RateLimit-Remaining and X-RateLimit-Reset headers. Allows
+	// the caller (typically the service-mode entrypoint) to push
+	// the values into Prometheus without coupling the mint package
+	// to the metrics package.
+	OnRateLimit func(apiBase string, remaining int64, resetAt time.Time)
 }
 
 // Token is a minted installation access token.
@@ -220,11 +252,43 @@ func signAppJWT(appID int64, key *rsa.PrivateKey, now time.Time) (string, error)
 
 // exchangeForInstallationToken POSTs the App JWT to the access_tokens
 // endpoint and parses the resulting installation token.
+//
+// The HTTP round-trip is wrapped in a circuit breaker so that a
+// sustained GitHub outage fails fast rather than piling up egress
+// slots on stalled connections. Only infra-level failures count
+// (5xx, transport errors); 4xx (e.g. 401 because the JWT/PEM is
+// wrong) is an operator config bug, not GitHub being down, and is
+// surfaced to the caller WITHOUT incrementing the breaker's
+// failure counter.
 func exchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (Token, error) {
+	out, err := githubBreaker.Execute(func() (interface{}, error) {
+		return doExchangeForInstallationToken(ctx, appJWT, req, apiBase)
+	})
+	if err != nil {
+		return Token{}, err
+	}
+	res := out.(exchangeResult)
+	if res.callerErr != nil {
+		// 4xx response — surfaced as an error but not counted as a
+		// breaker failure.
+		return Token{}, res.callerErr
+	}
+	return res.token, nil
+}
+
+// exchangeResult mirrors reviewResult on the server side: the inner
+// callerErr is for 4xx-style problems we don't want to count
+// against the breaker.
+type exchangeResult struct {
+	token     Token
+	callerErr error
+}
+
+func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (exchangeResult, error) {
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", apiBase, req.InstallationID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
-		return Token{}, fmt.Errorf("mint: build request: %w", err)
+		return exchangeResult{}, fmt.Errorf("mint: build request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+appJWT)
 	httpReq.Header.Set("Accept", "application/vnd.github+json")
@@ -237,13 +301,13 @@ func exchangeForInstallationToken(ctx context.Context, appJWT string, req Reques
 
 	release, err := acquireEgress(ctx)
 	if err != nil {
-		return Token{}, fmt.Errorf("mint: acquire egress slot: %w", err)
+		return exchangeResult{}, fmt.Errorf("mint: acquire egress slot: %w", err)
 	}
 	defer release()
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return Token{}, fmt.Errorf("mint: POST access_tokens: %w", err)
+		return exchangeResult{}, fmt.Errorf("mint: POST access_tokens: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -253,18 +317,35 @@ func exchangeForInstallationToken(ctx context.Context, appJWT string, req Reques
 		}
 	}
 
+	if req.OnRateLimit != nil {
+		remaining, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Remaining"), 10, 64)
+		resetUnix, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
+		var resetAt time.Time
+		if resetUnix > 0 {
+			resetAt = time.Unix(resetUnix, 0)
+		}
+		req.OnRateLimit(apiBase, remaining, resetAt)
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return Token{}, fmt.Errorf("mint: read response: %w", err)
+		return exchangeResult{}, fmt.Errorf("mint: read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusCreated {
-		return Token{}, fmt.Errorf("mint: GitHub returned %d: %s", resp.StatusCode, string(body))
+		// 4xx is a caller-side problem (bad JWT, wrong installation,
+		// suspended app). 5xx is GitHub-side. Let the breaker only
+		// see 5xx + transport failures.
+		errMsg := fmt.Errorf("mint: GitHub returned %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return exchangeResult{callerErr: errMsg}, nil
+		}
+		return exchangeResult{}, errMsg
 	}
 
 	var tok Token
 	if err := json.Unmarshal(body, &tok); err != nil {
-		return Token{}, fmt.Errorf("mint: parse response: %w", err)
+		return exchangeResult{}, fmt.Errorf("mint: parse response: %w", err)
 	}
-	return tok, nil
+	return exchangeResult{token: tok}, nil
 }

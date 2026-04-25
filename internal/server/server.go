@@ -25,8 +25,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,9 +37,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/sony/gobreaker"
@@ -57,15 +61,56 @@ var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/se
 // internal/mint or internal/sops directly.
 type MintFunc func(ctx context.Context, key config.Key) (token string, expiresAt time.Time, err error)
 
+// configSnapshot is an immutable view of the config + the
+// pre-computed allowedSubject lookup, swapped atomically when
+// the operator hot-reloads keymint's config.yaml.
+type configSnapshot struct {
+	cfg            *config.Config
+	allowedSubject map[string]map[string]bool // subject -> keys -> true
+}
+
+// reviewCache caches successful TokenReview lookups for a short TTL,
+// keyed by the SHA-256 of the bearer token (so the raw token never
+// sits in memory as a map key). Drastically reduces apiserver
+// authentication traffic for bursty callers; the TTL is short
+// enough that revoked SAs lose access quickly.
+const (
+	reviewCacheSize = 4096
+	reviewCacheTTL  = 60 * time.Second
+)
+
+type reviewCache struct {
+	cache *expirable.LRU[string, string]
+}
+
+func newReviewCache() *reviewCache {
+	return &reviewCache{
+		cache: expirable.NewLRU[string, string](reviewCacheSize, nil, reviewCacheTTL),
+	}
+}
+
+func (c *reviewCache) hashToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
+}
+
+func (c *reviewCache) get(token string) (string, bool) {
+	return c.cache.Get(c.hashToken(token))
+}
+
+func (c *reviewCache) put(token, subject string) {
+	c.cache.Add(c.hashToken(token), subject)
+}
+
 // Server holds wired-up HTTP server state.
 type Server struct {
-	cfg            *config.Config
-	mint           MintFunc
-	tokenReviewer  TokenReviewer
-	allowedSubject map[string]map[string]bool // subject -> keys -> true
-	preAuthLimit   *limiterMap                // per-IP, evaluated before auth
-	subjectLimit   *limiterMap                // per-resolved-SA, evaluated after auth
-	metrics        *metrics.Metrics
+	snapshot      atomic.Pointer[configSnapshot]
+	mint          MintFunc
+	tokenReviewer TokenReviewer
+	preAuthLimit  *limiterMap // per-IP, evaluated before auth
+	subjectLimit  *limiterMap // per-resolved-SA, evaluated after auth
+	reviewCache   *reviewCache
+	metrics       *metrics.Metrics
 }
 
 // limiterMap holds a per-key rate.Limiter behind an LRU so a slow
@@ -129,6 +174,26 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 		return nil, errors.New("server: reviewer is required")
 	}
 
+	s := &Server{
+		mint:          mint,
+		tokenReviewer: reviewer,
+		// Pre-auth (per-IP): tight bucket. Anonymous floods here just
+		// burn the attacker's own bucket and never reach the
+		// kubernetes TokenReview API.
+		preAuthLimit: newLimiterMap(rate.Limit(10), 20),
+		// Post-auth (per-subject): generous bucket for legitimate
+		// authenticated callers minting frequently.
+		subjectLimit: newLimiterMap(rate.Limit(100), 200),
+		reviewCache:  newReviewCache(),
+		metrics:      m,
+	}
+	s.snapshot.Store(buildSnapshot(cfg))
+	return s, nil
+}
+
+// buildSnapshot precomputes the subject -> keys allow map for fast
+// lookup at request time.
+func buildSnapshot(cfg *config.Config) *configSnapshot {
 	allowed := make(map[string]map[string]bool, len(cfg.Allowlist))
 	for _, e := range cfg.Allowlist {
 		if allowed[e.Subject] == nil {
@@ -138,21 +203,28 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 			allowed[e.Subject][k] = true
 		}
 	}
+	return &configSnapshot{cfg: cfg, allowedSubject: allowed}
+}
 
-	return &Server{
-		cfg:            cfg,
-		mint:           mint,
-		tokenReviewer:  reviewer,
-		allowedSubject: allowed,
-		// Pre-auth (per-IP): tight bucket. Anonymous floods here just
-		// burn the attacker's own bucket and never reach the
-		// kubernetes TokenReview API.
-		preAuthLimit: newLimiterMap(rate.Limit(10), 20),
-		// Post-auth (per-subject): generous bucket for legitimate
-		// authenticated callers minting frequently.
-		subjectLimit: newLimiterMap(rate.Limit(100), 200),
-		metrics:      m,
-	}, nil
+// Reload swaps in a new validated config atomically. Returns an
+// error if the new config fails validation; the existing snapshot
+// is left unchanged in that case so a bad reload cannot break a
+// running server.
+func (s *Server) Reload(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("server: nil config")
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("server: reload validation: %w", err)
+	}
+	s.snapshot.Store(buildSnapshot(cfg))
+	return nil
+}
+
+// snapshot accessors used by handlers.
+func (s *Server) currentConfig() *config.Config { return s.snapshot.Load().cfg }
+func (s *Server) currentAllowed() map[string]map[string]bool {
+	return s.snapshot.Load().allowedSubject
 }
 
 // Routes returns an http.Handler that serves keymint's API.
@@ -164,7 +236,7 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	if s.cfg == nil {
+	if s.currentConfig() == nil {
 		writeJSONError(w, http.StatusInternalServerError, "config missing")
 		return
 	}
@@ -201,7 +273,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// error message and structured log fields where cardinality is
 	// not a concern.
 	metricKey := metrics.UnknownKey
-	if _, ok := s.cfg.Keys[keyName]; ok {
+	if _, ok := s.currentConfig().Keys[keyName]; ok {
 		metricKey = keyName
 	}
 
@@ -242,21 +314,32 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Validate via TokenReview (audience-bound, SA token re-read)
-	subject, err := s.tokenReviewer.Review(ctx, bearer)
-	if err != nil {
-		if s.metrics != nil {
-			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
+	// 2. Validate via TokenReview (audience-bound, SA token re-read).
+	//    A short-lived cache shields the apiserver from bursts;
+	//    entries expire after reviewCacheTTL so revoked SAs lose
+	//    access promptly.
+	subject, cacheHit := s.reviewCache.get(bearer)
+	if cacheHit {
+		s.recordCacheLookup(metrics.CacheHit)
+	} else {
+		s.recordCacheLookup(metrics.CacheMiss)
+		var err error
+		subject, err = s.tokenReviewer.Review(ctx, bearer)
+		if err != nil {
+			if s.metrics != nil {
+				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
+			}
+			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "tokenreview failed")
+			log.Warn("tokenreview failed", zap.Error(err))
+			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
+			return
 		}
-		s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "tokenreview failed")
-		log.Warn("tokenreview failed", zap.Error(err))
-		writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
-		return
-	}
-	if s.metrics != nil {
-		s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
+		if s.metrics != nil {
+			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
+		}
+		s.reviewCache.put(bearer, subject)
 	}
 	span.SetAttributes(attribute.String("k8s.serviceaccount.subject", subject))
 	log = log.With(zap.String("subject", subject))
@@ -281,7 +364,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Look up key (already validated when computing metricKey, but
 	// keep an explicit branch for the 404 outcome).
-	keyEntry, ok := s.cfg.Keys[keyName]
+	keyEntry, ok := s.currentConfig().Keys[keyName]
 	if !ok {
 		s.recordOutcome(span, metricKey, metrics.OutcomeUnknownKey)
 		span.SetStatus(codes.Error, "unknown key")
@@ -319,8 +402,14 @@ func (s *Server) recordOutcome(span trace.Span, keyName, outcome string) {
 	}
 }
 
+func (s *Server) recordCacheLookup(result string) {
+	if s.metrics != nil {
+		s.metrics.TokenReviewCacheTotal.WithLabelValues(result).Inc()
+	}
+}
+
 func (s *Server) subjectMayMint(subject, key string) bool {
-	keys, ok := s.allowedSubject[subject]
+	keys, ok := s.currentAllowed()[subject]
 	if !ok {
 		return false
 	}
