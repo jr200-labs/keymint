@@ -101,9 +101,11 @@ keymint cannot tell which org's App should sign the token.
 
 ## Releasing
 
-Releases are fully automated via release-please. Conventional commits
-to `master` accumulate in a Release PR; merging that PR tags + cuts a
-GitHub Release, which dispatches the container build to ghcr.io.
+Releases are fully automated via release-please. Each PR merged to
+`master` (squash, conventional commit) is picked up by release-please,
+which keeps an open Release PR with the next version + changelog.
+Merging that Release PR tags the version and cuts a GitHub Release,
+which dispatches the container build to ghcr.io.
 
 Never bump versions by hand.
 
