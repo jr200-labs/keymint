@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
@@ -61,12 +62,43 @@ type Server struct {
 	mint           MintFunc
 	tokenReviewer  TokenReviewer
 	allowedSubject map[string]map[string]bool // subject -> keys -> true
-	limiter        *rate.Limiter
+	preAuthLimit   *limiterMap                // per-IP, evaluated before auth
+	subjectLimit   *limiterMap                // per-resolved-SA, evaluated after auth
 	metrics        *metrics.Metrics
+}
+
+// limiterMap holds a per-key rate.Limiter, lazily allocated on first
+// observation. Each Server keeps two of these — one keyed by remote
+// IP (cheap pre-auth gate) and one keyed by the resolved
+// ServiceAccount subject (post-auth, generous).
+type limiterMap struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	rps      rate.Limit
+	burst    int
+}
+
+func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
+	return &limiterMap{limiters: make(map[string]*rate.Limiter), rps: rps, burst: burst}
+}
+
+func (m *limiterMap) allow(key string) bool {
+	m.mu.Lock()
+	l, ok := m.limiters[key]
+	if !ok {
+		l = rate.NewLimiter(m.rps, m.burst)
+		m.limiters[key] = l
+	}
+	m.mu.Unlock()
+	return l.Allow()
 }
 
 // TokenReviewer abstracts the k8s TokenReview call so tests can
 // substitute a fake.
+//
+// The implementation MUST honour the operator-supplied audience list
+// when calling the kubernetes API, so a stolen SA token bound to a
+// different audience cannot be replayed against keymint.
 type TokenReviewer interface {
 	Review(ctx context.Context, token string) (subject string, err error)
 }
@@ -101,8 +133,14 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 		mint:           mint,
 		tokenReviewer:  reviewer,
 		allowedSubject: allowed,
-		limiter:        rate.NewLimiter(rate.Limit(100), 200),
-		metrics:        m,
+		// Pre-auth (per-IP): tight bucket. Anonymous floods here just
+		// burn the attacker's own bucket and never reach the
+		// kubernetes TokenReview API.
+		preAuthLimit: newLimiterMap(rate.Limit(10), 20),
+		// Post-auth (per-subject): generous bucket for legitimate
+		// authenticated callers minting frequently.
+		subjectLimit: newLimiterMap(rate.Limit(100), 200),
+		metrics:      m,
 	}, nil
 }
 
@@ -164,9 +202,11 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
 
-	if !s.limiter.Allow() {
+	// Pre-auth rate limit: per-remote-IP. Cheap, scoped to attacker so
+	// flooders cannot exhaust authenticated callers' budget.
+	if !s.preAuthLimit.allow(remoteIP(r)) {
 		s.recordOutcome(span, keyName, metrics.OutcomeRateLimited)
-		span.SetStatus(codes.Error, "rate limited")
+		span.SetStatus(codes.Error, "rate limited (pre-auth)")
 		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
@@ -180,7 +220,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Validate via TokenReview
+	// 2. Validate via TokenReview (audience-bound, SA token re-read)
 	subject, err := s.tokenReviewer.Review(ctx, bearer)
 	if err != nil {
 		if s.metrics != nil {
@@ -198,6 +238,15 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	}
 	span.SetAttributes(attribute.String("k8s.serviceaccount.subject", subject))
 	log = log.With(zap.String("subject", subject))
+
+	// Post-auth rate limit: per-subject. Caps any single legitimate
+	// service that goes haywire.
+	if !s.subjectLimit.allow(subject) {
+		s.recordOutcome(span, keyName, metrics.OutcomeRateLimited)
+		span.SetStatus(codes.Error, "rate limited (per-subject)")
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+		return
+	}
 
 	// 3. Allowlist check
 	if !s.subjectMayMint(subject, keyName) {
@@ -255,6 +304,17 @@ func (s *Server) subjectMayMint(subject, key string) bool {
 	return keys[key]
 }
 
+// remoteIP returns the IP portion of r.RemoteAddr, or the whole
+// string if it does not parse as host:port. Good enough for keying
+// the per-IP rate limiter; not used for authorization.
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // bearerToken extracts a bearer token from the Authorization header.
 // Returns (token, true) if present and well-formed.
 func bearerToken(r *http.Request) (string, bool) {
@@ -286,19 +346,29 @@ const (
 // K8sTokenReviewer talks to the in-cluster Kubernetes API to validate
 // inbound bearer tokens via the TokenReview API.
 type K8sTokenReviewer struct {
-	apiServer  string
-	saToken    string
-	httpClient *http.Client
+	apiServer         string
+	saTokenPath       string // re-read on every call — kubelet rotates this file
+	expectedAudiences []string
+	httpClient        *http.Client
 }
 
 // NewK8sTokenReviewer constructs a reviewer using the standard
 // in-pod service account credentials. Returns an error if the pod
 // is not running with a mounted service account.
-func NewK8sTokenReviewer() (*K8sTokenReviewer, error) {
+//
+// expectedAudiences is mandatory. It is forwarded to the TokenReview
+// API as Spec.Audiences so the caller's token is verified to have
+// been issued for one of these audiences. Operators must configure
+// the keymint pod and its callers to use a matching projected SA
+// volume audience.
+func NewK8sTokenReviewer(expectedAudiences []string) (*K8sTokenReviewer, error) {
 	host := os.Getenv("KUBERNETES_SERVICE_HOST")
 	port := os.Getenv("KUBERNETES_SERVICE_PORT")
 	if host == "" || port == "" {
 		return nil, errors.New("server: KUBERNETES_SERVICE_HOST/PORT not set — not running in-cluster?")
+	}
+	if len(expectedAudiences) == 0 {
+		return nil, errors.New("server: expected_audiences must be non-empty (set in keymint config)")
 	}
 
 	caBytes, err := os.ReadFile(saCAPath)
@@ -310,14 +380,18 @@ func NewK8sTokenReviewer() (*K8sTokenReviewer, error) {
 		return nil, errors.New("server: ca.crt is not a valid PEM")
 	}
 
-	saTokenBytes, err := os.ReadFile(saTokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("server: read service account token: %w", err)
+	// Sanity-check that the SA token file exists and is readable now;
+	// the actual content is re-read per call so kubelet rotation
+	// (typical projected-volume default ~1h) does not silently expire
+	// our cached token.
+	if _, err := os.Stat(saTokenPath); err != nil {
+		return nil, fmt.Errorf("server: stat service account token: %w", err)
 	}
 
 	return &K8sTokenReviewer{
-		apiServer: fmt.Sprintf("https://%s", net.JoinHostPort(host, port)),
-		saToken:   strings.TrimSpace(string(saTokenBytes)),
+		apiServer:         fmt.Sprintf("https://%s", net.JoinHostPort(host, port)),
+		saTokenPath:       saTokenPath,
+		expectedAudiences: append([]string(nil), expectedAudiences...),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
@@ -337,7 +411,8 @@ type tokenReviewRequest struct {
 }
 
 type tokenReviewRequestSpec struct {
-	Token string `json:"token"`
+	Token     string   `json:"token"`
+	Audiences []string `json:"audiences,omitempty"`
 }
 
 type tokenReviewResponse struct {
@@ -346,28 +421,40 @@ type tokenReviewResponse struct {
 		User          struct {
 			Username string `json:"username"`
 		} `json:"user"`
-		Error string `json:"error,omitempty"`
+		Audiences []string `json:"audiences,omitempty"`
+		Error     string   `json:"error,omitempty"`
 	} `json:"status"`
 }
 
 // Review POSTs a TokenReview to the API server and returns the
-// resolved username on success.
+// resolved username on success. The pod's own SA token is re-read
+// from disk on each call so kubelet-rotated projected tokens stay
+// valid for the lifetime of the process.
 func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, error) {
 	body, err := json.Marshal(tokenReviewRequest{
 		APIVersion: "authentication.k8s.io/v1",
 		Kind:       "TokenReview",
-		Spec:       tokenReviewRequestSpec{Token: token},
+		Spec: tokenReviewRequestSpec{
+			Token:     token,
+			Audiences: r.expectedAudiences,
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("server: marshal tokenreview: %w", err)
 	}
+
+	saTokenBytes, err := os.ReadFile(r.saTokenPath)
+	if err != nil {
+		return "", fmt.Errorf("server: read sa token: %w", err)
+	}
+	saToken := strings.TrimSpace(string(saTokenBytes))
 
 	url := r.apiServer + "/apis/authentication.k8s.io/v1/tokenreviews"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("server: build tokenreview request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+r.saToken)
+	req.Header.Set("Authorization", "Bearer "+saToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -395,8 +482,30 @@ func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, er
 		}
 		return "", errors.New("server: tokenreview not authenticated")
 	}
+	if !audienceIntersect(out.Status.Audiences, r.expectedAudiences) {
+		return "", fmt.Errorf("server: tokenreview returned audiences %v, none match expected %v", out.Status.Audiences, r.expectedAudiences)
+	}
 	if out.Status.User.Username == "" {
 		return "", errors.New("server: tokenreview returned empty username")
 	}
 	return out.Status.User.Username, nil
+}
+
+// audienceIntersect returns true if any audience in got is also in
+// want. Empty got is treated as a mismatch — if the operator asked
+// for audience binding we require the apiserver to return one.
+func audienceIntersect(got, want []string) bool {
+	if len(got) == 0 || len(want) == 0 {
+		return false
+	}
+	have := make(map[string]struct{}, len(got))
+	for _, a := range got {
+		have[a] = struct{}{}
+	}
+	for _, a := range want {
+		if _, ok := have[a]; ok {
+			return true
+		}
+	}
+	return false
 }

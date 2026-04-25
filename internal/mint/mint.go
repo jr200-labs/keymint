@@ -25,7 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -40,8 +40,13 @@ const DefaultGitHubAPI = "https://api.github.com"
 // to leave headroom for clock skew.
 const jwtLifetime = 9 * time.Minute
 
-// clockOffset holds the drift in seconds between local time and GitHub API.
-var clockOffset int64
+// clockOffsets holds the most recently observed clock drift, in
+// seconds, between local time and each distinct GitHub API endpoint
+// keymint talks to. Keyed by the resolved API base URL — public
+// github.com and GitHub Enterprise Server installs each have their
+// own offset so a sick GHE clock cannot poison signing for other
+// endpoints.
+var clockOffsets sync.Map // map[string]int64
 
 // Request describes a single token-mint operation.
 type Request struct {
@@ -124,13 +129,35 @@ func Mint(ctx context.Context, req Request) (Token, error) {
 		return Token{}, errors.New("mint: InstallationID is required")
 	}
 
-	now := time.Now().Add(time.Duration(atomic.LoadInt64(&clockOffset)) * time.Second)
+	apiBase := req.APIBaseURL
+	if apiBase == "" {
+		apiBase = DefaultGitHubAPI
+	}
+
+	now := time.Now().Add(loadClockOffset(apiBase))
 	signed, err := signAppJWT(req.AppID, req.PrivateKey, now)
 	if err != nil {
 		return Token{}, err
 	}
 
-	return exchangeForInstallationToken(ctx, signed, req)
+	return exchangeForInstallationToken(ctx, signed, req, apiBase)
+}
+
+// loadClockOffset returns the cached drift for apiBase, or 0 if
+// none has been observed yet.
+func loadClockOffset(apiBase string) time.Duration {
+	v, ok := clockOffsets.Load(apiBase)
+	if !ok {
+		return 0
+	}
+	return time.Duration(v.(int64)) * time.Second
+}
+
+// storeClockOffset records the most recent drift observation for
+// apiBase, scoped per-endpoint so a misconfigured GHE instance
+// cannot pollute signing for unrelated endpoints.
+func storeClockOffset(apiBase string, offset time.Duration) {
+	clockOffsets.Store(apiBase, int64(offset.Seconds()))
 }
 
 // signAppJWT produces a JWT signed with the App's private key, suitable
@@ -157,12 +184,7 @@ func signAppJWT(appID int64, key *rsa.PrivateKey, now time.Time) (string, error)
 
 // exchangeForInstallationToken POSTs the App JWT to the access_tokens
 // endpoint and parses the resulting installation token.
-func exchangeForInstallationToken(ctx context.Context, appJWT string, req Request) (Token, error) {
-	apiBase := req.APIBaseURL
-	if apiBase == "" {
-		apiBase = DefaultGitHubAPI
-	}
-
+func exchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (Token, error) {
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", apiBase, req.InstallationID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
@@ -185,8 +207,7 @@ func exchangeForInstallationToken(ctx context.Context, appJWT string, req Reques
 
 	if dateHdr := resp.Header.Get("Date"); dateHdr != "" {
 		if ghTime, err := time.Parse(time.RFC1123, dateHdr); err == nil {
-			offset := int64(time.Until(ghTime).Seconds())
-			atomic.StoreInt64(&clockOffset, offset)
+			storeClockOffset(apiBase, time.Until(ghTime))
 		}
 	}
 

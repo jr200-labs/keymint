@@ -36,6 +36,14 @@ type Config struct {
 	// Kubernetes ServiceAccount subject (`system:serviceaccount:NS:NAME`)
 	// to the keys it is allowed to mint for.
 	Allowlist []AllowEntry `yaml:"allowlist,omitempty"`
+
+	// ExpectedAudiences is the list of audiences keymint will require
+	// inbound projected ServiceAccount tokens to have been bound to.
+	// Forwarded into TokenReview Spec.Audiences so a stolen token
+	// scoped to a different audience (vault, another service, etc.)
+	// cannot be replayed against keymint. Service mode only; CLI mode
+	// ignores it.
+	ExpectedAudiences []string `yaml:"expected_audiences,omitempty"`
 }
 
 // Key describes one GitHub App.
