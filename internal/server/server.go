@@ -200,8 +200,8 @@ const (
 // K8sTokenReviewer talks to the in-cluster Kubernetes API to validate
 // inbound bearer tokens via the TokenReview API.
 type K8sTokenReviewer struct {
-	apiServer string
-	saToken   string
+	apiServer  string
+	saToken    string
 	httpClient *http.Client
 }
 

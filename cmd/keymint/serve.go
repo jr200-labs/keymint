@@ -19,12 +19,12 @@ import (
 // installation tokens for callers in the SA allowlist.
 func newServeCmd() *cobra.Command {
 	var (
-		listen     string
-		configPath string
-		mintTimeout time.Duration
+		listen          string
+		configPath      string
+		mintTimeout     time.Duration
 		shutdownTimeout time.Duration
-		logLevel   string
-		logHuman   bool
+		logLevel        string
+		logHuman        bool
 	)
 
 	cmd := &cobra.Command{
