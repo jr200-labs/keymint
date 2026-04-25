@@ -355,6 +355,24 @@ func TestPerSubjectRateLimit(t *testing.T) {
 	}
 }
 
+// TestMintAuditFingerprintIsLogged asserts that the minted-token
+// SHA-256 fingerprint is hex-encoded and stable across repeated
+// hashes of the same string. (Full log-capture would couple too
+// tightly to zap internals.)
+func TestMintAuditFingerprintIsStable(t *testing.T) {
+	a := tokenFingerprint("ghs_synthetic_token")
+	b := tokenFingerprint("ghs_synthetic_token")
+	if a != b {
+		t.Errorf("fingerprint not deterministic: %q vs %q", a, b)
+	}
+	if len(a) != 64 {
+		t.Errorf("fingerprint hex length = %d, want 64 (32-byte SHA-256)", len(a))
+	}
+	if a == tokenFingerprint("different") {
+		t.Errorf("collision between distinct tokens")
+	}
+}
+
 // TestUnknownKey_DoesNotExplodeMetricCardinality verifies that
 // requests for keys not in the config bucket their metrics under
 // metrics.UnknownKey rather than the attacker-supplied path

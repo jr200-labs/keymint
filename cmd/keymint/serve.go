@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/rsa"
+	"crypto"
 	"errors"
 	"fmt"
 	"net/http"
@@ -28,11 +28,12 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// keyCacheEntry remembers a parsed RSA key plus the mtime/size of the
-// file it came from so we can detect operator-driven rotations of
-// the underlying mounted Secret without restarting the pod.
+// keyCacheEntry remembers a parsed signing key (RSA or Ed25519)
+// plus the mtime/size of the file it came from so we can detect
+// operator-driven rotations of the underlying mounted Secret
+// without restarting the pod.
 type keyCacheEntry struct {
-	key   *rsa.PrivateKey
+	key   crypto.PrivateKey
 	mtime time.Time
 	size  int64
 }
@@ -152,7 +153,7 @@ SOPS files.`,
 			// result keyed by `cacheKey`. Honours operator-driven
 			// rotation by comparing the on-disk file's mtime+size
 			// against the cached version.
-			loadKey := func(ctx context.Context, cacheKey string, k config.Key) (*rsa.PrivateKey, error) {
+			loadKey := func(ctx context.Context, cacheKey string, k config.Key) (crypto.PrivateKey, error) {
 				path := k.PrivateKeyFile
 				if path == "" {
 					return nil, fmt.Errorf("serve: key %q: private_key_file required in service mode", cacheKey)
