@@ -14,8 +14,11 @@ import (
 
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
+	keymintMetrics "github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/jr200-labs/keymint/internal/mint"
 	"github.com/jr200-labs/keymint/internal/server"
+	"github.com/jr200-labs/keymint/internal/tracing"
+	"github.com/jr200-labs/keymint/internal/version"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -27,6 +30,7 @@ import (
 func newServeCmd() *cobra.Command {
 	var (
 		listen          string
+		metricsListen   string
 		configPath      string
 		mintTimeout     time.Duration
 		shutdownTimeout time.Duration
@@ -62,6 +66,21 @@ SOPS files.`,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			logging.Setup(logLevel, logHuman)
 			log := zap.L()
+
+			// OTel: turns on if OTEL_EXPORTER_OTLP_ENDPOINT is set, else no-op.
+			tracingResult, err := tracing.Setup(context.Background(), "keymint", version.Version)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer cancel()
+				if err := tracingResult.Shutdown(shutdownCtx); err != nil {
+					log.Error("tracing shutdown failed", zap.Error(err))
+				}
+			}()
+
+			m := keymintMetrics.New()
 
 			cfg, err := config.Load(configPath)
 			if err != nil {
@@ -129,7 +148,7 @@ SOPS files.`,
 				return tok.Token, tok.ExpiresAt, nil
 			}
 
-			srv, err := server.New(cfg, mintFn, reviewer)
+			srv, err := server.New(cfg, mintFn, reviewer, m)
 			if err != nil {
 				return err
 			}
@@ -143,13 +162,24 @@ SOPS files.`,
 				IdleTimeout:       120 * time.Second,
 			}
 
+			// /metrics on a separate listener — keeps it off the public
+			// API path and makes it easy to scope via NetworkPolicy.
+			metricsMux := http.NewServeMux()
+			metricsMux.Handle("GET /metrics", keymintMetrics.Handler())
+			metricsServer := &http.Server{
+				Addr:              metricsListen,
+				Handler:           metricsMux,
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+
 			log.Info("keymint serve starting",
 				zap.String("listen", listen),
+				zap.String("metrics_listen", metricsListen),
 				zap.Int("keys", len(cfg.Keys)),
 				zap.Int("allowlist_entries", len(cfg.Allowlist)),
 			)
 
-			errCh := make(chan error, 1)
+			errCh := make(chan error, 2)
 			go func() {
 				if certFile != "" && keyFile != "" {
 					log.Info("serving with TLS")
@@ -158,6 +188,9 @@ SOPS files.`,
 					log.Warn("serving plaintext HTTP (no TLS config provided)")
 					errCh <- httpServer.ListenAndServe()
 				}
+			}()
+			go func() {
+				errCh <- metricsServer.ListenAndServe()
 			}()
 
 			sigCh := make(chan os.Signal, 1)
@@ -175,12 +208,16 @@ SOPS files.`,
 				if err := httpServer.Shutdown(ctx); err != nil {
 					return err
 				}
+				if err := metricsServer.Shutdown(ctx); err != nil {
+					log.Error("metrics shutdown failed", zap.Error(err))
+				}
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&listen, "listen", ":9999", "HTTP listen address")
+	cmd.Flags().StringVar(&listen, "listen", ":9999", "HTTP listen address for the API")
+	cmd.Flags().StringVar(&metricsListen, "metrics-listen", ":9100", "HTTP listen address for /metrics (Prometheus)")
 	cmd.Flags().StringVar(&configPath, "config", "/etc/keymint/config.yaml", "path to keymint config")
 	cmd.Flags().DurationVar(&mintTimeout, "mint-timeout", 30*time.Second, "per-mint timeout (PEM read + JWT + GitHub round-trip)")
 	cmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 15*time.Second, "graceful shutdown grace period")
