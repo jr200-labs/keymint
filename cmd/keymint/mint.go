@@ -2,73 +2,83 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/mint"
+	"github.com/jr200-labs/keymint/internal/sops"
 	"github.com/spf13/cobra"
 )
 
-// newMintCmd implements `keymint mint` — the CLI entrypoint that signs
-// a fresh GitHub App JWT, exchanges it for an installation token, and
-// prints the token to stdout.
-//
-// At this stage of the rollout there is no config-file loader yet
-// (config + SOPS lands in a follow-up PR), so the user passes app-id
-// / install-id / key-file as flags. The positional <key> argument is
-// reserved for forward compatibility with the eventual config-driven
-// flow.
+// newMintCmd implements `keymint mint <key>` — the CLI entrypoint
+// that loads the keymint config, finds the named key, decrypts its
+// PEM (via SOPS or plaintext file), and prints a fresh installation
+// token to stdout.
 func newMintCmd() *cobra.Command {
 	var (
-		appID      int64
-		installID  int64
-		keyFile    string
-		apiBaseURL string
+		configPath string
 		timeout    time.Duration
 	)
 
 	cmd := &cobra.Command{
 		Use:   "mint <key>",
 		Short: "Mint an installation token (CLI mode)",
-		Long: `Mint a short-lived GitHub App installation token and print it
-to stdout.
+		Long: `Mint a short-lived GitHub App installation token for the named key
+in the keymint config and print it to stdout.
 
-The positional <key> argument is the name of a key entry in the
-keymint config (config-file support lands in a follow-up PR — for
-now, pass --app-id / --install-id / --key-file directly).
+The PEM private key is read on demand. If the key entry has
+private_key_sops set, keymint shells out to ` + "`sops -d`" + ` to decrypt
+it; if private_key_file is set, the PEM is read from disk in
+plaintext. The plaintext key is held in memory for the duration of
+the mint call only.
 
-Example:
+Example config (~/.config/keymint/config.yaml):
 
-    keymint mint whengas \
-      --app-id      3495091 \
-      --install-id  126859631 \
-      --key-file    ~/.config/github-app/whengas.pem
+    keys:
+      whengas:
+        app_id:        3495091
+        install_id:    126859631
+        private_key_sops: ~/.config/keymint/whengas.sops.pem
+        github_url_match: github.com/whengas
+
+Then:
+
+    keymint mint whengas
 `,
 		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if appID == 0 || installID == 0 || keyFile == "" {
-				return errors.New("--app-id, --install-id, and --key-file are required (config-file support lands in a follow-up PR)")
-			}
+		RunE: func(_ *cobra.Command, args []string) error {
+			keyName := args[0]
 
-			pemBytes, err := os.ReadFile(keyFile)
-			if err != nil {
-				return fmt.Errorf("read key file: %w", err)
-			}
-			privateKey, err := mint.ParsePrivateKey(pemBytes)
+			cfg, err := config.Load(configPath)
 			if err != nil {
 				return err
+			}
+
+			entry, ok := cfg.Keys[keyName]
+			if !ok {
+				return fmt.Errorf("mint: key %q not found in config", keyName)
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
+			pemBytes, err := readPEM(ctx, entry)
+			if err != nil {
+				return err
+			}
+
+			privateKey, err := mint.ParsePrivateKey(pemBytes)
+			if err != nil {
+				return err
+			}
+
 			tok, err := mint.Mint(ctx, mint.Request{
-				AppID:          appID,
-				InstallationID: installID,
+				AppID:          entry.AppID,
+				InstallationID: entry.InstallationID,
 				PrivateKey:     privateKey,
-				APIBaseURL:     apiBaseURL,
+				APIBaseURL:     entry.APIBaseURL,
 			})
 			if err != nil {
 				return err
@@ -79,11 +89,19 @@ Example:
 		},
 	}
 
-	cmd.Flags().Int64Var(&appID, "app-id", 0, "GitHub App ID (required)")
-	cmd.Flags().Int64Var(&installID, "install-id", 0, "GitHub App installation ID (required)")
-	cmd.Flags().StringVar(&keyFile, "key-file", "", "path to the App's PEM private key (required)")
-	cmd.Flags().StringVar(&apiBaseURL, "api-base-url", "", "GitHub API base URL (default: https://api.github.com)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "request timeout")
+	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to keymint config (default: $XDG_CONFIG_HOME/keymint/config.yaml)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "overall mint timeout (decrypt + JWT + GitHub round-trip)")
 
 	return cmd
+}
+
+// readPEM resolves the PEM bytes for a key entry.
+//
+// Precedence: private_key_sops takes priority over private_key_file.
+// Validation in config.Load ensures at least one is set.
+func readPEM(ctx context.Context, k config.Key) ([]byte, error) {
+	if k.PrivateKeySOPS != "" {
+		return sops.Decrypt(ctx, k.PrivateKeySOPS)
+	}
+	return os.ReadFile(k.PrivateKeyFile)
 }
