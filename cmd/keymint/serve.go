@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
@@ -146,15 +149,32 @@ SOPS files.`,
 				zap.Int("allowlist_entries", len(cfg.Allowlist)),
 			)
 
-			if certFile != "" && keyFile != "" {
-				log.Info("serving with TLS")
-				err = httpServer.ListenAndServeTLS(certFile, keyFile)
-			} else {
-				log.Warn("serving plaintext HTTP (no TLS config provided)")
-				err = httpServer.ListenAndServe()
-			}
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return err
+			errCh := make(chan error, 1)
+			go func() {
+				if certFile != "" && keyFile != "" {
+					log.Info("serving with TLS")
+					errCh <- httpServer.ListenAndServeTLS(certFile, keyFile)
+				} else {
+					log.Warn("serving plaintext HTTP (no TLS config provided)")
+					errCh <- httpServer.ListenAndServe()
+				}
+			}()
+
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					return err
+				}
+			case sig := <-sigCh:
+				log.Info("shutting down gracefully...", zap.String("signal", sig.String()))
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				defer cancel()
+				if err := httpServer.Shutdown(ctx); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
@@ -163,7 +183,7 @@ SOPS files.`,
 	cmd.Flags().StringVar(&listen, "listen", ":9999", "HTTP listen address")
 	cmd.Flags().StringVar(&configPath, "config", "/etc/keymint/config.yaml", "path to keymint config")
 	cmd.Flags().DurationVar(&mintTimeout, "mint-timeout", 30*time.Second, "per-mint timeout (PEM read + JWT + GitHub round-trip)")
-	cmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 15*time.Second, "graceful shutdown grace period (reserved)")
+	cmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 15*time.Second, "graceful shutdown grace period")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: disabled|panic|fatal|error|warn|info|debug|trace")
 	cmd.Flags().BoolVar(&logHuman, "log-human", false, "human-readable log format (default: JSON)")
 	cmd.Flags().StringVar(&certFile, "tls-cert", "", "path to TLS certificate file")
