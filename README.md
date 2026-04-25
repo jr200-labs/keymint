@@ -33,6 +33,26 @@ Early scaffold. Implementation lands in a sequence of small PRs:
 | 6  | Container image release wiring |
 | 7  | Homebrew formula |
 
+## Development setup
+
+Install pre-commit hooks once after cloning. Hooks run `gofmt`, `go vet`,
+`golangci-lint` (with the same shared config CI uses) on staged Go files
+and `commitlint` on commit messages:
+
+```sh
+make hooks-install
+```
+
+Run hooks against every file in the repo:
+
+```sh
+make hooks-run
+```
+
+`pre-commit` itself comes from
+[pre-commit.com](https://pre-commit.com); install via `brew install pre-commit`
+or `uv tool install pre-commit`.
+
 ## Build
 
 ```sh

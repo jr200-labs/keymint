@@ -1,0 +1,51 @@
+# Pre-commit hooks for keymint.
+#
+# Install once after cloning:
+#   pre-commit install
+#   pre-commit install --hook-type commit-msg
+#
+# Or run `make hooks-install`.
+#
+# CI runs the same checks (golangci-lint, commitlint) — keeping these
+# hooks aligned with CI catches issues locally and avoids round-trips.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: go fmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+
+      - id: go-vet
+        name: go vet
+        entry: go vet ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        # Mirror CI: same config (downloaded via make sync-shared-lint),
+        # same flags. --fix lets safe autofixes land before the commit.
+        entry: bash -c 'test -f .shared/.golangci.yml || make sync-shared-lint; golangci-lint run --config .shared/.golangci.yml --fix'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+  - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+    rev: v9.18.0
+    hooks:
+      - id: commitlint
+        stages: [commit-msg]
+        additional_dependencies: ['@commitlint/config-conventional']

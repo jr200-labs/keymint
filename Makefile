@@ -7,7 +7,7 @@ VERSION := $(shell sed -n 's/.*"\.": *"\([^"]*\)".*/\1/p' .release-please-manife
 
 .DEFAULT_GOAL := all
 
-.PHONY: all fmt test test-integration test-all test-race view-coverage lint build clean sync-shared-lint
+.PHONY: all fmt test test-integration test-all test-race view-coverage lint build clean sync-shared-lint hooks-install hooks-run
 
 all: fmt lint build
 
@@ -53,6 +53,17 @@ clean:
 	rm -rf ./build
 	rm -f coverage.out
 	go clean -testcache
+
+# Install both the pre-commit and commit-msg hooks for this clone.
+# Run once after `git clone`. Idempotent.
+hooks-install:
+	pre-commit install
+	pre-commit install --hook-type commit-msg
+
+# Run all hooks against every file in the repo (not just staged).
+# Useful for verifying a clean baseline.
+hooks-run:
+	pre-commit run --all-files
 
 # NOTE: releases are fully automated via release-please — see .github/workflows/release-please.yaml.
 # Do not add bump/release targets here; they will drift from the CI flow.
