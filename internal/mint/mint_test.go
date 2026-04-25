@@ -2,11 +2,13 @@ package mint
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,7 +42,11 @@ func TestParsePrivateKey_PKCS1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParsePrivateKey: %v", err)
 	}
-	if got.N.Cmp(key.N) != 0 {
+	rsaKey, ok := got.(*rsa.PrivateKey)
+	if !ok {
+		t.Fatalf("ParsePrivateKey returned %T, want *rsa.PrivateKey", got)
+	}
+	if rsaKey.N.Cmp(key.N) != 0 {
 		t.Errorf("parsed key modulus mismatch")
 	}
 }
@@ -57,8 +63,61 @@ func TestParsePrivateKey_PKCS8(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParsePrivateKey: %v", err)
 	}
-	if got.N.Cmp(key.N) != 0 {
+	rsaKey, ok := got.(*rsa.PrivateKey)
+	if !ok {
+		t.Fatalf("ParsePrivateKey returned %T, want *rsa.PrivateKey", got)
+	}
+	if rsaKey.N.Cmp(key.N) != 0 {
 		t.Errorf("parsed key modulus mismatch")
+	}
+}
+
+func TestParsePrivateKey_Ed25519PKCS8(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+
+	got, err := ParsePrivateKey(pemBytes)
+	if err != nil {
+		t.Fatalf("ParsePrivateKey: %v", err)
+	}
+	edKey, ok := got.(ed25519.PrivateKey)
+	if !ok {
+		t.Fatalf("ParsePrivateKey returned %T, want ed25519.PrivateKey", got)
+	}
+	if !edKey.Equal(priv) {
+		t.Errorf("parsed ed25519 key does not match original")
+	}
+}
+
+func TestSignAppJWT_Ed25519(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	signed, err := signAppJWT(7777, priv, now)
+	if err != nil {
+		t.Fatalf("signAppJWT: %v", err)
+	}
+	parsed, err := jwt.Parse(signed, func(tok *jwt.Token) (interface{}, error) {
+		if _, ok := tok.Method.(*jwt.SigningMethodEd25519); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", tok.Header["alg"])
+		}
+		return pub, nil
+	})
+	if err != nil {
+		t.Fatalf("jwt.Parse: %v", err)
+	}
+	if !parsed.Valid {
+		t.Errorf("ed25519-signed JWT did not validate")
 	}
 }
 

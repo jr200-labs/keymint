@@ -552,12 +552,29 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordOutcome(span, metricKey, metrics.OutcomeSuccess)
 	span.SetStatus(codes.Ok, "")
-	log.Info("minted")
+	// Audit fingerprint: emit a SHA-256 of the minted token in
+	// logs and span attrs so a leaked token can be traced back to
+	// the exact pod + ServiceAccount + minute that issued it,
+	// without ever persisting the sensitive token material.
+	fp := tokenFingerprint(token)
+	span.SetAttributes(attribute.String("keymint.token_fingerprint", fp))
+	log.Info("minted",
+		zap.String("token_fingerprint", fp),
+		zap.Time("expires_at", expiresAt))
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(mintResponse{Token: token, ExpiresAt: expiresAt}); err != nil {
 		log.Error("encode response failed", zap.Error(err))
 	}
+}
+
+// tokenFingerprint hashes a minted GitHub installation token with
+// SHA-256 and returns the hex digest. Used purely for audit
+// correlation: never roundtrips back to a real token, but a leaked
+// token can be hashed and cross-referenced against keymint logs.
+func tokenFingerprint(tok string) string {
+	h := sha256.Sum256([]byte(tok))
+	return hex.EncodeToString(h[:])
 }
 
 // recordOutcome stamps the span with the outcome attribute and bumps
