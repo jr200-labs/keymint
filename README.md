@@ -150,10 +150,11 @@ the deploy accordingly:
   `IdleConnTimeout`, `TLSHandshakeTimeout`, and
   `ResponseHeaderTimeout` instead of inheriting stdlib defaults.
 
-- **TokenReview cache.** Successful `TokenReview` results are cached
-  for ~60 s in an LRU keyed by the SHA-256 of the bearer token so
-  bursty callers don't amplify into the kubernetes API. Revoked
-  ServiceAccounts lose access on the next TTL boundary.
+- **TokenReview cache (positive + negative).** Successful TokenReview results are cached for ~60 s and rejections for ~15 s, both in LRUs keyed by the SHA-256 of the bearer token. Bursty legitimate callers don't amplify into the kubernetes API; bursts of invalid/revoked tokens (misconfigured CI, attackers) also collapse to one apiserver call per TTL window. Revoked ServiceAccounts lose access on the next positive-TTL boundary.
+
+- **Split liveness / readiness probes.** `/livez` returns 200 immediately with no I/O — the right thing for a liveness probe (a transient FS hiccup won't kill the pod). `/readyz` performs the deeper config + projected-volume `os.Stat` checks — the right thing for a readiness probe. `/healthz` is kept as a back-compat alias for `/readyz`.
+
+- **Debounced config reloads.** The fsnotify-driven reload coalesces a 500ms quiet-period of events before invoking `srv.Reload`, so the kubelet's flurry of symlink-swap / permission events on a ConfigMap or Secret update collapses to a single reload against the fully-settled new state.
 
 - **Hot config reload.** keymint watches `--config` via fsnotify.
   When the file changes (operator updates Keys / Allowlist) the new
