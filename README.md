@@ -168,6 +168,27 @@ the deploy accordingly:
   failures. 4xx responses (bad JWT, suspended app) are
   caller-config bugs and don't count against it.
 
+- **Trusted-proxy-aware client IP extraction.** Set
+  `trusted_proxies:` in the config to a list of CIDR blocks for your
+  Ingress controller / API gateway / mesh sidecar. When the
+  immediate peer is in one of those blocks, keymint walks the
+  `X-Forwarded-For` chain right-to-left (then falls back to
+  `X-Real-IP`) to recover the real client IP for the per-IP rate
+  limiter. Empty (the default) keeps using the raw peer address —
+  spoofing-safe but useless behind a proxy.
+
+  ```yaml
+  trusted_proxies:
+    - 10.0.0.0/8        # cluster pod CIDR
+    - 192.168.1.5/32    # specific load balancer
+  ```
+
+- **Stale-but-valid token fallback.** If a synchronous refresh
+  fails (GitHub timeout, 5xx) but the previously-cached token
+  still has any validity left, keymint logs the failure and hands
+  back the cached token instead of failing the request. Callers
+  get a usable token; the next call retries the refresh.
+
 - **GitHub rate-limit observability.** Each `/access_tokens`
   response's `X-RateLimit-Remaining` and `X-RateLimit-Reset`
   headers are exported as Prometheus gauges

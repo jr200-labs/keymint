@@ -44,6 +44,20 @@ type Config struct {
 	// cannot be replayed against keymint. Service mode only; CLI mode
 	// ignores it.
 	ExpectedAudiences []string `yaml:"expected_audiences,omitempty"`
+
+	// TrustedProxies is the list of CIDR blocks (e.g. "10.0.0.0/8",
+	// "192.168.1.5/32") whose direct connections are allowed to set
+	// X-Forwarded-For / X-Real-IP. When the immediate peer address
+	// is in one of these blocks, keymint walks the XFF chain to
+	// recover the real client IP for per-IP rate limiting. Without
+	// this, an Ingress controller / API gateway / mesh sidecar
+	// fronting keymint causes every cluster client to share the
+	// proxy's IP and trip the pre-auth limiter together.
+	//
+	// Empty (the default) disables proxy-header trust: r.RemoteAddr
+	// is used as-is. Set this only to your real load-balancer
+	// CIDRs; trusting too widely allows clients to spoof their IP.
+	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 }
 
 // Key describes one GitHub App.
@@ -161,7 +175,30 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	for i, cidr := range c.TrustedProxies {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("trusted_proxies[%d] %q: %w", i, cidr, err)
+		}
+	}
 	return nil
+}
+
+// ParsedTrustedProxies returns the TrustedProxies field as parsed
+// CIDR networks. Validate() guarantees they parse, so a non-nil
+// error here would only occur if validation was bypassed.
+func (c *Config) ParsedTrustedProxies() ([]*net.IPNet, error) {
+	if len(c.TrustedProxies) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(c.TrustedProxies))
+	for _, cidr := range c.TrustedProxies {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("config: parse trusted_proxies %q: %w", cidr, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 // FindByGitHubURL returns the Key whose GitHubOwner matches the owner

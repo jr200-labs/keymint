@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -611,6 +612,80 @@ func TestReload_RejectsInvalidConfig(t *testing.T) {
 	// Original snapshot intact.
 	if _, ok := srv.currentConfig().Keys["good"]; !ok {
 		t.Errorf("good config replaced by failed reload")
+	}
+}
+
+func TestClientIP_TrustsXFFOnlyFromConfiguredCIDRs(t *testing.T) {
+	mustCIDR := func(s string) *net.IPNet {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%q): %v", s, err)
+		}
+		return n
+	}
+	trusted := []*net.IPNet{
+		mustCIDR("10.0.0.0/8"),
+		mustCIDR("192.168.1.5/32"),
+	}
+
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		realIP     string
+		trusted    []*net.IPNet
+		want       string
+	}{
+		{
+			name:       "no trusted proxies → use peer",
+			remoteAddr: "10.0.0.1:1234",
+			xff:        "1.2.3.4",
+			trusted:    nil,
+			want:       "10.0.0.1",
+		},
+		{
+			name:       "untrusted peer → ignore XFF (anti-spoof)",
+			remoteAddr: "8.8.8.8:1234",
+			xff:        "1.2.3.4",
+			trusted:    trusted,
+			want:       "8.8.8.8",
+		},
+		{
+			name:       "trusted peer → walk XFF right-to-left",
+			remoteAddr: "10.0.0.1:1234",
+			xff:        "1.2.3.4, 10.0.0.2",
+			trusted:    trusted,
+			want:       "1.2.3.4",
+		},
+		{
+			name:       "all-trusted XFF → fall through to X-Real-IP",
+			remoteAddr: "10.0.0.1:1234",
+			xff:        "10.0.0.2, 10.0.0.3",
+			realIP:     "5.6.7.8",
+			trusted:    trusted,
+			want:       "5.6.7.8",
+		},
+		{
+			name:       "trusted peer, empty XFF and X-Real-IP → fall back to peer",
+			remoteAddr: "10.0.0.1:1234",
+			trusted:    trusted,
+			want:       "10.0.0.1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/x", nil)
+			r.RemoteAddr = tc.remoteAddr
+			if tc.xff != "" {
+				r.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if tc.realIP != "" {
+				r.Header.Set("X-Real-IP", tc.realIP)
+			}
+			if got := clientIP(r, tc.trusted); got != tc.want {
+				t.Errorf("clientIP = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

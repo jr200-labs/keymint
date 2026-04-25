@@ -67,6 +67,7 @@ type MintFunc func(ctx context.Context, key config.Key) (token string, expiresAt
 type configSnapshot struct {
 	cfg            *config.Config
 	allowedSubject map[string]map[string]bool // subject -> keys -> true
+	trustedProxies []*net.IPNet               // parsed once at snapshot build
 }
 
 // reviewCache caches successful TokenReview lookups for a short TTL,
@@ -191,8 +192,8 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 	return s, nil
 }
 
-// buildSnapshot precomputes the subject -> keys allow map for fast
-// lookup at request time.
+// buildSnapshot precomputes the subject -> keys allow map and
+// parsed trusted-proxy CIDRs for fast lookup at request time.
 func buildSnapshot(cfg *config.Config) *configSnapshot {
 	allowed := make(map[string]map[string]bool, len(cfg.Allowlist))
 	for _, e := range cfg.Allowlist {
@@ -203,7 +204,14 @@ func buildSnapshot(cfg *config.Config) *configSnapshot {
 			allowed[e.Subject][k] = true
 		}
 	}
-	return &configSnapshot{cfg: cfg, allowedSubject: allowed}
+	// Validate has already accepted these CIDRs; parse failures
+	// here would only happen if validation was bypassed.
+	proxies, _ := cfg.ParsedTrustedProxies()
+	return &configSnapshot{
+		cfg:            cfg,
+		allowedSubject: allowed,
+		trustedProxies: proxies,
+	}
 }
 
 // Reload swaps in a new validated config atomically. Returns an
@@ -298,7 +306,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	// Pre-auth rate limit: per-remote-IP. Cheap, scoped to attacker so
 	// flooders cannot exhaust authenticated callers' budget.
-	if !s.preAuthLimit.allow(remoteIP(r)) {
+	if !s.preAuthLimit.allow(clientIP(r, s.snapshot.Load().trustedProxies)) {
 		s.recordOutcome(span, metricKey, metrics.OutcomeRateLimited)
 		span.SetStatus(codes.Error, "rate limited (pre-auth)")
 		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
@@ -416,15 +424,59 @@ func (s *Server) subjectMayMint(subject, key string) bool {
 	return keys[key]
 }
 
-// remoteIP returns the IP portion of r.RemoteAddr, or the whole
-// string if it does not parse as host:port. Good enough for keying
-// the per-IP rate limiter; not used for authorization.
-func remoteIP(r *http.Request) string {
+// clientIP returns the best estimate of the original client IP for
+// rate-limiting purposes. If the immediate peer (r.RemoteAddr) is
+// inside one of the configured trusted-proxy CIDR blocks, walks the
+// X-Forwarded-For chain right-to-left to find the first non-trusted
+// hop (the real client). Falls back to X-Real-IP, then to the raw
+// peer address.
+//
+// When trustedProxies is empty, proxy headers are ignored entirely
+// — otherwise an attacker could spoof their source IP and bypass
+// the per-IP rate limit. Operators must explicitly opt in by
+// listing their load-balancer / Ingress / mesh CIDRs.
+func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if len(trustedProxies) == 0 || !ipInCIDRs(host, trustedProxies) {
+		return host
+	}
+
+	// Peer is a trusted proxy: parse XFF right-to-left, skipping
+	// any further trusted hops, return the first untrusted IP we
+	// encounter. That's the client.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(parts[i])
+			if ip == "" {
+				continue
+			}
+			if !ipInCIDRs(ip, trustedProxies) {
+				return ip
+			}
+		}
+	}
+	// Fall back to X-Real-IP if XFF was empty / all-trusted.
+	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" && !ipInCIDRs(real, trustedProxies) {
+		return real
 	}
 	return host
+}
+
+func ipInCIDRs(ipStr string, cidrs []*net.IPNet) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, n := range cidrs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // bearerToken extracts a bearer token from the Authorization header.
