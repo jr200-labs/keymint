@@ -70,23 +70,34 @@ type configSnapshot struct {
 	trustedProxies []*net.IPNet               // parsed once at snapshot build
 }
 
-// reviewCache caches successful TokenReview lookups for a short TTL,
-// keyed by the SHA-256 of the bearer token (so the raw token never
-// sits in memory as a map key). Drastically reduces apiserver
-// authentication traffic for bursty callers; the TTL is short
-// enough that revoked SAs lose access quickly.
+// reviewCache caches both positive and negative TokenReview results
+// for short TTLs, keyed by the SHA-256 of the bearer token (so the
+// raw token never sits in memory as a map key).
+//
+//   - positive cache: subject string for a token the apiserver
+//     accepted. Long enough TTL (60s) to absorb bursty callers
+//     while still honouring SA revocation within a minute.
+//
+//   - negative cache: empty subject for a token the apiserver
+//     rejected. Short TTL (15s) so retries get a fresh review
+//     promptly while still shielding the apiserver from
+//     authentication storms (misconfigured CI, attacker, etc.).
 const (
-	reviewCacheSize = 4096
-	reviewCacheTTL  = 60 * time.Second
+	reviewCacheSize   = 4096
+	reviewCachePosTTL = 60 * time.Second
+	reviewCacheNegTTL = 15 * time.Second
+	reviewNegSentinel = "" // empty subject = negative entry
 )
 
 type reviewCache struct {
-	cache *expirable.LRU[string, string]
+	pos *expirable.LRU[string, string]
+	neg *expirable.LRU[string, string]
 }
 
 func newReviewCache() *reviewCache {
 	return &reviewCache{
-		cache: expirable.NewLRU[string, string](reviewCacheSize, nil, reviewCacheTTL),
+		pos: expirable.NewLRU[string, string](reviewCacheSize, nil, reviewCachePosTTL),
+		neg: expirable.NewLRU[string, string](reviewCacheSize, nil, reviewCacheNegTTL),
 	}
 }
 
@@ -95,12 +106,27 @@ func (c *reviewCache) hashToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (c *reviewCache) get(token string) (string, bool) {
-	return c.cache.Get(c.hashToken(token))
+// get returns:
+//   - subject="..." ok=true    on positive hit (token previously accepted)
+//   - subject=""    ok=true    on negative hit (token previously rejected)
+//   - subject=""    ok=false   on miss (caller should hit apiserver)
+func (c *reviewCache) get(token string) (subject string, ok bool) {
+	h := c.hashToken(token)
+	if subj, hit := c.pos.Get(h); hit {
+		return subj, true
+	}
+	if _, hit := c.neg.Get(h); hit {
+		return reviewNegSentinel, true
+	}
+	return "", false
 }
 
-func (c *reviewCache) put(token, subject string) {
-	c.cache.Add(c.hashToken(token), subject)
+func (c *reviewCache) putPositive(token, subject string) {
+	c.pos.Add(c.hashToken(token), subject)
+}
+
+func (c *reviewCache) putNegative(token string) {
+	c.neg.Add(c.hashToken(token), reviewNegSentinel)
 }
 
 // Server holds wired-up HTTP server state.
@@ -236,30 +262,53 @@ func (s *Server) currentAllowed() map[string]map[string]bool {
 }
 
 // Routes returns an http.Handler that serves keymint's API.
+//
+// Probe split:
+//   - /livez  proves the HTTP server is responsive (no I/O,
+//     returns 200 instantly). Use as the liveness probe.
+//   - /readyz performs the deeper config + projected-volume
+//     os.Stat checks. Use as the readiness probe so a
+//     transient FS hiccup doesn't restart the pod.
+//   - /healthz is kept as an alias for /readyz for backward
+//     compatibility with anything still pointing at it.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token/{key}", s.handleMint)
-	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /livez", s.handleLive)
+	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
 	return mux
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+// handleLive returns 200 immediately. Liveness probes fire often
+// enough that any disk I/O here would risk killing pods on
+// transient filesystem latency. The mere fact this goroutine ran
+// proves the HTTP server is healthy at the process level.
+func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleReady performs deep checks suitable for a readiness probe:
+// config snapshot loaded and (when running in-cluster) the
+// projected SA token + CA cert files are stat-able.
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	if s.currentConfig() == nil {
-		writeJSONError(w, http.StatusInternalServerError, "config missing")
+		writeJSONError(w, http.StatusServiceUnavailable, "config missing")
 		return
 	}
 	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
 		if _, err := os.Stat(saTokenPath); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "sa token missing")
+			writeJSONError(w, http.StatusServiceUnavailable, "sa token missing")
 			return
 		}
 		if _, err := os.Stat(saCAPath); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "sa ca missing")
+			writeJSONError(w, http.StatusServiceUnavailable, "sa ca missing")
 			return
 		}
 	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ready"))
 }
 
 type mintResponse struct {
@@ -323,12 +372,21 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Validate via TokenReview (audience-bound, SA token re-read).
-	//    A short-lived cache shields the apiserver from bursts;
-	//    entries expire after reviewCacheTTL so revoked SAs lose
-	//    access promptly.
+	//    Two-tier short-lived cache shields the apiserver from
+	//    bursts: positive entries expire in 60s (revoked SAs lose
+	//    access promptly), negative entries expire in 15s (retries
+	//    of bad creds get a fresh review fast).
 	subject, cacheHit := s.reviewCache.get(bearer)
 	if cacheHit {
 		s.recordCacheLookup(metrics.CacheHit)
+		if subject == reviewNegSentinel {
+			// Negative cache hit: token was rejected very recently.
+			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
+			span.SetStatus(codes.Error, "tokenreview cached negative")
+			log.Warn("tokenreview rejected (cached)")
+			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
+			return
+		}
 	} else {
 		s.recordCacheLookup(metrics.CacheMiss)
 		var err error
@@ -337,6 +395,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 			if s.metrics != nil {
 				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
 			}
+			s.reviewCache.putNegative(bearer)
 			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "tokenreview failed")
@@ -347,7 +406,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		if s.metrics != nil {
 			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
 		}
-		s.reviewCache.put(bearer, subject)
+		s.reviewCache.putPositive(bearer, subject)
 	}
 	span.SetAttributes(attribute.String("k8s.serviceaccount.subject", subject))
 	log = log.With(zap.String("subject", subject))

@@ -441,10 +441,30 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 		return
 	}
 
+	// Debounce: kubelet's ConfigMap/Secret update fires several
+	// fsnotify events in rapid succession (..data symlink swap,
+	// permission changes, etc.). Reset a quiet-period timer on
+	// each matching event and only fire onChange once it expires
+	// without further activity. Means the reload runs against the
+	// fully-settled new state rather than intermediate snapshots.
+	var debounce *time.Timer
+	defer func() {
+		if debounce != nil {
+			debounce.Stop()
+		}
+	}()
+
 	for {
+		var debounceCh <-chan time.Time
+		if debounce != nil {
+			debounceCh = debounce.C
+		}
 		select {
 		case <-stop:
 			return
+		case <-debounceCh:
+			debounce = nil
+			onChange()
 		case event, ok := <-w.Events:
 			if !ok {
 				return
@@ -457,8 +477,20 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 			if base != target && base != "..data" {
 				continue
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				onChange()
+			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+				continue
+			}
+			// (Re)arm the debounce timer.
+			if debounce == nil {
+				debounce = time.NewTimer(configReloadDebounce)
+			} else {
+				if !debounce.Stop() {
+					select {
+					case <-debounce.C:
+					default:
+					}
+				}
+				debounce.Reset(configReloadDebounce)
 			}
 		case err, ok := <-w.Errors:
 			if !ok {
@@ -468,6 +500,10 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 		}
 	}
 }
+
+// configReloadDebounce is the quiet period the watcher waits after
+// the most recent matching fsnotify event before invoking onChange.
+const configReloadDebounce = 500 * time.Millisecond
 
 // pumpGitHubBreakerState publishes mint.GithubBreakerState() into
 // the Prometheus gauge every few seconds. Cheap, lockless reads.

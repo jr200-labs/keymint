@@ -615,6 +615,76 @@ func TestReload_RejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+// TestReviewCache_NegativeCacheBypassesApiserver asserts that a token
+// the apiserver rejects once is cached as negative — subsequent
+// presentations within the negative TTL are rejected without
+// hitting the apiserver again.
+func TestReviewCache_NegativeCacheBypassesApiserver(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Allowlist: []config.AllowEntry{
+			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
+		},
+	}
+	calls := 0
+	reviewer := &countingReviewer{
+		fn: func(_ context.Context, _ string) (string, error) {
+			calls++
+			return "", errors.New("apiserver: invalid token")
+		},
+	}
+	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+		return "ghs_x", time.Now().Add(time.Hour), nil
+	}
+	srv, err := New(cfg, mintFn, reviewer, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	for i := 0; i < 5; i++ {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token/org-a", nil)
+		req.Header.Set("Authorization", "Bearer junk")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", resp.StatusCode)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("TokenReviewer hit %d times, want 1 (negative cache should absorb the rest)", calls)
+	}
+}
+
+func TestProbes_LivezAndReadyz(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+	}
+	srv, err := New(cfg,
+		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		&fakeReviewer{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	for _, p := range []string{"/livez", "/readyz", "/healthz"} {
+		resp, err := http.Get(ts.URL + p)
+		if err != nil {
+			t.Fatalf("get %s: %v", p, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status %s = %d, want 200", p, resp.StatusCode)
+		}
+	}
+}
+
 func TestClientIP_TrustsXFFOnlyFromConfiguredCIDRs(t *testing.T) {
 	mustCIDR := func(s string) *net.IPNet {
 		_, n, err := net.ParseCIDR(s)
