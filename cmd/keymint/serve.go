@@ -24,6 +24,31 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// keyCacheEntry remembers a parsed RSA key plus the mtime/size of the
+// file it came from so we can detect operator-driven rotations of
+// the underlying mounted Secret without restarting the pod.
+type keyCacheEntry struct {
+	key   *rsa.PrivateKey
+	mtime time.Time
+	size  int64
+}
+
+// cachedToken is the in-memory copy of an installation token + its
+// GitHub-reported expiry.
+type cachedToken struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
+// Token freshness thresholds. The 5-min cutoff bounds the staleness
+// we will hand back; below that we kick off a background refresh.
+// Below 1 min we block until the refresh completes — at that point
+// the existing token is too close to expiry to risk handing out.
+const (
+	freshFor          = 5 * time.Minute
+	backgroundRefresh = 1 * time.Minute
+)
+
 // newServeCmd implements `keymint serve` — the in-cluster HTTP service
 // mode. Wires the keymint config to the server package, validates
 // inbound bearer tokens via Kubernetes TokenReview, and mints
@@ -94,77 +119,130 @@ SOPS files.`,
 			}
 
 			var cacheMu sync.RWMutex
-			type cachedToken struct {
-				Token     string
-				ExpiresAt time.Time
-			}
-			keyCache := make(map[string]*rsa.PrivateKey)
+			keyCache := make(map[string]keyCacheEntry)
 			tokenCache := make(map[string]cachedToken)
 			var sf singleflight.Group
 
-			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
-				cacheKey := fmt.Sprintf("%d-%d", k.AppID, k.InstallationID)
-
-				// Fast path: usable cached token already.
-				cacheMu.RLock()
-				if ct, ok := tokenCache[cacheKey]; ok && time.Now().Add(5*time.Minute).Before(ct.ExpiresAt) {
-					cacheMu.RUnlock()
-					return ct.Token, ct.ExpiresAt, nil
+			// loadKey reads the PEM file, parses it, and caches the
+			// result keyed by `cacheKey`. Honours operator-driven
+			// rotation by comparing the on-disk file's mtime+size
+			// against the cached version.
+			loadKey := func(ctx context.Context, cacheKey string, k config.Key) (*rsa.PrivateKey, error) {
+				path := k.PrivateKeyFile
+				if path == "" {
+					return nil, fmt.Errorf("serve: key %q: private_key_file required in service mode", cacheKey)
 				}
+				st, err := os.Stat(path)
+				if err != nil {
+					return nil, fmt.Errorf("serve: stat key file %s: %w", path, err)
+				}
+
+				cacheMu.RLock()
+				cached, hit := keyCache[cacheKey]
+				cacheMu.RUnlock()
+				if hit && cached.mtime.Equal(st.ModTime()) && cached.size == st.Size() {
+					return cached.key, nil
+				}
+
+				pemBytes, err := readPEM(ctx, k)
+				if err != nil {
+					return nil, err
+				}
+				priv, err := mint.ParsePrivateKey(pemBytes)
+				if err != nil {
+					return nil, err
+				}
+				cacheMu.Lock()
+				keyCache[cacheKey] = keyCacheEntry{key: priv, mtime: st.ModTime(), size: st.Size()}
+				cacheMu.Unlock()
+				return priv, nil
+			}
+
+			// doMint runs the full PEM-load + JWT + GitHub round-trip
+			// once and caches the result. Always called under
+			// singleflight so concurrent callers for the same key
+			// collapse into one outbound request.
+			doMint := func(ctx context.Context, cacheKey string, k config.Key) (cachedToken, error) {
+				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
+				defer cancel()
+
+				priv, err := loadKey(ctx, cacheKey, k)
+				if err != nil {
+					return cachedToken{}, err
+				}
+				tok, err := mint.Mint(ctx, mint.Request{
+					AppID:          k.AppID,
+					InstallationID: k.InstallationID,
+					PrivateKey:     priv,
+					APIBaseURL:     k.APIBaseURL,
+				})
+				if err != nil {
+					return cachedToken{}, err
+				}
+				ct := cachedToken{Token: tok.Token, ExpiresAt: tok.ExpiresAt}
+				cacheMu.Lock()
+				tokenCache[cacheKey] = ct
+				cacheMu.Unlock()
+				return ct, nil
+			}
+
+			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
+				// Cache key MUST disambiguate every dimension that
+				// could affect the minted token: AppID + InstallID
+				// alone collide if two configs reuse the same
+				// numeric IDs against different API endpoints or
+				// different PEM files. Include APIBaseURL and the
+				// PEM path.
+				cacheKey := fmt.Sprintf("%d|%d|%s|%s",
+					k.AppID, k.InstallationID, k.APIBaseURL, k.PrivateKeyFile)
+
+				cacheMu.RLock()
+				ct, hasToken := tokenCache[cacheKey]
 				cacheMu.RUnlock()
 
-				// Slow path: collapse N concurrent misses for the same
-				// key into a single PEM-load + Mint round-trip via
-				// singleflight. Other callers wait for the first to
-				// complete and reuse its result.
+				if hasToken {
+					timeLeft := time.Until(ct.ExpiresAt)
+					switch {
+					case timeLeft > freshFor:
+						// Fast path — comfortably within validity.
+						return ct.Token, ct.ExpiresAt, nil
+
+					case timeLeft > backgroundRefresh:
+						// Background refresh: hand back the still-valid
+						// cached token and kick off an async refresh
+						// (singleflight collapses concurrent triggers).
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), mintTimeout)
+							defer cancel()
+							_, _, _ = sf.Do(cacheKey, func() (any, error) {
+								newCt, err := doMint(ctx, cacheKey, k)
+								if err != nil {
+									zap.L().Warn("background refresh failed",
+										zap.String("cache_key", cacheKey), zap.Error(err))
+								}
+								return newCt, err
+							})
+						}()
+						return ct.Token, ct.ExpiresAt, nil
+					}
+					// Otherwise fall through and synchronously refresh.
+				}
+
 				v, err, _ := sf.Do(cacheKey, func() (any, error) {
-					// Re-check cache under the singleflight lock; a
-					// previous collapsed call may have already filled it.
+					// Re-check cache under singleflight — a parallel
+					// caller may have just refreshed it.
 					cacheMu.RLock()
-					if ct, ok := tokenCache[cacheKey]; ok && time.Now().Add(5*time.Minute).Before(ct.ExpiresAt) {
+					if ct, ok := tokenCache[cacheKey]; ok && time.Until(ct.ExpiresAt) > backgroundRefresh {
 						cacheMu.RUnlock()
 						return ct, nil
 					}
-					privateKey := keyCache[cacheKey]
 					cacheMu.RUnlock()
-
-					ctx, cancel := context.WithTimeout(ctx, mintTimeout)
-					defer cancel()
-
-					if privateKey == nil {
-						pemBytes, err := readPEM(ctx, k)
-						if err != nil {
-							return cachedToken{}, err
-						}
-						privateKey, err = mint.ParsePrivateKey(pemBytes)
-						if err != nil {
-							return cachedToken{}, err
-						}
-						cacheMu.Lock()
-						keyCache[cacheKey] = privateKey
-						cacheMu.Unlock()
-					}
-
-					tok, err := mint.Mint(ctx, mint.Request{
-						AppID:          k.AppID,
-						InstallationID: k.InstallationID,
-						PrivateKey:     privateKey,
-						APIBaseURL:     k.APIBaseURL,
-					})
-					if err != nil {
-						return cachedToken{}, err
-					}
-
-					ct := cachedToken{Token: tok.Token, ExpiresAt: tok.ExpiresAt}
-					cacheMu.Lock()
-					tokenCache[cacheKey] = ct
-					cacheMu.Unlock()
-					return ct, nil
+					return doMint(ctx, cacheKey, k)
 				})
 				if err != nil {
 					return "", time.Time{}, err
 				}
-				ct := v.(cachedToken)
+				ct = v.(cachedToken)
 				return ct.Token, ct.ExpiresAt, nil
 			}
 
@@ -184,12 +262,17 @@ SOPS files.`,
 
 			// /metrics on a separate listener — keeps it off the public
 			// API path and makes it easy to scope via NetworkPolicy.
+			// Same Slowloris-mitigating timeouts as the API server so
+			// internal scrapers / scanners cannot tie up the listener.
 			metricsMux := http.NewServeMux()
 			metricsMux.Handle("GET /metrics", keymintMetrics.Handler())
 			metricsServer := &http.Server{
 				Addr:              metricsListen,
 				Handler:           metricsMux,
 				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				WriteTimeout:      30 * time.Second,
+				IdleTimeout:       120 * time.Second,
 			}
 
 			log.Info("keymint serve starting",
@@ -225,12 +308,25 @@ SOPS files.`,
 				log.Info("shutting down gracefully...", zap.String("signal", sig.String()))
 				ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 				defer cancel()
-				if err := httpServer.Shutdown(ctx); err != nil {
-					return err
-				}
-				if err := metricsServer.Shutdown(ctx); err != nil {
-					log.Error("metrics shutdown failed", zap.Error(err))
-				}
+
+				// Shut both servers down concurrently so the metrics
+				// listener doesn't lose its grace window when the API
+				// listener uses up the full deadline.
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					if err := httpServer.Shutdown(ctx); err != nil {
+						log.Error("api shutdown failed", zap.Error(err))
+					}
+				}()
+				go func() {
+					defer wg.Done()
+					if err := metricsServer.Shutdown(ctx); err != nil {
+						log.Error("metrics shutdown failed", zap.Error(err))
+					}
+				}()
+				wg.Wait()
 			}
 			return nil
 		},

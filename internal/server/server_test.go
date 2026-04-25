@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -343,6 +344,18 @@ func TestPerSubjectRateLimit(t *testing.T) {
 	}
 	if results[2] != http.StatusTooManyRequests || results[3] != http.StatusTooManyRequests {
 		t.Errorf("later requests = %v, want 429", results[2:])
+	}
+}
+
+func TestLimiterMap_LRUEvictionBoundsMemory(t *testing.T) {
+	// Insert more keys than limiterMapSize and confirm the map size
+	// stays bounded — the LRU evicts the oldest entries.
+	m := newLimiterMap(rate.Every(time.Second), 1)
+	for i := 0; i < limiterMapSize*2; i++ {
+		m.allow(fmt.Sprintf("ip-%d", i))
+	}
+	if got := m.cache.Len(); got > limiterMapSize {
+		t.Errorf("cache.Len() = %d, want <= %d", got, limiterMapSize)
 	}
 }
 
