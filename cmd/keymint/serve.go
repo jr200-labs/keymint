@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -139,6 +140,14 @@ SOPS files.`,
 			// "thundering herd against a closed circuit" failure mode.
 			var refreshCooldownUntil sync.Map // cacheKey -> time.Time
 
+			// pemGeneration is bumped whenever fsnotify reports a
+			// PEM directory has changed. The hot mintFn path folds
+			// the current value into its cache key so a rotation
+			// invalidates cached tokens for that PEM without the
+			// cost of an os.Stat on every inbound HTTP request.
+			pemGenerations := pemGenerationTracker{}
+			pemGenerations.start(cfg, log)
+
 			// loadKey reads the PEM file, parses it, and caches the
 			// result keyed by `cacheKey`. Honours operator-driven
 			// rotation by comparing the on-disk file's mtime+size
@@ -214,23 +223,15 @@ SOPS files.`,
 				// alone collide if two configs reuse the same
 				// numeric IDs against different API endpoints or
 				// different PEM files. Include APIBaseURL, PEM path,
-				// and the PEM's mtime+size so that an operator
-				// rotating the on-disk private key (kubernetes
-				// Secret update) immediately invalidates any cached
-				// token minted with the previous PEM — even if its
-				// nominal expires_at is hours away. Stat is sub-µs
-				// in the common (cached) case.
-				var pemMtimeNs int64
-				var pemSize int64
-				if k.PrivateKeyFile != "" {
-					if st, err := os.Stat(k.PrivateKeyFile); err == nil {
-						pemMtimeNs = st.ModTime().UnixNano()
-						pemSize = st.Size()
-					}
-				}
-				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d|%d",
+				// and a generation counter that fsnotify increments
+				// on rotation so that operator-driven Secret swaps
+				// immediately invalidate cached tokens — without
+				// imposing an os.Stat syscall on every inbound HTTP
+				// request.
+				gen := pemGenerations.current(k.PrivateKeyFile)
+				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d",
 					k.AppID, k.InstallationID, k.APIBaseURL,
-					k.PrivateKeyFile, pemMtimeNs, pemSize)
+					k.PrivateKeyFile, gen)
 
 				cacheMu.RLock()
 				ct, hasToken := tokenCache[cacheKey]
@@ -547,6 +548,116 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 // configReloadDebounce is the quiet period the watcher waits after
 // the most recent matching fsnotify event before invoking onChange.
 const configReloadDebounce = 500 * time.Millisecond
+
+// pemGenerationTracker keeps a per-PEM-file generation counter that
+// fsnotify-driven goroutines bump whenever the file's content
+// changes on disk. mintFn folds the current generation into its
+// cache key so a rotation immediately invalidates cached tokens —
+// without paying an os.Stat per inbound HTTP request the way the
+// previous mtime-on-the-hot-path implementation did.
+//
+// One watcher is started per distinct directory containing a
+// configured PEM. The watcher uses the same parent-directory +
+// "..data" filter pattern as the config watcher so kubernetes
+// Secret atomic-symlink swaps are handled correctly.
+type pemGenerationTracker struct {
+	gens sync.Map // path (string) -> *atomic.Uint64
+}
+
+// current returns the generation counter for the given PEM path,
+// creating it lazily. The hot mintFn path calls this on every
+// request — it is a sync.Map.Load + atomic.Uint64.Load, no syscalls.
+func (t *pemGenerationTracker) current(path string) uint64 {
+	if path == "" {
+		return 0
+	}
+	v, ok := t.gens.Load(path)
+	if !ok {
+		fresh := new(atomic.Uint64)
+		actual, loaded := t.gens.LoadOrStore(path, fresh)
+		if !loaded {
+			v = fresh
+		} else {
+			v = actual
+		}
+	}
+	return v.(*atomic.Uint64).Load()
+}
+
+// bump atomically increments the generation counter for path,
+// allocating one if it doesn't exist yet.
+func (t *pemGenerationTracker) bump(path string) {
+	v, ok := t.gens.Load(path)
+	if !ok {
+		fresh := new(atomic.Uint64)
+		actual, loaded := t.gens.LoadOrStore(path, fresh)
+		if !loaded {
+			v = fresh
+		} else {
+			v = actual
+		}
+	}
+	v.(*atomic.Uint64).Add(1)
+}
+
+// start launches one fsnotify watcher per distinct directory that
+// contains a PEM file referenced from the config. Goroutines run
+// for the life of the process; restart not required for new keys
+// added to the config (those would prompt a config reload, which
+// in turn calls start again — start is idempotent per directory).
+func (t *pemGenerationTracker) start(cfg *config.Config, log *zap.Logger) {
+	dirs := map[string]map[string]struct{}{} // dir -> set(target basenames)
+	for _, k := range cfg.Keys {
+		if k.PrivateKeyFile == "" {
+			continue
+		}
+		dir := filepath.Dir(k.PrivateKeyFile)
+		base := filepath.Base(k.PrivateKeyFile)
+		if dirs[dir] == nil {
+			dirs[dir] = map[string]struct{}{}
+		}
+		dirs[dir][base] = struct{}{}
+	}
+	for dir, targets := range dirs {
+		go t.watchDir(dir, targets, log)
+	}
+}
+
+// watchDir runs fsnotify on dir. On Write/Create for any file in
+// targets (or the kubernetes "..data" symlink) it bumps every
+// matching PEM's generation counter — invalidating cached tokens
+// minted against the prior content. Same parent-dir +
+// debounce-the-burst pattern as watchConfigFile.
+func (t *pemGenerationTracker) watchDir(dir string, targets map[string]struct{}, log *zap.Logger) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Error("pem watcher init failed", zap.String("dir", dir), zap.Error(err))
+		return
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(dir); err != nil {
+		log.Error("pem watcher add failed", zap.String("dir", dir), zap.Error(err))
+		return
+	}
+	for {
+		event, ok := <-w.Events
+		if !ok {
+			return
+		}
+		base := filepath.Base(event.Name)
+		// "..data" → swap of the whole mounted Secret. Bump every
+		// target in this directory.
+		if base == "..data" && event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+			for tgt := range targets {
+				t.bump(filepath.Join(dir, tgt))
+			}
+			continue
+		}
+		if _, isTarget := targets[base]; isTarget && event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+			t.bump(event.Name)
+		}
+	}
+}
 
 // pumpGitHubBreakerState publishes mint.GithubBreakerState() into
 // the Prometheus gauge every few seconds. Cheap, lockless reads.

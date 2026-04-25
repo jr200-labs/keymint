@@ -41,7 +41,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/golang-lru/v2"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/metrics"
@@ -139,57 +138,94 @@ type Server struct {
 	subjectLimit  *limiterMap // per-resolved-SA, evaluated after auth
 	reviewCache   *reviewCache
 	metrics       *metrics.Metrics
+
+	janitorStop chan struct{} // closed by Stop() to halt limiter GC goroutines
 }
 
-// limiterMap holds a per-key rate.Limiter behind an LRU so a slow
-// flood of unique keys (random IPs, invalid auth) cannot grow the
-// map without bound.
+// limiterMap holds a per-key rate.Limiter that does NOT evict on
+// LRU pressure. An LRU-backed limiter would let attackers bypass
+// the rate cap by cycling through enough unique keys (spoofed IPs,
+// rotating bearer tokens) to push targeted limiters out of the
+// cache — each subsequent reappearance gets a fresh, fully-loaded
+// burst bucket.
 //
-// Each Server keeps two — one keyed by remote IP (cheap pre-auth
-// gate) and one keyed by the resolved ServiceAccount subject
-// (post-auth, generous).
+// Instead we keep limiters in a sync.Map and rely on a background
+// janitor that opportunistically drops limiters whose bucket is
+// completely full (i.e. no traffic for at least burst/rps seconds —
+// the limiter is idle). Idle keys evict; active or recently-active
+// keys do not, so the rate cap is never reset under attacker
+// pressure.
+//
+// Each Server keeps two limiterMaps — one keyed by remote IP
+// (cheap pre-auth gate) and one keyed by the resolved
+// ServiceAccount subject (post-auth, generous).
 type limiterMap struct {
-	cache *lru.Cache[string, *rate.Limiter]
-	mu    sync.Mutex // serialises miss-path Get+Add against itself
-	rps   rate.Limit
-	burst int
+	limiters sync.Map   // key (string) -> *rate.Limiter
+	mu       sync.Mutex // serialises miss-path LoadOrStore against itself
+	rps      rate.Limit
+	burst    int
 }
 
-// limiterMapSize is the per-instance cap. Once exceeded the
-// least-recently-used limiter is evicted; a new one for that key
-// is allocated on the next observation.
-const limiterMapSize = 4096
+// limiterJanitorInterval bounds how often we sweep idle limiters.
+// Sweeping is O(active keys); 30s keeps memory bounded for any
+// realistic key churn while staying out of the hot path.
+const limiterJanitorInterval = 30 * time.Second
 
 func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
-	c, err := lru.New[string, *rate.Limiter](limiterMapSize)
-	if err != nil {
-		// lru.New only fails on size <= 0 — treat as a programmer error.
-		panic(fmt.Sprintf("server: limiterMap LRU init: %v", err))
-	}
-	return &limiterMap{cache: c, rps: rps, burst: burst}
+	return &limiterMap{rps: rps, burst: burst}
 }
 
 // allow checks the per-key limiter, allocating one on first use.
 //
-// The hit path stays lock-free (lru.Cache.Get is internally
-// synchronised). The miss path uses a mutex with a double-checked
-// re-Get under the lock so a thundering herd of concurrent first
-// requests for the same key all share *one* limiter instead of
-// each instantiating their own and silently bypassing the rate
-// cap.
+// The hit path is lock-free via sync.Map.Load. The miss path takes
+// a Mutex with a re-Load under the lock so a thundering herd of N
+// concurrent first requests for the same key shares one limiter
+// rather than instantiating N independent buckets.
 func (m *limiterMap) allow(key string) bool {
-	if l, ok := m.cache.Get(key); ok {
-		return l.Allow()
+	if l, ok := m.limiters.Load(key); ok {
+		return l.(*rate.Limiter).Allow()
 	}
 	m.mu.Lock()
-	if l, ok := m.cache.Get(key); ok {
+	if l, ok := m.limiters.Load(key); ok {
 		m.mu.Unlock()
-		return l.Allow()
+		return l.(*rate.Limiter).Allow()
 	}
 	l := rate.NewLimiter(m.rps, m.burst)
-	m.cache.Add(key, l)
+	m.limiters.Store(key, l)
 	m.mu.Unlock()
 	return l.Allow()
+}
+
+// runJanitor periodically deletes limiters whose token bucket is
+// completely full — meaning no traffic has touched them recently
+// enough to consume any tokens. An attacker cannot abuse this for
+// rate-limit reset because any IP/subject they're actively hitting
+// retains a depleted bucket and is NOT collected.
+func (m *limiterMap) runJanitor(stop <-chan struct{}) {
+	ticker := time.NewTicker(limiterJanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			m.gcIdle()
+		}
+	}
+}
+
+func (m *limiterMap) gcIdle() {
+	burstF := float64(m.burst)
+	m.limiters.Range(func(k, v any) bool {
+		l := v.(*rate.Limiter)
+		// Tokens() returns the current bucket fill level. == burst
+		// means no consumption since burst/rps seconds ago — safe
+		// to drop without resetting any in-progress rate cap.
+		if l.Tokens() >= burstF {
+			m.limiters.Delete(k)
+		}
+		return true
+	})
 }
 
 // TokenReviewer abstracts the k8s TokenReview call so tests can
@@ -198,8 +234,21 @@ func (m *limiterMap) allow(key string) bool {
 // The implementation MUST honour the operator-supplied audience list
 // when calling the kubernetes API, so a stolen SA token bound to a
 // different audience cannot be replayed against keymint.
+//
+// The three return shapes encode three distinct outcomes:
+//
+//   - (subject, true, nil)   — token is valid; subject populated.
+//   - ("", false, nil)       — apiserver authoritatively REJECTED the
+//     token (auth failure). Cache as negative,
+//     respond 401.
+//   - ("", false, non-nil)   — INFRA failure (apiserver 5xx, transport
+//     error, breaker open, …). Do NOT cache
+//     as negative; respond 503. A single
+//     kubernetes-API blip must not poison
+//     valid callers' tokens for the negative
+//     cache TTL.
 type TokenReviewer interface {
-	Review(ctx context.Context, token string) (subject string, err error)
+	Review(ctx context.Context, token string) (subject string, ok bool, err error)
 }
 
 // New builds a Server. The reviewer argument is nil-friendly for
@@ -229,9 +278,23 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 		subjectLimit: newLimiterMap(rate.Limit(100), 200),
 		reviewCache:  newReviewCache(),
 		metrics:      m,
+		janitorStop:  make(chan struct{}),
 	}
 	s.snapshot.Store(buildSnapshot(cfg))
+	go s.preAuthLimit.runJanitor(s.janitorStop)
+	go s.subjectLimit.runJanitor(s.janitorStop)
 	return s, nil
+}
+
+// Stop releases background goroutines (rate-limiter janitors). Safe
+// to call multiple times.
+func (s *Server) Stop() {
+	select {
+	case <-s.janitorStop:
+		// already closed
+	default:
+		close(s.janitorStop)
+	}
 }
 
 // buildSnapshot precomputes the subject -> keys allow map and
@@ -405,17 +468,39 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		s.recordCacheLookup(metrics.CacheMiss)
-		var err error
-		subject, err = s.tokenReviewer.Review(ctx, bearer)
-		if err != nil {
+		var (
+			ok  bool
+			err error
+		)
+		subject, ok, err = s.tokenReviewer.Review(ctx, bearer)
+		switch {
+		case err != nil:
+			// Infrastructure failure — apiserver 5xx, transport
+			// error, or breaker open. Do NOT touch the negative
+			// cache: a transient kubernetes-API blip must not
+			// poison legitimate callers' tokens for 15s. Tell
+			// the caller to back off and retry via 503.
+			if s.metrics != nil {
+				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
+			}
+			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "tokenreview infra failure")
+			log.Error("tokenreview infra failure", zap.Error(err))
+			writeJSONError(w, http.StatusServiceUnavailable, "kubernetes tokenreview unavailable; retry")
+			return
+		case !ok:
+			// Apiserver authoritatively rejected the caller's
+			// token. Cache the rejection briefly so a flood of
+			// the same bad token doesn't keep waking the
+			// apiserver.
 			if s.metrics != nil {
 				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
 			}
 			s.reviewCache.putNegative(bearer)
 			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "tokenreview failed")
-			log.Warn("tokenreview failed", zap.Error(err))
+			span.SetStatus(codes.Error, "tokenreview rejected")
+			log.Warn("tokenreview rejected")
 			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
 			return
 		}
@@ -704,30 +789,34 @@ type reviewResult struct {
 	authError error
 }
 
-// Review POSTs a TokenReview to the API server and returns the
-// resolved username on success. The pod's own SA token is re-read
-// from disk on each call so kubelet-rotated projected tokens stay
-// valid for the lifetime of the process. Wrapped in a circuit
-// breaker so the handler fails fast when the apiserver degrades —
-// but caller-side auth rejections are NOT counted as breaker
-// failures, so a flood of invalid tokens cannot trip it and DoS
-// legitimate callers.
-func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, error) {
+// Review POSTs a TokenReview to the API server and reports the
+// outcome. See the TokenReviewer interface comment for the
+// (subject, ok, err) tri-state contract.
+//
+// The pod's own SA token is re-read from disk on each call so
+// kubelet-rotated projected tokens stay valid for the lifetime of
+// the process. Wrapped in a circuit breaker so the handler fails
+// fast when the apiserver degrades — but caller-side auth
+// rejections are NOT counted as breaker failures, so a flood of
+// invalid tokens cannot trip it and DoS legitimate callers.
+func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, bool, error) {
 	out, err := r.breaker.Execute(func() (interface{}, error) {
 		return r.reviewLocked(ctx, token)
 	})
 	if err != nil {
-		// Infra-level failure or breaker open.
-		return "", err
+		// Infra-level failure (transport, 5xx, breaker open).
+		return "", false, err
 	}
 	res := out.(reviewResult)
 	if res.authError != nil {
-		// Caller's token was rejected by the apiserver. Surface to
-		// the handler as an error, but the breaker already saw a
-		// successful call so its failure counter is untouched.
-		return "", res.authError
+		// Apiserver authoritatively said this token is invalid —
+		// auth rejection, not infra. Caller can safely negative-
+		// cache this outcome. Returning nil here on purpose: the
+		// caller distinguishes auth rejection from infra failure
+		// via the boolean, not the Go error.
+		return "", false, nil //nolint:nilerr
 	}
-	return res.subject, nil
+	return res.subject, true, nil
 }
 
 // reviewLocked is the inner implementation invoked by the circuit breaker.
