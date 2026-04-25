@@ -855,6 +855,8 @@ func TestBearerToken(t *testing.T) {
 		wantOk bool
 	}{
 		{"Bearer abc123", "abc123", true},
+		{"bearer lowercase", "lowercase", true}, // RFC 7235: case-insensitive
+		{"BEARER upper", "upper", true},         // RFC 7235: case-insensitive
 		{"Bearer  spaces  ", "spaces", true},
 		{"Basic abc", "", false},
 		{"", "", false},

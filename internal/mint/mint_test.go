@@ -289,34 +289,44 @@ func TestClockOffset_PerEndpoint(t *testing.T) {
 }
 
 func TestEgressSemaphore_BoundsConcurrency(t *testing.T) {
-	// Synthetic experiment: spawn many concurrent acquires and
-	// confirm we never exceed the cap. release one, the next can
-	// proceed.
-	if cap(egressSem) != egressConcurrency {
-		t.Fatalf("egressSem capacity = %d, want %d", cap(egressSem), egressConcurrency)
-	}
+	// Per-endpoint cap: drain one host's slots and confirm
+	// acquisition for that host blocks, while a different host's
+	// slots remain free (no cross-host bleed-over).
+	const hostA = "https://endpoint-a.example/"
+	const hostB = "https://endpoint-b.example/"
+
+	// Reset to ensure clean state across test runs.
+	egressSems = sync.Map{}
 
 	releases := make([]func(), 0, egressConcurrency)
 	for i := 0; i < egressConcurrency; i++ {
-		release, err := acquireEgress(context.Background())
+		release, err := acquireEgress(context.Background(), hostA)
 		if err != nil {
-			t.Fatalf("acquire %d: %v", i, err)
+			t.Fatalf("acquire %d on hostA: %v", i, err)
 		}
 		releases = append(releases, release)
 	}
 
-	// One more must block; assert it via a short context timeout.
+	// One more on hostA must block; assert via context timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := acquireEgress(ctx); err == nil {
-		t.Errorf("expected acquire to block + ctx.Done, got nil error")
+	if _, err := acquireEgress(ctx, hostA); err == nil {
+		t.Errorf("expected hostA acquire to block + ctx.Done, got nil error")
 	}
 
-	// Release all — fresh acquire should succeed immediately.
+	// hostB is independent — must succeed immediately.
+	releaseB, err := acquireEgress(context.Background(), hostB)
+	if err != nil {
+		t.Errorf("hostB acquire blocked despite hostA exhaustion: %v", err)
+	} else {
+		releaseB()
+	}
+
+	// Release all — fresh acquire on hostA should succeed.
 	for _, r := range releases {
 		r()
 	}
-	release, err := acquireEgress(context.Background())
+	release, err := acquireEgress(context.Background(), hostA)
 	if err != nil {
 		t.Errorf("post-release acquire: %v", err)
 	}

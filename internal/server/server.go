@@ -160,8 +160,7 @@ type Server struct {
 // (cheap pre-auth gate) and one keyed by the resolved
 // ServiceAccount subject (post-auth, generous).
 type limiterMap struct {
-	limiters sync.Map   // key (string) -> *rate.Limiter
-	mu       sync.Mutex // serialises miss-path LoadOrStore against itself
+	limiters sync.Map // key (string) -> *rate.Limiter
 	rps      rate.Limit
 	burst    int
 }
@@ -177,23 +176,22 @@ func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
 
 // allow checks the per-key limiter, allocating one on first use.
 //
-// The hit path is lock-free via sync.Map.Load. The miss path takes
-// a Mutex with a re-Load under the lock so a thundering herd of N
-// concurrent first requests for the same key shares one limiter
-// rather than instantiating N independent buckets.
+// Both hit and miss paths are lock-free. sync.Map.LoadOrStore
+// resolves concurrent miss races atomically: a transient burst of
+// goroutines for the same fresh key may each construct a fresh
+// rate.Limiter, but only one wins the Store; the rest discard
+// their candidate and use the winning limiter. Allocating a
+// rate.Limiter is microseconds-cheap and tossing one is far
+// preferable to serialising every miss through a global mutex —
+// which under a flood of distinct spoofed IPs would block the
+// entire HTTP ingest pipeline behind one lock.
 func (m *limiterMap) allow(key string) bool {
 	if l, ok := m.limiters.Load(key); ok {
 		return l.(*rate.Limiter).Allow()
 	}
-	m.mu.Lock()
-	if l, ok := m.limiters.Load(key); ok {
-		m.mu.Unlock()
-		return l.(*rate.Limiter).Allow()
-	}
-	l := rate.NewLimiter(m.rps, m.burst)
-	m.limiters.Store(key, l)
-	m.mu.Unlock()
-	return l.Allow()
+	candidate := rate.NewLimiter(m.rps, m.burst)
+	actual, _ := m.limiters.LoadOrStore(key, candidate)
+	return actual.(*rate.Limiter).Allow()
 }
 
 // runJanitor periodically deletes limiters whose token bucket is
@@ -657,11 +655,14 @@ func ipInCIDRs(ipStr string, cidrs []*net.IPNet) bool {
 }
 
 // bearerToken extracts a bearer token from the Authorization header.
-// Returns (token, true) if present and well-formed.
+// Per RFC 7235 §2.1, scheme names are case-insensitive — accept
+// "Bearer ", "bearer ", "BEARER ", etc., so callers behind
+// proxy / middleware that case-normalise the scheme aren't
+// spuriously rejected.
 func bearerToken(r *http.Request) (string, bool) {
 	h := r.Header.Get("Authorization")
 	const prefix = "Bearer "
-	if !strings.HasPrefix(h, prefix) {
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
 		return "", false
 	}
 	tok := strings.TrimSpace(h[len(prefix):])
