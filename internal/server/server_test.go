@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -756,6 +758,35 @@ func TestClientIP_TrustsXFFOnlyFromConfiguredCIDRs(t *testing.T) {
 				t.Errorf("clientIP = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLimiterMap_ConcurrentInitSharesOneLimiter asserts that a
+// thundering herd of N goroutines all calling allow() on the same
+// new key shares exactly one limiter — the rate cap is honoured
+// immediately, instead of N goroutines each instantiating their
+// own bucket and silently bypassing the cap.
+func TestLimiterMap_ConcurrentInitSharesOneLimiter(t *testing.T) {
+	const concurrency = 200
+	// burst=1 — at most one allow() call should succeed for a
+	// given key.
+	m := newLimiterMap(rate.Every(time.Hour), 1)
+
+	var wg sync.WaitGroup
+	var allowed atomic.Int64
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			if m.allow("racy-key") {
+				allowed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := allowed.Load(); got != 1 {
+		t.Errorf("concurrent allow() races allowed %d through; want exactly 1 (rate cap bypassed)", got)
 	}
 }
 

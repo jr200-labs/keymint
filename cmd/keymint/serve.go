@@ -50,6 +50,13 @@ type cachedToken struct {
 const (
 	freshFor          = 5 * time.Minute
 	backgroundRefresh = 1 * time.Minute
+
+	// refreshFailureCooldown — after a background refresh fails
+	// (typically because GitHub is down or the breaker is open),
+	// suppress further background refreshes for this window so we
+	// don't spawn a goroutine + log a warning per inbound request.
+	// The next request after the cooldown re-attempts.
+	refreshFailureCooldown = 15 * time.Second
 )
 
 // newServeCmd implements `keymint serve` — the in-cluster HTTP service
@@ -125,6 +132,12 @@ SOPS files.`,
 			keyCache := make(map[string]keyCacheEntry)
 			tokenCache := make(map[string]cachedToken)
 			var sf singleflight.Group
+			// refreshCooldownUntil tracks the wall-clock time before
+			// which a background refresh for a given cacheKey should
+			// be skipped, after a previous refresh attempt failed.
+			// Prevents the goroutine + log stampede described in the
+			// "thundering herd against a closed circuit" failure mode.
+			var refreshCooldownUntil sync.Map // cacheKey -> time.Time
 
 			// loadKey reads the PEM file, parses it, and caches the
 			// result keyed by `cacheKey`. Honours operator-driven
@@ -197,13 +210,27 @@ SOPS files.`,
 
 			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
 				// Cache key MUST disambiguate every dimension that
-				// could affect the minted token: AppID + InstallID
+				// could affect the minted token. AppID + InstallID
 				// alone collide if two configs reuse the same
 				// numeric IDs against different API endpoints or
-				// different PEM files. Include APIBaseURL and the
-				// PEM path.
-				cacheKey := fmt.Sprintf("%d|%d|%s|%s",
-					k.AppID, k.InstallationID, k.APIBaseURL, k.PrivateKeyFile)
+				// different PEM files. Include APIBaseURL, PEM path,
+				// and the PEM's mtime+size so that an operator
+				// rotating the on-disk private key (kubernetes
+				// Secret update) immediately invalidates any cached
+				// token minted with the previous PEM — even if its
+				// nominal expires_at is hours away. Stat is sub-µs
+				// in the common (cached) case.
+				var pemMtimeNs int64
+				var pemSize int64
+				if k.PrivateKeyFile != "" {
+					if st, err := os.Stat(k.PrivateKeyFile); err == nil {
+						pemMtimeNs = st.ModTime().UnixNano()
+						pemSize = st.Size()
+					}
+				}
+				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d|%d",
+					k.AppID, k.InstallationID, k.APIBaseURL,
+					k.PrivateKeyFile, pemMtimeNs, pemSize)
 
 				cacheMu.RLock()
 				ct, hasToken := tokenCache[cacheKey]
@@ -220,17 +247,33 @@ SOPS files.`,
 						// Background refresh: hand back the still-valid
 						// cached token and kick off an async refresh
 						// (singleflight collapses concurrent triggers).
+						//
+						// Skip the spawn entirely if a recent attempt
+						// failed and we're still inside its cooldown —
+						// otherwise an open-circuit GitHub outage
+						// produces one goroutine + warning log per
+						// inbound request.
+						if v, ok := refreshCooldownUntil.Load(cacheKey); ok {
+							if time.Now().Before(v.(time.Time)) {
+								return ct.Token, ct.ExpiresAt, nil
+							}
+						}
 						go func() {
 							ctx, cancel := context.WithTimeout(context.Background(), mintTimeout)
 							defer cancel()
-							_, _, _ = sf.Do(cacheKey, func() (any, error) {
-								newCt, err := doMint(ctx, cacheKey, k)
-								if err != nil {
-									zap.L().Warn("background refresh failed",
-										zap.String("cache_key", cacheKey), zap.Error(err))
-								}
-								return newCt, err
+							_, err, _ := sf.Do(cacheKey, func() (any, error) {
+								return doMint(ctx, cacheKey, k)
 							})
+							if err != nil {
+								refreshCooldownUntil.Store(cacheKey,
+									time.Now().Add(refreshFailureCooldown))
+								zap.L().Warn("background refresh failed",
+									zap.String("cache_key", cacheKey),
+									zap.Duration("cooldown", refreshFailureCooldown),
+									zap.Error(err))
+							} else {
+								refreshCooldownUntil.Delete(cacheKey)
+							}
 						}()
 						return ct.Token, ct.ExpiresAt, nil
 					}
