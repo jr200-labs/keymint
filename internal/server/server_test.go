@@ -33,7 +33,7 @@ func (f *fakeReviewer) Review(_ context.Context, token string) (string, error) {
 
 func newTestServer(t *testing.T, cfg *config.Config, mint MintFunc, reviewer TokenReviewer) *httptest.Server {
 	t.Helper()
-	srv, err := New(cfg, mint, reviewer)
+	srv, err := New(cfg, mint, reviewer, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -267,13 +267,13 @@ func TestNew_Validation(t *testing.T) {
 	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil }
 	rev := &fakeReviewer{}
 
-	if _, err := New(nil, mint, rev); err == nil {
+	if _, err := New(nil, mint, rev, nil); err == nil {
 		t.Errorf("expected error for nil cfg")
 	}
-	if _, err := New(&config.Config{}, nil, rev); err == nil {
+	if _, err := New(&config.Config{}, nil, rev, nil); err == nil {
 		t.Errorf("expected error for nil mint")
 	}
-	if _, err := New(&config.Config{}, mint, nil); err == nil {
+	if _, err := New(&config.Config{}, mint, nil, nil); err == nil {
 		t.Errorf("expected error for nil reviewer")
 	}
 }

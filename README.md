@@ -84,6 +84,30 @@ make test       # unit tests
 make test-race  # with race detector + coverage
 ```
 
+## Observability
+
+Service mode emits structured (zap) logs, OpenTelemetry traces, and
+Prometheus metrics.
+
+- **Logs** — JSON by default. Control via `--log-level` and
+  `--log-human` flags.
+- **Tracing** — opt in by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP
+  gRPC) or `OTEL_TRACES_EXPORTER=console` (stdout, dev). Disabled if
+  neither is set. `OTEL_DEPLOYMENT_ENVIRONMENT` adds a deployment
+  environment resource attribute. Spans wrap the `/token/<key>`
+  handler with attributes for the key, k8s subject, and outcome.
+- **Metrics** — scrapeable on a separate listener (default `:9100`,
+  configurable via `--metrics-listen`). Exported series:
+  - `keymint_mint_requests_total{outcome,key}`
+  - `keymint_mint_duration_seconds{key}` (histogram)
+  - `keymint_mint_in_flight`
+  - `keymint_tokenreviews_total{result}`
+  - `keymint_github_api_latency_seconds{status}` (histogram)
+  - `keymint_jwt_clock_offset_seconds`
+
+The metrics listener should be reachable only from your monitoring
+namespace; use a NetworkPolicy to lock it down.
+
 ## Using as a git credential helper
 
 Once `keymint mint <key>` works, you can wire it as a credential

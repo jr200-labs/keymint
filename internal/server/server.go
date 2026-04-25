@@ -38,9 +38,17 @@ import (
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
+
+// tracer is the OTel tracer used for spans emitted by this package.
+var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/server")
 
 // MintFunc is the contract for producing an installation token given
 // a Key entry. It is injected so this package does not depend on
@@ -54,6 +62,7 @@ type Server struct {
 	tokenReviewer  TokenReviewer
 	allowedSubject map[string]map[string]bool // subject -> keys -> true
 	limiter        *rate.Limiter
+	metrics        *metrics.Metrics
 }
 
 // TokenReviewer abstracts the k8s TokenReview call so tests can
@@ -63,8 +72,10 @@ type TokenReviewer interface {
 }
 
 // New builds a Server. The reviewer argument is nil-friendly for
-// tests; in production callers pass NewK8sTokenReviewer.
-func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer) (*Server, error) {
+// tests; in production callers pass NewK8sTokenReviewer. The metrics
+// argument may be nil — handlers handle that gracefully so unit tests
+// don't have to construct a metrics registry.
+func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.Metrics) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("server: cfg is required")
 	}
@@ -91,6 +102,7 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer) (*Server, er
 		tokenReviewer:  reviewer,
 		allowedSubject: allowed,
 		limiter:        rate.NewLimiter(rate.Limit(100), 200),
+		metrics:        m,
 	}, nil
 }
 
@@ -131,32 +143,66 @@ type errorResponse struct {
 }
 
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
+	keyName := r.PathValue("key")
+
+	// Open a span for the whole handler. Span attributes are filled in
+	// as we learn more (subject, outcome).
+	ctx, span := tracer.Start(r.Context(), "server.handleMint",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(attribute.String("keymint.key", keyName)),
+	)
+	defer span.End()
+
+	start := time.Now()
+	if s.metrics != nil {
+		s.metrics.MintInFlight.Inc()
+		defer s.metrics.MintInFlight.Dec()
+		defer func() {
+			s.metrics.MintDuration.WithLabelValues(keyName).Observe(time.Since(start).Seconds())
+		}()
+	}
+
+	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
+
 	if !s.limiter.Allow() {
+		s.recordOutcome(span, keyName, metrics.OutcomeRateLimited)
+		span.SetStatus(codes.Error, "rate limited")
 		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
-	keyName := r.PathValue("key")
-	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
-
 	// 1. Extract bearer token
 	bearer, ok := bearerToken(r)
 	if !ok {
+		s.recordOutcome(span, keyName, metrics.OutcomeBadAuth)
+		span.SetStatus(codes.Error, "missing bearer")
 		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 		return
 	}
 
 	// 2. Validate via TokenReview
-	subject, err := s.tokenReviewer.Review(r.Context(), bearer)
+	subject, err := s.tokenReviewer.Review(ctx, bearer)
 	if err != nil {
+		if s.metrics != nil {
+			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
+		}
+		s.recordOutcome(span, keyName, metrics.OutcomeTokenReviewError)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "tokenreview failed")
 		log.Warn("tokenreview failed", zap.Error(err))
 		writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
 		return
 	}
+	if s.metrics != nil {
+		s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
+	}
+	span.SetAttributes(attribute.String("k8s.serviceaccount.subject", subject))
 	log = log.With(zap.String("subject", subject))
 
 	// 3. Allowlist check
 	if !s.subjectMayMint(subject, keyName) {
+		s.recordOutcome(span, keyName, metrics.OutcomeForbidden)
+		span.SetStatus(codes.Error, "forbidden")
 		log.Warn("subject not permitted")
 		writeJSONError(w, http.StatusForbidden, fmt.Sprintf("subject %q not permitted to mint key %q", subject, keyName))
 		return
@@ -165,22 +211,39 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// 4. Look up key
 	keyEntry, ok := s.cfg.Keys[keyName]
 	if !ok {
+		s.recordOutcome(span, keyName, metrics.OutcomeUnknownKey)
+		span.SetStatus(codes.Error, "unknown key")
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("key %q not found", keyName))
 		return
 	}
 
 	// 5. Mint
-	token, expiresAt, err := s.mint(r.Context(), keyEntry)
+	token, expiresAt, err := s.mint(ctx, keyEntry)
 	if err != nil {
+		s.recordOutcome(span, keyName, metrics.OutcomeMintError)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "mint failed")
 		log.Error("mint failed", zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "mint failed")
 		return
 	}
+	s.recordOutcome(span, keyName, metrics.OutcomeSuccess)
+	span.SetStatus(codes.Ok, "")
 	log.Info("minted")
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(mintResponse{Token: token, ExpiresAt: expiresAt}); err != nil {
 		log.Error("encode response failed", zap.Error(err))
+	}
+}
+
+// recordOutcome stamps the span with the outcome attribute and bumps
+// the corresponding metric counter. Both are nil-safe so tests don't
+// have to set up either.
+func (s *Server) recordOutcome(span trace.Span, keyName, outcome string) {
+	span.SetAttributes(attribute.String("keymint.outcome", outcome))
+	if s.metrics != nil {
+		s.metrics.MintRequestsTotal.WithLabelValues(outcome, keyName).Inc()
 	}
 }
 
