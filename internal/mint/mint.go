@@ -32,7 +32,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 )
 
 // defaultHTTPClient has explicit Transport tuning so we don't inherit
@@ -69,11 +69,11 @@ var egressSems sync.Map
 // with public github.com.
 var githubBreakers sync.Map
 
-func breakerForAPI(apiBase string) *gobreaker.CircuitBreaker {
+func breakerForAPI(apiBase string) *gobreaker.CircuitBreaker[exchangeResult] {
 	if v, ok := githubBreakers.Load(apiBase); ok {
-		return v.(*gobreaker.CircuitBreaker)
+		return v.(*gobreaker.CircuitBreaker[exchangeResult])
 	}
-	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+	cb := gobreaker.NewCircuitBreaker[exchangeResult](gobreaker.Settings{
 		Name:        "github-access-tokens:" + apiBase,
 		MaxRequests: 1,
 		Interval:    60 * time.Second,
@@ -85,7 +85,7 @@ func breakerForAPI(apiBase string) *gobreaker.CircuitBreaker {
 	})
 	actual, loaded := githubBreakers.LoadOrStore(apiBase, cb)
 	if loaded {
-		return actual.(*gobreaker.CircuitBreaker)
+		return actual.(*gobreaker.CircuitBreaker[exchangeResult])
 	}
 	return cb
 }
@@ -96,7 +96,7 @@ func breakerForAPI(apiBase string) *gobreaker.CircuitBreaker {
 func GithubBreakerState() gobreaker.State {
 	worst := gobreaker.StateClosed
 	githubBreakers.Range(func(_, v any) bool {
-		st := v.(*gobreaker.CircuitBreaker).State()
+		st := v.(*gobreaker.CircuitBreaker[exchangeResult]).State()
 		if st > worst {
 			worst = st
 		}
@@ -317,13 +317,12 @@ func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, erro
 // surfaced to the caller WITHOUT incrementing the breaker's
 // failure counter.
 func exchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (Token, error) {
-	out, err := breakerForAPI(apiBase).Execute(func() (interface{}, error) {
+	res, err := breakerForAPI(apiBase).Execute(func() (exchangeResult, error) {
 		return doExchangeForInstallationToken(ctx, appJWT, req, apiBase)
 	})
 	if err != nil {
 		return Token{}, err
 	}
-	res := out.(exchangeResult)
 	if res.callerErr != nil {
 		// 4xx response — surfaced as an error but not counted as a
 		// breaker failure.

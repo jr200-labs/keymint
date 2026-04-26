@@ -44,7 +44,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/metrics"
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -692,7 +692,7 @@ type K8sTokenReviewer struct {
 	saTokenPath       string // re-read on every call — kubelet rotates this file
 	expectedAudiences []string
 	httpClient        *http.Client
-	breaker           *gobreaker.CircuitBreaker
+	breaker           *gobreaker.CircuitBreaker[reviewResult]
 }
 
 // NewK8sTokenReviewer constructs a reviewer using the standard
@@ -751,7 +751,7 @@ func NewK8sTokenReviewer(expectedAudiences []string) (*K8sTokenReviewer, error) 
 	// (consistently slow or 5xx), open the breaker and fail-fast for
 	// 30s so we don't pile up 10-second-stalled goroutines and exhaust
 	// the request handling pool.
-	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+	cb := gobreaker.NewCircuitBreaker[reviewResult](gobreaker.Settings{
 		Name:        "kubernetes-tokenreview",
 		MaxRequests: 1,
 		Interval:    60 * time.Second,
@@ -818,14 +818,13 @@ type reviewResult struct {
 // rejections are NOT counted as breaker failures, so a flood of
 // invalid tokens cannot trip it and DoS legitimate callers.
 func (r *K8sTokenReviewer) Review(ctx context.Context, token string) (string, bool, error) {
-	out, err := r.breaker.Execute(func() (interface{}, error) {
+	res, err := r.breaker.Execute(func() (reviewResult, error) {
 		return r.reviewLocked(ctx, token)
 	})
 	if err != nil {
 		// Infra-level failure (transport, 5xx, breaker open).
 		return "", false, err
 	}
-	res := out.(reviewResult)
 	if res.authError != nil {
 		// Apiserver authoritatively said this token is invalid —
 		// auth rejection, not infra. Caller can safely negative-

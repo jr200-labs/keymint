@@ -23,7 +23,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/server"
 	"github.com/jr200-labs/keymint/internal/tracing"
 	"github.com/jr200-labs/keymint/internal/version"
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
