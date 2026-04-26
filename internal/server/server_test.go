@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 	"golang.org/x/time/rate"
 )
 
@@ -442,7 +442,7 @@ func TestBreaker_AuthFailuresDoNotTripBreaker(t *testing.T) {
 		saTokenPath:       writeTempSAToken(t),
 		expectedAudiences: []string{"keymint"},
 		httpClient:        apiserver.Client(),
-		breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		breaker: gobreaker.NewCircuitBreaker[reviewResult](gobreaker.Settings{
 			Name:        "test-tokenreview",
 			MaxRequests: 1,
 			Interval:    60 * time.Second,
@@ -486,7 +486,7 @@ func TestBreaker_InfraFailuresTripBreaker(t *testing.T) {
 		saTokenPath:       writeTempSAToken(t),
 		expectedAudiences: []string{"keymint"},
 		httpClient:        apiserver.Client(),
-		breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		breaker: gobreaker.NewCircuitBreaker[reviewResult](gobreaker.Settings{
 			Name:        "test-tokenreview-infra",
 			MaxRequests: 1,
 			Interval:    60 * time.Second,

@@ -101,7 +101,7 @@ func TestSignAppJWT_Ed25519(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ed25519.GenerateKey: %v", err)
 	}
-	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 
 	signed, err := signAppJWT(7777, priv, now)
 	if err != nil {
@@ -141,7 +141,7 @@ func TestParsePrivateKey_BadInput(t *testing.T) {
 
 func TestSignAppJWT_ClaimsRoundTrip(t *testing.T) {
 	key := generateTestKey(t)
-	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 
 	signed, err := signAppJWT(12345, key, now)
 	if err != nil {
