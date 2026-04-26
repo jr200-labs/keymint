@@ -5,6 +5,10 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+# Only the caller's TOP-LEVEL permissions cascade into reusable
+# workflows. The reusable's renovate job needs all three writes —
+# without this block GitHub silently downgrades to read and the call
+# startup-fails. See AGENTS.md.
 permissions:
   contents: write
   issues: write
