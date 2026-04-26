@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.2](https://github.com/jr200-labs/keymint/compare/v1.0.1...v1.0.2) (2026-04-26)
+
+
+### Bug Fixes
+
+* **ci:** set release-type simple in release-please config ([#25](https://github.com/jr200-labs/keymint/issues/25)) ([38acae6](https://github.com/jr200-labs/keymint/commit/38acae63a0c072d127e4cb1a3e12bbbce9e86656))
+* **deps:** update all non-major dependencies ([#22](https://github.com/jr200-labs/keymint/issues/22)) ([f333616](https://github.com/jr200-labs/keymint/commit/f3336165fd1b326f1b0232897b060297ccd4372f))
+* **deps:** update module github.com/sony/gobreaker to v2 ([#23](https://github.com/jr200-labs/keymint/issues/23)) ([f04dea1](https://github.com/jr200-labs/keymint/commit/f04dea1952bbfc9c0938da64b6a55df820f44b83))
+
 ## [1.0.1](https://github.com/jr200-labs/keymint/compare/v1.0.0...v1.0.1) (2026-04-25)
 
 
