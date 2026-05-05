@@ -3,7 +3,7 @@ module github.com/jr200-labs/keymint
 go 1.26.2
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/prometheus/client_golang v1.23.2
