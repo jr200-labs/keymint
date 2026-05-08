@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0](https://github.com/jr200-labs/keymint/compare/v1.0.2...v1.1.0) (2026-05-08)
+
+
+### Features
+
+* **deps:** update actions/checkout action to v6 ([#29](https://github.com/jr200-labs/keymint/issues/29)) ([cf24cdd](https://github.com/jr200-labs/keymint/commit/cf24cdd04c095b24f7470157e61f5e9b2a052934))
+
+
+### Bug Fixes
+
+* **deps:** update go module directive to v1.26.3 ([#33](https://github.com/jr200-labs/keymint/issues/33)) ([8f3a5f9](https://github.com/jr200-labs/keymint/commit/8f3a5f9c7edb60bd6c88b4550a61c22a0d1a4920))
+* **deps:** update module github.com/fsnotify/fsnotify to v1.10.1 ([#32](https://github.com/jr200-labs/keymint/issues/32)) ([65819db](https://github.com/jr200-labs/keymint/commit/65819db52890e887853fa25c8df53aafeffd080c))
+* **deps:** update module go.uber.org/zap to v1.28.0 ([#27](https://github.com/jr200-labs/keymint/issues/27)) ([12eada6](https://github.com/jr200-labs/keymint/commit/12eada6b8fb9878bf35844a69e620238cfb62527))
+
 ## [1.0.2](https://github.com/jr200-labs/keymint/compare/v1.0.1...v1.0.2) (2026-04-26)
 
 
