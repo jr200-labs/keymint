@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/jr200-labs/keymint/compare/v1.1.0...v1.1.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* **deps:** update actions/create-github-app-token action to v3.2.0 ([#35](https://github.com/jr200-labs/keymint/issues/35)) ([2857693](https://github.com/jr200-labs/keymint/commit/28576931e5bfe7332c3b733124ce3fe13dd330ba))
+
 ## [1.1.0](https://github.com/jr200-labs/keymint/compare/v1.0.2...v1.1.0) (2026-05-08)
 
 
