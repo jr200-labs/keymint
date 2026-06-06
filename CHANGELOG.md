@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2](https://github.com/jr200-labs/keymint/compare/v1.1.1...v1.1.2) (2026-06-06)
+
+
+### Bug Fixes
+
+* **deps:** update all non-major dependencies to v1.26.4 ([#40](https://github.com/jr200-labs/keymint/issues/40)) ([c29eac3](https://github.com/jr200-labs/keymint/commit/c29eac36e888a3e6f51f2b46c0dc7b4ff76d082c))
+* **deps:** update all non-major dependencies to v1.44.0 ([#37](https://github.com/jr200-labs/keymint/issues/37)) ([c0d0861](https://github.com/jr200-labs/keymint/commit/c0d0861d588350fcd1feeb38bf6ecb96db43bab1))
+
 ## [1.1.1](https://github.com/jr200-labs/keymint/compare/v1.1.0...v1.1.1) (2026-05-14)
 
 
