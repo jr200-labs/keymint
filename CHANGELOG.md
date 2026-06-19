@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/jr200-labs/keymint/compare/v1.1.3...v1.2.0) (2026-06-19)
+
+
+### Features
+
+* **deps:** update github-actions to v7 ([#45](https://github.com/jr200-labs/keymint/issues/45)) ([3292169](https://github.com/jr200-labs/keymint/commit/3292169db8d51ef6c636d1c9f24a164fb5ef1a64))
+
+
+### Bug Fixes
+
+* **deps:** update all non-major dependencies to shared-v0.1.9 ([#43](https://github.com/jr200-labs/keymint/issues/43)) ([b5e97db](https://github.com/jr200-labs/keymint/commit/b5e97dbd50826acdd1e03f56886ff08e48b65650))
+
 ## [1.1.3](https://github.com/jr200-labs/keymint/compare/v1.1.2...v1.1.3) (2026-06-08)
 
 
