@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.1](https://github.com/jr200-labs/keymint/compare/v1.2.0...v1.2.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.19 ([#52](https://github.com/jr200-labs/keymint/issues/52)) ([b7222fc](https://github.com/jr200-labs/keymint/commit/b7222fc64e5c7146e2d664675bed526069d497dc))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.20 ([#53](https://github.com/jr200-labs/keymint/issues/53)) ([6d3ec5c](https://github.com/jr200-labs/keymint/commit/6d3ec5c67e108e03444712c12f22b04efc2711ec))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.21 ([#54](https://github.com/jr200-labs/keymint/issues/54)) ([4ce21ff](https://github.com/jr200-labs/keymint/commit/4ce21ffe6577e9c62dd30ac8be9c232035d22ea3))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.23 ([#55](https://github.com/jr200-labs/keymint/issues/55)) ([3daf81a](https://github.com/jr200-labs/keymint/commit/3daf81ae0f9ea777fe4787a993b95cdb99dca916))
+* **deps:** update shared workflow ref ([#46](https://github.com/jr200-labs/keymint/issues/46)) ([d24395e](https://github.com/jr200-labs/keymint/commit/d24395efb069b6309932aa83a1bd3d232bc7539b))
+* **deps:** update shared workflow ref ([#48](https://github.com/jr200-labs/keymint/issues/48)) ([7a682c0](https://github.com/jr200-labs/keymint/commit/7a682c0aefcb5419f72846887cb157579fc14096))
+* **deps:** update shared workflow ref ([#49](https://github.com/jr200-labs/keymint/issues/49)) ([fb07f87](https://github.com/jr200-labs/keymint/commit/fb07f871e20923aa747c7353ff07e8f4a00f820e))
+* **deps:** update shared workflow ref ([#50](https://github.com/jr200-labs/keymint/issues/50)) ([fbdb3b0](https://github.com/jr200-labs/keymint/commit/fbdb3b0cdd4f080b6e6de584a01a063b263a0e78))
+* **deps:** update shared workflow ref ([#51](https://github.com/jr200-labs/keymint/issues/51)) ([a35f0d2](https://github.com/jr200-labs/keymint/commit/a35f0d270f85b05e8d03ee8e6e4e3795babd92a8))
+
 ## [1.2.0](https://github.com/jr200-labs/keymint/compare/v1.1.3...v1.2.0) (2026-06-19)
 
 
