@@ -6,6 +6,26 @@ on:
   schedule:
     - cron: "0 17 * * *"
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner pool
+        required: false
+        type: choice
+        default: configured
+        options:
+          - configured
+          - self-hosted
+          - github-hosted
+      repair-lockfiles:
+        description: Overwrite stale pnpm lockfiles on existing Renovate branches
+        required: false
+        type: boolean
+        default: false
+      rebase-branches:
+        description: Rebase Renovate branches that are behind the base branch
+        required: false
+        type: boolean
+        default: false
 
 # Only the caller's TOP-LEVEL permissions cascade into reusable
 # workflows. The reusable's renovate job needs contents/issues/PR
@@ -15,10 +35,16 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  statuses: write
   actions: read
 
 jobs:
   renovate:
     uses: jr200-labs/github-action-templates/.github/workflows/renovate.yaml@master
+    with:
+      runner: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.runner == 'self-hosted' && 'self-hosted' || github.event_name == 'workflow_dispatch' && github.event.inputs.runner == 'github-hosted' && 'ubuntu-latest' || fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+      renovate-image: ${{ vars.RENOVATE_IMAGE }}
+      repair-lockfiles: ${{ github.event_name == 'workflow_dispatch' && inputs.repair-lockfiles }}
+      rebase-branches: ${{ github.event_name == 'workflow_dispatch' && inputs.rebase-branches }}
     secrets:
       INTEGRATION_APP_PRIVATE_KEY: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}
