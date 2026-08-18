@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.0](https://github.com/jr200-labs/keymint/compare/v1.2.1...v1.3.0) (2026-08-18)
+
+
+### Features
+
+* broker emergency credential sessions ([#70](https://github.com/jr200-labs/keymint/issues/70)) ([0b9f798](https://github.com/jr200-labs/keymint/commit/0b9f798aa504908c4e7eb3f6eb3827fb4f9d2286))
+
+
+### Bug Fixes
+
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.36 ([#65](https://github.com/jr200-labs/keymint/issues/65)) ([9fceea3](https://github.com/jr200-labs/keymint/commit/9fceea37ada07a7d825636d58b493cd931470eba))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.37 ([#67](https://github.com/jr200-labs/keymint/issues/67)) ([8253522](https://github.com/jr200-labs/keymint/commit/8253522d1cf36ef7a15c236b8a947c1b0400a3f5))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.38 ([#69](https://github.com/jr200-labs/keymint/issues/69)) ([710bb7b](https://github.com/jr200-labs/keymint/commit/710bb7b10484bf169f4dd68ca98936c34891885b))
+* **deps:** update go module directive to v1.26.6 ([#68](https://github.com/jr200-labs/keymint/issues/68)) ([b065cfb](https://github.com/jr200-labs/keymint/commit/b065cfb91709bbd3bfde08cd95c2ce65de536a32))
+
 ## [1.2.1](https://github.com/jr200-labs/keymint/compare/v1.2.0...v1.2.1) (2026-07-27)
 
 
