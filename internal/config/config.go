@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -58,6 +59,32 @@ type Config struct {
 	// is used as-is. Set this only to your real load-balancer
 	// CIDRs; trusting too widely allows clients to spoof their IP.
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
+
+	// EmergencyProfiles are short-lived, human-authenticated credentials.
+	// They are separate from installation Keys because they represent an
+	// explicitly activated operator identity, not routine workload identity.
+	EmergencyProfiles map[string]EmergencyProfile `yaml:"emergency_profiles,omitempty"`
+}
+
+// EmergencyProfile describes one credential source activated by a human.
+type EmergencyProfile struct {
+	Provider string `yaml:"provider"`
+	MaxTTL   string `yaml:"max_ttl,omitempty"`
+
+	// GitHub OAuth App device flow.
+	ClientID           string   `yaml:"client_id,omitempty"`
+	ClientIDFile       string   `yaml:"client_id_file,omitempty"`
+	ClientSecret       string   `yaml:"client_secret,omitempty"`
+	ClientSecretFile   string   `yaml:"client_secret_file,omitempty"`
+	AllowedUserIDs     []int64  `yaml:"allowed_user_ids,omitempty"`
+	AllowedUserIDsFile string   `yaml:"allowed_user_ids_file,omitempty"`
+	Scopes             []string `yaml:"scopes,omitempty"`
+	APIBaseURL         string   `yaml:"api_base_url,omitempty"`
+
+	// Kubernetes TokenRequest, protected by TOTP re-authentication.
+	Namespace      string `yaml:"namespace,omitempty"`
+	ServiceAccount string `yaml:"service_account,omitempty"`
+	TOTPSecretFile string `yaml:"totp_secret_file,omitempty"`
 }
 
 // Key describes one GitHub App.
@@ -102,6 +129,10 @@ type AllowEntry struct {
 	// Keys is the set of Key names from the top-level Keys map that
 	// this Subject is allowed to mint for.
 	Keys []string `yaml:"keys"`
+
+	// EmergencyProfiles are the human-authenticated profiles this workload may
+	// activate. Empty means routine installation tokens only.
+	EmergencyProfiles []string `yaml:"emergency_profiles,omitempty"`
 }
 
 // Load reads and parses a config file from disk. If path is empty,
@@ -166,13 +197,38 @@ func (c *Config) Validate() error {
 		if e.Subject == "" {
 			return fmt.Errorf("allowlist[%d]: subject is required", i)
 		}
-		if len(e.Keys) == 0 {
-			return fmt.Errorf("allowlist[%d]: keys is required", i)
+		if len(e.Keys) == 0 && len(e.EmergencyProfiles) == 0 {
+			return fmt.Errorf("allowlist[%d]: keys or emergency_profiles is required", i)
 		}
 		for _, ref := range e.Keys {
 			if _, ok := c.Keys[ref]; !ok {
 				return fmt.Errorf("allowlist[%d]: unknown key %q (not in keys map)", i, ref)
 			}
+		}
+		for _, ref := range e.EmergencyProfiles {
+			if _, ok := c.EmergencyProfiles[ref]; !ok {
+				return fmt.Errorf("allowlist[%d]: unknown emergency profile %q", i, ref)
+			}
+		}
+	}
+	for name, profile := range c.EmergencyProfiles {
+		if name == "" {
+			return errors.New("emergency profile name must be non-empty")
+		}
+		if _, err := profile.TTL(); err != nil {
+			return fmt.Errorf("emergency profile %q: %w", name, err)
+		}
+		switch profile.Provider {
+		case "github_user":
+			if (profile.ClientID == "" && profile.ClientIDFile == "") || (profile.ClientSecret == "" && profile.ClientSecretFile == "") || (len(profile.AllowedUserIDs) == 0 && profile.AllowedUserIDsFile == "") || len(profile.Scopes) == 0 {
+				return fmt.Errorf("emergency profile %q: client ID, client secret, allowed user IDs, and scopes are required", name)
+			}
+		case "kubernetes":
+			if profile.Namespace == "" || profile.ServiceAccount == "" || profile.TOTPSecretFile == "" {
+				return fmt.Errorf("emergency profile %q: namespace, service_account, and totp_secret_file are required", name)
+			}
+		default:
+			return fmt.Errorf("emergency profile %q: unsupported provider %q", name, profile.Provider)
 		}
 	}
 	for i, cidr := range c.TrustedProxies {
@@ -181,6 +237,18 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// TTL returns the configured maximum session duration, defaulting to 15 minutes.
+func (p EmergencyProfile) TTL() (time.Duration, error) {
+	if p.MaxTTL == "" {
+		return 15 * time.Minute, nil
+	}
+	ttl, err := time.ParseDuration(p.MaxTTL)
+	if err != nil || ttl <= 0 || ttl > time.Hour {
+		return 0, errors.New("max_ttl must be between 1ns and 1h")
+	}
+	return ttl, nil
 }
 
 // ParsedTrustedProxies returns the TrustedProxies field as parsed

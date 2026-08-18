@@ -17,6 +17,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/emergency"
 	"github.com/jr200-labs/keymint/internal/logging"
 	keymintMetrics "github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/jr200-labs/keymint/internal/mint"
@@ -324,7 +325,18 @@ SOPS files.`,
 				return ct.Token, ct.ExpiresAt, nil
 			}
 
-			srv, err := server.New(cfg, mintFn, reviewer, m)
+			var issuer emergency.TokenIssuer
+			for _, profile := range cfg.EmergencyProfiles {
+				if profile.Provider == "kubernetes" {
+					issuer, err = emergency.NewKubernetesIssuer()
+					if err != nil {
+						return err
+					}
+					break
+				}
+			}
+			emergencyService := emergency.New(cfg, &http.Client{Timeout: 15 * time.Second}, issuer)
+			srv, err := server.New(cfg, mintFn, reviewer, m, emergencyService)
 			if err != nil {
 				return err
 			}

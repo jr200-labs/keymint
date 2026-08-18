@@ -13,6 +13,11 @@ your laptop or as an in-cluster broker service.
   inbound bearer tokens against the cluster's TokenReview API; if the
   caller's ServiceAccount is in the configured allowlist, mints an
   installation token and returns it.
+- **Emergency sessions**: re-authenticate a human with a GitHub OAuth App device
+  flow or TOTP, then issue a session-scoped GitHub user or Secret-bound
+  Kubernetes token to the authenticated workload. The credential stays in
+  trusted process memory; expiry remotely revokes the OAuth token or deletes
+  the Kubernetes binding Secret.
 
 The two modes share the same Go binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo

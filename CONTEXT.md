@@ -1,0 +1,25 @@
+# Credential Brokerage
+
+Keymint holds credential-issuing authority and gives authenticated workloads
+short-lived credentials without distributing long-lived signing material.
+
+## Language
+
+**Key**:
+A GitHub App installation identity used for routine workload credentials.
+_Avoid_: Account, user token
+
+**Emergency profile**:
+A configured human identity and credential provider that can be activated only
+through explicit re-authentication.
+_Avoid_: Admin key, permanent elevation
+
+**Emergency session**:
+A short-lived, revocable activation of one emergency profile by one authenticated
+workload acting for a human.
+_Avoid_: Break-glass token, login
+
+**GitHub user session**:
+A GitHub OAuth device-flow emergency session with explicit scopes and an allowed
+immutable user ID.
+_Avoid_: GitHub App installation token
