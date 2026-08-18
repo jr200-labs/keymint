@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,10 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 		Allowlist: []config.AllowEntry{{Subject: "system:serviceaccount:agents:relay", EmergencyProfiles: []string{"cluster-admin"}}},
 	}
 	issuer := &fakeIssuer{}
-	service := New(cfg, http.DefaultClient, issuer)
+	service, err := New(cfg, http.DefaultClient, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
 	service.now = func() time.Time { return time.Unix(59, 0) }
 
 	session, err := service.Create(context.Background(), "system:serviceaccount:agents:relay", "cluster-admin", 10*time.Minute)
@@ -73,6 +77,51 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 	}
 	if issuer.revoked != "bound-secret" {
 		t.Fatalf("revoked %q", issuer.revoked)
+	}
+}
+
+func TestActiveTOTPSessionCanBeginPasskeyEnrollment(t *testing.T) {
+	directory := t.TempDir()
+	secretPath := filepath.Join(directory, "totp")
+	if err := os.WriteFile(secretPath, []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Passkeys: &config.PasskeyConfig{
+			RPID: "padd.example.com", RPDisplayName: "Padd", RPOrigins: []string{"https://padd.example.com"},
+			VerificationURL: "https://padd.example.com/auth/passkey", StateFile: filepath.Join(directory, "passkeys.json"),
+		},
+		EmergencyProfiles: map[string]config.EmergencyProfile{
+			"cluster-admin": {Provider: "kubernetes", Namespace: "operators", ServiceAccount: "breakglass-admin", TOTPSecretFile: secretPath},
+		},
+		Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin"}}},
+	}
+	service, err := New(cfg, http.DefaultClient, &fakeIssuer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return time.Unix(59, 0) }
+	session, err := service.Create(context.Background(), "allowed", "cluster-admin", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BeginPasskeyEnrollment("allowed", session.ID); err == nil {
+		t.Fatal("enrollment began before TOTP verification")
+	}
+	if _, err := service.VerifyTOTP("allowed", session.ID, "287082"); err != nil {
+		t.Fatal(err)
+	}
+	enrollment, err := service.BeginPasskeyEnrollment("allowed", session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.TrimPrefix(enrollment.VerificationURI, "https://padd.example.com/auth/passkey/#")
+	options, err := service.PasskeyOptions("allowed", token)
+	if err != nil || options["kind"] != "registration" || options["public_key"] == nil {
+		t.Fatalf("options = %#v, %v", options, err)
+	}
+	if _, err := os.Stat(cfg.Passkeys.StateFile); err != nil {
+		t.Fatalf("passkey state was not persisted: %v", err)
 	}
 }
 
@@ -109,7 +158,10 @@ func TestKubernetesSessionCanUseGitHubDeviceAuthentication(t *testing.T) {
 		Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin-passkey"}}},
 	}
 	issuer := &fakeIssuer{}
-	service := New(cfg, client, issuer)
+	service, err := New(cfg, client, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
 	session, err := service.Create(context.Background(), "allowed", "cluster-admin-passkey", 10*time.Minute)
 	if err != nil || session.State != AwaitingGitHub {
 		t.Fatalf("create = %#v, %v", session, err)
@@ -138,7 +190,10 @@ func TestProfileIsHiddenFromUnallowedWorkload(t *testing.T) {
 		},
 		Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin"}}},
 	}
-	service := New(cfg, http.DefaultClient, &fakeIssuer{})
+	service, err := New(cfg, http.DefaultClient, &fakeIssuer{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if profiles := service.Profiles("other"); len(profiles) != 0 {
 		t.Fatalf("profiles = %#v", profiles)
 	}
@@ -156,7 +211,10 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	}))
 	defer server.Close()
 	profile := config.EmergencyProfile{Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}, Scopes: []string{"repo"}, APIBaseURL: server.URL}
-	service := New(&config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": profile}}, server.Client(), nil)
+	service, err := New(&config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": profile}}, server.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	service.sessions["E-1"] = &Session{ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
 	service.now = func() time.Time { return time.Unix(2, 0) }
 	if err := service.Prune(context.Background()); err != nil {

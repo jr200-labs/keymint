@@ -22,28 +22,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
 )
 
 type State string
 
 const (
-	AwaitingGitHub State = "awaiting_github"
-	AwaitingTOTP   State = "awaiting_totp"
-	Active         State = "active"
-	Expired        State = "expired"
+	AwaitingGitHub  State = "awaiting_github"
+	AwaitingTOTP    State = "awaiting_totp"
+	AwaitingPasskey State = "awaiting_passkey"
+	Active          State = "active"
+	Expired         State = "expired"
 )
 
 type Profile struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	MaxTTL   int64  `json:"max_ttl_seconds"`
+	Name           string `json:"name"`
+	Provider       string `json:"provider"`
+	Authentication string `json:"authentication"`
+	MaxTTL         int64  `json:"max_ttl_seconds"`
 }
 
 type Session struct {
 	ID              string    `json:"id"`
 	Profile         string    `json:"profile"`
 	Provider        string    `json:"provider"`
+	Authentication  string    `json:"authentication"`
 	State           State     `json:"state"`
 	VerificationURI string    `json:"verification_uri,omitempty"`
 	UserCode        string    `json:"user_code,omitempty"`
@@ -57,6 +61,22 @@ type Session struct {
 	pollEvery      time.Duration
 	boundSecret    string
 	verifyAttempts int
+}
+
+type PasskeyEnrollment struct {
+	ID              string    `json:"id"`
+	State           string    `json:"state"`
+	VerificationURI string    `json:"verification_uri"`
+	ExpiresAt       time.Time `json:"expires_at"`
+}
+
+type passkeyCeremony struct {
+	subject   string
+	sessionID string
+	kind      string
+	options   any
+	data      webauthn.SessionData
+	expiresAt time.Time
 }
 
 type Credential struct {
@@ -77,21 +97,31 @@ type TokenIssuer interface {
 }
 
 type Service struct {
-	mu       sync.Mutex
-	profiles map[string]config.EmergencyProfile
-	allowed  map[string]map[string]bool
-	sessions map[string]*Session
-	http     *http.Client
-	issuer   TokenIssuer
-	now      func() time.Time
+	mu                     sync.Mutex
+	profiles               map[string]config.EmergencyProfile
+	allowed                map[string]map[string]bool
+	sessions               map[string]*Session
+	http                   *http.Client
+	issuer                 TokenIssuer
+	passkeys               *passkeys
+	passkeyVerificationURL string
+	ceremonies             map[string]passkeyCeremony
+	now                    func() time.Time
 }
 
 const maxSessions = 1024
 
-func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) *Service {
-	service := &Service{http: client, issuer: issuer, sessions: map[string]*Session{}, now: time.Now}
+func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service, error) {
+	manager, err := newPasskeys(cfg.Passkeys)
+	if err != nil {
+		return nil, err
+	}
+	service := &Service{http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, now: time.Now}
+	if cfg.Passkeys != nil {
+		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
+	}
 	service.Reload(cfg)
-	return service
+	return service, nil
 }
 
 func (service *Service) Reload(cfg *config.Config) {
@@ -135,7 +165,7 @@ func (service *Service) Profiles(subject string) []Profile {
 	for name := range service.allowed[subject] {
 		profile := service.profiles[name]
 		ttl, _ := profile.TTL()
-		result = append(result, Profile{Name: name, Provider: profile.Provider, MaxTTL: int64(ttl.Seconds())})
+		result = append(result, Profile{Name: name, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), MaxTTL: int64(ttl.Seconds())})
 	}
 	slicesSortProfiles(result)
 	return result
@@ -158,7 +188,7 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 	if err != nil {
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
-	session := &Session{ID: id, Profile: profileName, Provider: profile.Provider, subject: subject, ExpiresAt: now.Add(requestedTTL)}
+	session := &Session{ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
 	switch profile.AuthenticationMethod() {
 	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
@@ -169,6 +199,23 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 		session.deviceCode, session.pollEvery, session.nextPoll = device.DeviceCode, device.Interval, now
 	case "totp":
 		session.State = AwaitingTOTP
+	case "webauthn":
+		if service.passkeys == nil {
+			return Session{}, errors.New("passkeys are unavailable")
+		}
+		options, data, err := service.passkeys.beginLogin()
+		if err != nil {
+			return Session{}, err
+		}
+		token, err := randomID()
+		if err != nil {
+			return Session{}, fmt.Errorf("create passkey ceremony token: %w", err)
+		}
+		session.State = AwaitingPasskey
+		session.VerificationURI = service.passkeyVerificationURL + "/#" + token
+		service.mu.Lock()
+		service.ceremonies[token] = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: now.Add(5 * time.Minute)}
+		service.mu.Unlock()
 	default:
 		return Session{}, errors.New("unsupported emergency authentication")
 	}
@@ -177,12 +224,87 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 	}
 	service.mu.Lock()
 	if len(service.sessions) >= maxSessions {
+		for token, ceremony := range service.ceremonies {
+			if ceremony.sessionID == session.ID {
+				delete(service.ceremonies, token)
+			}
+		}
 		service.mu.Unlock()
 		return Session{}, errors.New("too many active emergency sessions")
 	}
 	service.sessions[session.ID] = session
 	service.mu.Unlock()
 	return publicSession(session), nil
+}
+
+func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (PasskeyEnrollment, error) {
+	if service.passkeys == nil {
+		return PasskeyEnrollment{}, errors.New("passkeys are unavailable")
+	}
+	service.mu.Lock()
+	proof, err := service.ownedSession(subject, proofSessionID)
+	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) {
+		service.mu.Unlock()
+		return PasskeyEnrollment{}, errors.New("an active TOTP-authenticated session is required")
+	}
+	service.mu.Unlock()
+	options, data, err := service.passkeys.beginRegistration()
+	if err != nil {
+		return PasskeyEnrollment{}, err
+	}
+	id, err := randomID()
+	if err != nil {
+		return PasskeyEnrollment{}, err
+	}
+	token, err := randomID()
+	if err != nil {
+		return PasskeyEnrollment{}, err
+	}
+	now := service.now().UTC()
+	enrollment := PasskeyEnrollment{ID: id, State: "awaiting_passkey", VerificationURI: service.passkeyVerificationURL + "/#" + token, ExpiresAt: now.Add(5 * time.Minute)}
+	service.mu.Lock()
+	service.ceremonies[token] = passkeyCeremony{subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
+	service.mu.Unlock()
+	return enrollment, nil
+}
+
+func (service *Service) PasskeyOptions(subject, token string) (map[string]any, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	ceremony, ok := service.ceremonies[token]
+	if !ok || ceremony.subject != subject || !ceremony.expiresAt.After(service.now()) {
+		return nil, errors.New("passkey ceremony not found or expired")
+	}
+	return map[string]any{"kind": ceremony.kind, "public_key": ceremony.options}, nil
+}
+
+func (service *Service) VerifyPasskey(subject, token string, request *http.Request) error {
+	service.mu.Lock()
+	ceremony, ok := service.ceremonies[token]
+	if !ok || ceremony.subject != subject || !ceremony.expiresAt.After(service.now()) {
+		service.mu.Unlock()
+		return errors.New("passkey ceremony not found or expired")
+	}
+	delete(service.ceremonies, token)
+	service.mu.Unlock()
+	if ceremony.sessionID != "" {
+		if err := service.passkeys.finishLogin(ceremony.data, request); err != nil {
+			return fmt.Errorf("verify passkey: %w", err)
+		}
+		service.mu.Lock()
+		defer service.mu.Unlock()
+		session := service.sessions[ceremony.sessionID]
+		if session == nil || session.subject != subject || session.State != AwaitingPasskey {
+			return errors.New("emergency session is unavailable")
+		}
+		session.State = Active
+		return nil
+	}
+	_, err := service.passkeys.finishRegistration(ceremony.data, request)
+	if err != nil {
+		return fmt.Errorf("register passkey: %w", err)
+	}
+	return nil
 }
 
 func (service *Service) Prune(ctx context.Context) error {
@@ -202,6 +324,11 @@ func (service *Service) Prune(ctx context.Context) error {
 		profile := service.profiles[current.Profile]
 		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{profile: profile, token: current.accessToken, secret: current.boundSecret}})
 		delete(service.sessions, id)
+	}
+	for token, ceremony := range service.ceremonies {
+		if !ceremony.expiresAt.After(now) {
+			delete(service.ceremonies, token)
+		}
 	}
 	service.mu.Unlock()
 	var result error

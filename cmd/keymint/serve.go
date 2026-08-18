@@ -335,7 +335,10 @@ SOPS files.`,
 					break
 				}
 			}
-			emergencyService := emergency.New(cfg, &http.Client{Timeout: 15 * time.Second}, issuer)
+			emergencyService, err := emergency.New(cfg, &http.Client{Timeout: 15 * time.Second}, issuer)
+			if err != nil {
+				return err
+			}
 			srv, err := server.New(cfg, mintFn, reviewer, m, emergencyService)
 			if err != nil {
 				return err

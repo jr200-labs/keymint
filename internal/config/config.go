@@ -64,6 +64,16 @@ type Config struct {
 	// They are separate from installation Keys because they represent an
 	// explicitly activated operator identity, not routine workload identity.
 	EmergencyProfiles map[string]EmergencyProfile `yaml:"emergency_profiles,omitempty"`
+	Passkeys          *PasskeyConfig              `yaml:"passkeys,omitempty"`
+}
+
+// PasskeyConfig defines Keymint's WebAuthn relying party and persistent state.
+type PasskeyConfig struct {
+	RPID            string   `yaml:"rp_id"`
+	RPDisplayName   string   `yaml:"rp_display_name"`
+	RPOrigins       []string `yaml:"rp_origins"`
+	VerificationURL string   `yaml:"verification_url"`
+	StateFile       string   `yaml:"state_file"`
 }
 
 // EmergencyProfile describes one credential source activated by a human.
@@ -228,6 +238,10 @@ func (c *Config) Validate() error {
 			if profile.TOTPSecretFile == "" {
 				return fmt.Errorf("emergency profile %q: totp_secret_file is required", name)
 			}
+		case "webauthn":
+			if c.Passkeys == nil {
+				return fmt.Errorf("emergency profile %q: passkeys configuration is required", name)
+			}
 		default:
 			return fmt.Errorf("emergency profile %q: unsupported authentication %q", name, profile.Authentication)
 		}
@@ -242,6 +256,15 @@ func (c *Config) Validate() error {
 			}
 		default:
 			return fmt.Errorf("emergency profile %q: unsupported provider %q", name, profile.Provider)
+		}
+	}
+	if c.Passkeys != nil {
+		if c.Passkeys.RPID == "" || c.Passkeys.RPDisplayName == "" || len(c.Passkeys.RPOrigins) == 0 || c.Passkeys.VerificationURL == "" || c.Passkeys.StateFile == "" {
+			return errors.New("passkeys: rp_id, rp_display_name, rp_origins, verification_url, and state_file are required")
+		}
+		verification, err := url.Parse(c.Passkeys.VerificationURL)
+		if err != nil || verification.Scheme != "https" || verification.Host == "" {
+			return errors.New("passkeys: verification_url must be an absolute HTTPS URL")
 		}
 	}
 	for i, cidr := range c.TrustedProxies {
