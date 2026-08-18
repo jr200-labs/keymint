@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/jr200-labs/keymint/compare/v1.3.0...v1.4.0) (2026-08-18)
+
+
+### Features
+
+* support pluggable emergency authentication ([#72](https://github.com/jr200-labs/keymint/issues/72)) ([c847e07](https://github.com/jr200-labs/keymint/commit/c847e0725f64473e77bae406b279a02784414dee))
+
 ## [1.3.0](https://github.com/jr200-labs/keymint/compare/v1.2.1...v1.3.0) (2026-08-18)
 
 
