@@ -159,18 +159,18 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
 	session := &Session{ID: id, Profile: profileName, Provider: profile.Provider, subject: subject, ExpiresAt: now.Add(requestedTTL)}
-	switch profile.Provider {
-	case "github_user":
+	switch profile.AuthenticationMethod() {
+	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
 		if err != nil {
 			return Session{}, err
 		}
 		session.State, session.VerificationURI, session.UserCode = AwaitingGitHub, device.VerificationURI, device.UserCode
 		session.deviceCode, session.pollEvery, session.nextPoll = device.DeviceCode, device.Interval, now
-	case "kubernetes":
+	case "totp":
 		session.State = AwaitingTOTP
 	default:
-		return Session{}, errors.New("unsupported emergency provider")
+		return Session{}, errors.New("unsupported emergency authentication")
 	}
 	if err := service.Prune(ctx); err != nil {
 		slog.Error("prune expired emergency credentials", "error", err)

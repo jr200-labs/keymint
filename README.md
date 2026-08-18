@@ -17,7 +17,9 @@ your laptop or as an in-cluster broker service.
   flow or TOTP, then issue a session-scoped GitHub user or Secret-bound
   Kubernetes token to the authenticated workload. The credential stays in
   trusted process memory; expiry remotely revokes the OAuth token or deletes
-  the Kubernetes binding Secret.
+  the Kubernetes binding Secret. Kubernetes profiles may use either method;
+  GitHub sign-in supports passkeys while TOTP remains the
+  external-service-independent fallback.
 
 The two modes share the same Go binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo
