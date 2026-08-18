@@ -43,6 +43,7 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/emergency"
 	"github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/sony/gobreaker/v2"
 	"go.opentelemetry.io/otel"
@@ -138,6 +139,7 @@ type Server struct {
 	subjectLimit  *limiterMap // per-resolved-SA, evaluated after auth
 	reviewCache   *reviewCache
 	metrics       *metrics.Metrics
+	emergency     *emergency.Service
 
 	janitorStop chan struct{} // closed by Stop() to halt limiter GC goroutines
 }
@@ -169,6 +171,8 @@ type limiterMap struct {
 // Sweeping is O(active keys); 30s keeps memory bounded for any
 // realistic key churn while staying out of the hot path.
 const limiterJanitorInterval = 30 * time.Second
+
+const emergencyJanitorInterval = 30 * time.Second
 
 func newLimiterMap(rps rate.Limit, burst int) *limiterMap {
 	return &limiterMap{rps: rps, burst: burst}
@@ -253,7 +257,7 @@ type TokenReviewer interface {
 // tests; in production callers pass NewK8sTokenReviewer. The metrics
 // argument may be nil — handlers handle that gracefully so unit tests
 // don't have to construct a metrics registry.
-func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.Metrics) (*Server, error) {
+func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.Metrics, emergencyServices ...*emergency.Service) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("server: cfg is required")
 	}
@@ -279,9 +283,32 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 		janitorStop:  make(chan struct{}),
 	}
 	s.snapshot.Store(buildSnapshot(cfg))
+	if len(emergencyServices) != 0 {
+		s.emergency = emergencyServices[0]
+	}
 	go s.preAuthLimit.runJanitor(s.janitorStop)
 	go s.subjectLimit.runJanitor(s.janitorStop)
+	if s.emergency != nil {
+		go s.runEmergencyJanitor()
+	}
 	return s, nil
+}
+
+func (s *Server) runEmergencyJanitor() {
+	ticker := time.NewTicker(emergencyJanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.janitorStop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), emergencyJanitorInterval)
+			if err := s.emergency.Prune(ctx); err != nil {
+				zap.L().Error("prune expired emergency sessions", zap.Error(err))
+			}
+			cancel()
+		}
+	}
 }
 
 // Stop releases background goroutines (rate-limiter janitors). Safe
@@ -329,6 +356,9 @@ func (s *Server) Reload(cfg *config.Config) error {
 		return fmt.Errorf("server: reload validation: %w", err)
 	}
 	s.snapshot.Store(buildSnapshot(cfg))
+	if s.emergency != nil {
+		s.emergency.Reload(cfg)
+	}
 	return nil
 }
 
@@ -351,6 +381,12 @@ func (s *Server) currentAllowed() map[string]map[string]bool {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token/{key}", s.handleMint)
+	mux.HandleFunc("GET /emergency/profiles", s.handleEmergencyProfiles)
+	mux.HandleFunc("POST /emergency/sessions", s.handleEmergencyCreate)
+	mux.HandleFunc("GET /emergency/sessions/{id}", s.handleEmergencyGet)
+	mux.HandleFunc("POST /emergency/sessions/{id}/verify", s.handleEmergencyVerify)
+	mux.HandleFunc("POST /emergency/sessions/{id}/credential", s.handleEmergencyCredential)
+	mux.HandleFunc("DELETE /emergency/sessions/{id}", s.handleEmergencyRevoke)
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
@@ -395,6 +431,144 @@ type mintResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+func (s *Server) emergencySubject(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if s.emergency == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "emergency sessions are unavailable")
+		return "", false
+	}
+	if !s.preAuthLimit.allow(clientIP(r, s.snapshot.Load().trustedProxies)) {
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+		return "", false
+	}
+	bearer, ok := bearerToken(r)
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
+		return "", false
+	}
+	subject, hit := s.reviewCache.get(bearer)
+	if hit && subject == reviewNegSentinel {
+		writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
+		return "", false
+	}
+	if !hit {
+		var err error
+		subject, ok, err = s.tokenReviewer.Review(r.Context(), bearer)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "kubernetes tokenreview unavailable; retry")
+			return "", false
+		}
+		if !ok {
+			s.reviewCache.putNegative(bearer)
+			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
+			return "", false
+		}
+		s.reviewCache.putPositive(bearer, subject)
+	}
+	if !s.subjectLimit.allow(subject) {
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+		return "", false
+	}
+	return subject, true
+}
+
+func (s *Server) handleEmergencyProfiles(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, map[string]any{"profiles": s.emergency.Profiles(subject)})
+}
+
+func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	var input struct {
+		Profile    string `json:"profile"`
+		TTLSeconds int64  `json:"ttl_seconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	session, err := s.emergency.Create(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	zap.L().Info("emergency session created", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID), zap.Time("expires_at", session.ExpiresAt))
+	writeJSON(w, session)
+}
+
+func (s *Server) handleEmergencyGet(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	session, err := s.emergency.Get(r.Context(), subject, r.PathValue("id"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, session)
+}
+
+func (s *Server) handleEmergencyVerify(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	var input struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	session, err := s.emergency.VerifyTOTP(subject, r.PathValue("id"), input.Code)
+	if err != nil {
+		zap.L().Warn("emergency verification rejected", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+		writeJSONError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	zap.L().Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
+	writeJSON(w, session)
+}
+
+func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	credential, err := s.emergency.Credential(r.Context(), subject, r.PathValue("id"))
+	if err != nil {
+		writeJSONError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	zap.L().Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
+	writeJSON(w, credential)
+}
+
+func (s *Server) handleEmergencyRevoke(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	if err := s.emergency.Revoke(r.Context(), subject, r.PathValue("id")); err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	zap.L().Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
