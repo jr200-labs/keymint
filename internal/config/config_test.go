@@ -107,6 +107,36 @@ allowlist:
 	}
 }
 
+func TestValidateAllowsGitHubAuthenticatedKubernetesProfile(t *testing.T) {
+	cfg := Config{
+		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
+		EmergencyProfiles: map[string]EmergencyProfile{
+			"cluster-admin": {Provider: "kubernetes", Authentication: "github_device", Namespace: "operators", ServiceAccount: "admin", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{42}, Scopes: []string{"read:user"}},
+		},
+		Allowlist: []AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin"}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateAllowsPasskeyAuthenticatedKubernetesProfile(t *testing.T) {
+	cfg := Config{
+		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
+		Passkeys: &PasskeyConfig{
+			RPID: "broker.example.com", RPDisplayName: "Broker", RPOrigins: []string{"https://broker.example.com"},
+			VerificationURL: "https://broker.example.com/auth/passkey", StateFile: "/var/lib/keymint/passkeys.json",
+		},
+		EmergencyProfiles: map[string]EmergencyProfile{
+			"cluster-admin": {Provider: "kubernetes", Authentication: "webauthn", Namespace: "operators", ServiceAccount: "admin"},
+		},
+		Allowlist: []AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin"}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFindByGitHubURL(t *testing.T) {
 	cfg := &Config{
 		Keys: map[string]Key{

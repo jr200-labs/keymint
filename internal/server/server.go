@@ -387,10 +387,65 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /emergency/sessions/{id}/verify", s.handleEmergencyVerify)
 	mux.HandleFunc("POST /emergency/sessions/{id}/credential", s.handleEmergencyCredential)
 	mux.HandleFunc("DELETE /emergency/sessions/{id}", s.handleEmergencyRevoke)
+	mux.HandleFunc("GET /emergency/passkeys/ceremonies/{token}", s.handlePasskeyOptions)
+	mux.HandleFunc("POST /emergency/passkeys/ceremonies/{token}", s.handlePasskeyVerify)
+	mux.HandleFunc("POST /emergency/passkeys/enrollments", s.handlePasskeyEnrollmentCreate)
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
 	return mux
+}
+
+func (s *Server) handlePasskeyOptions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	options, err := s.emergency.PasskeyOptions(subject, r.PathValue("token"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, options)
+}
+
+func (s *Server) handlePasskeyVerify(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	if err := s.emergency.VerifyPasskey(subject, r.PathValue("token"), r); err != nil {
+		zap.L().Warn("passkey verification rejected", zap.String("subject", subject), zap.Error(err))
+		writeJSONError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	zap.L().Info("passkey ceremony completed", zap.String("subject", subject))
+	writeJSON(w, map[string]string{"state": "complete"})
+}
+
+func (s *Server) handlePasskeyEnrollmentCreate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	var input struct {
+		ProofSessionID string `json:"proof_session_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	enrollment, err := s.emergency.BeginPasskeyEnrollment(subject, input.ProofSessionID)
+	if err != nil {
+		writeJSONError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	zap.L().Info("passkey enrollment created", zap.String("subject", subject), zap.String("enrollment", enrollment.ID))
+	writeJSON(w, enrollment)
 }
 
 // handleLive returns 200 immediately. Liveness probes fire often

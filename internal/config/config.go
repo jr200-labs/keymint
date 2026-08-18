@@ -64,12 +64,23 @@ type Config struct {
 	// They are separate from installation Keys because they represent an
 	// explicitly activated operator identity, not routine workload identity.
 	EmergencyProfiles map[string]EmergencyProfile `yaml:"emergency_profiles,omitempty"`
+	Passkeys          *PasskeyConfig              `yaml:"passkeys,omitempty"`
+}
+
+// PasskeyConfig defines Keymint's WebAuthn relying party and persistent state.
+type PasskeyConfig struct {
+	RPID            string   `yaml:"rp_id"`
+	RPDisplayName   string   `yaml:"rp_display_name"`
+	RPOrigins       []string `yaml:"rp_origins"`
+	VerificationURL string   `yaml:"verification_url"`
+	StateFile       string   `yaml:"state_file"`
 }
 
 // EmergencyProfile describes one credential source activated by a human.
 type EmergencyProfile struct {
-	Provider string `yaml:"provider"`
-	MaxTTL   string `yaml:"max_ttl,omitempty"`
+	Provider       string `yaml:"provider"`
+	Authentication string `yaml:"authentication,omitempty"`
+	MaxTTL         string `yaml:"max_ttl,omitempty"`
 
 	// GitHub OAuth App device flow.
 	ClientID           string   `yaml:"client_id,omitempty"`
@@ -81,7 +92,7 @@ type EmergencyProfile struct {
 	Scopes             []string `yaml:"scopes,omitempty"`
 	APIBaseURL         string   `yaml:"api_base_url,omitempty"`
 
-	// Kubernetes TokenRequest, protected by TOTP re-authentication.
+	// Kubernetes TokenRequest, protected by the selected authentication method.
 	Namespace      string `yaml:"namespace,omitempty"`
 	ServiceAccount string `yaml:"service_account,omitempty"`
 	TOTPSecretFile string `yaml:"totp_secret_file,omitempty"`
@@ -218,17 +229,42 @@ func (c *Config) Validate() error {
 		if _, err := profile.TTL(); err != nil {
 			return fmt.Errorf("emergency profile %q: %w", name, err)
 		}
-		switch profile.Provider {
-		case "github_user":
+		switch profile.AuthenticationMethod() {
+		case "github_device":
 			if (profile.ClientID == "" && profile.ClientIDFile == "") || (profile.ClientSecret == "" && profile.ClientSecretFile == "") || (len(profile.AllowedUserIDs) == 0 && profile.AllowedUserIDsFile == "") || len(profile.Scopes) == 0 {
 				return fmt.Errorf("emergency profile %q: client ID, client secret, allowed user IDs, and scopes are required", name)
 			}
+		case "totp":
+			if profile.TOTPSecretFile == "" {
+				return fmt.Errorf("emergency profile %q: totp_secret_file is required", name)
+			}
+		case "webauthn":
+			if c.Passkeys == nil {
+				return fmt.Errorf("emergency profile %q: passkeys configuration is required", name)
+			}
+		default:
+			return fmt.Errorf("emergency profile %q: unsupported authentication %q", name, profile.Authentication)
+		}
+		switch profile.Provider {
+		case "github_user":
+			if profile.AuthenticationMethod() != "github_device" {
+				return fmt.Errorf("emergency profile %q: GitHub user credentials require github_device authentication", name)
+			}
 		case "kubernetes":
-			if profile.Namespace == "" || profile.ServiceAccount == "" || profile.TOTPSecretFile == "" {
-				return fmt.Errorf("emergency profile %q: namespace, service_account, and totp_secret_file are required", name)
+			if profile.Namespace == "" || profile.ServiceAccount == "" {
+				return fmt.Errorf("emergency profile %q: namespace and service_account are required", name)
 			}
 		default:
 			return fmt.Errorf("emergency profile %q: unsupported provider %q", name, profile.Provider)
+		}
+	}
+	if c.Passkeys != nil {
+		if c.Passkeys.RPID == "" || c.Passkeys.RPDisplayName == "" || len(c.Passkeys.RPOrigins) == 0 || c.Passkeys.VerificationURL == "" || c.Passkeys.StateFile == "" {
+			return errors.New("passkeys: rp_id, rp_display_name, rp_origins, verification_url, and state_file are required")
+		}
+		verification, err := url.Parse(c.Passkeys.VerificationURL)
+		if err != nil || verification.Scheme != "https" || verification.Host == "" {
+			return errors.New("passkeys: verification_url must be an absolute HTTPS URL")
 		}
 	}
 	for i, cidr := range c.TrustedProxies {
@@ -237,6 +273,17 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// AuthenticationMethod returns the configured human-verification method.
+func (p EmergencyProfile) AuthenticationMethod() string {
+	if p.Authentication != "" {
+		return p.Authentication
+	}
+	if p.Provider == "github_user" {
+		return "github_device"
+	}
+	return "totp"
 }
 
 // TTL returns the configured maximum session duration, defaulting to 15 minutes.
