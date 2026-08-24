@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.1](https://github.com/jr200-labs/keymint/compare/v1.4.0...v1.4.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **deps:** update go module directive to v1.27.0 ([#74](https://github.com/jr200-labs/keymint/issues/74)) ([e48c1f0](https://github.com/jr200-labs/keymint/commit/e48c1f0cee6e1b01ea98c5bf10f232d9b165cd21))
+* refresh Kubernetes issuer token ([#75](https://github.com/jr200-labs/keymint/issues/75)) ([ae22555](https://github.com/jr200-labs/keymint/commit/ae22555fd3ee0d026f041ce9710e523c18098909))
+
 ## [1.4.0](https://github.com/jr200-labs/keymint/compare/v1.3.0...v1.4.0) (2026-08-18)
 
 
