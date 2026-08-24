@@ -23,18 +23,14 @@ const (
 )
 
 type KubernetesIssuer struct {
-	apiServer, bearer string
-	http              *http.Client
+	apiServer, tokenPath string
+	http                 *http.Client
 }
 
 func NewKubernetesIssuer() (*KubernetesIssuer, error) {
 	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
 	if host == "" || port == "" {
 		return nil, errors.New("Kubernetes service environment is unavailable")
-	}
-	bearer, err := os.ReadFile(serviceAccountTokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("read service account token: %w", err)
 	}
 	ca, err := os.ReadFile(serviceAccountCAPath)
 	if err != nil {
@@ -45,7 +41,7 @@ func NewKubernetesIssuer() (*KubernetesIssuer, error) {
 		return nil, errors.New("parse service account CA")
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	return &KubernetesIssuer{apiServer: "https://" + host + ":" + port, bearer: strings.TrimSpace(string(bearer)), http: &http.Client{Transport: transport, Timeout: 15 * time.Second}}, nil
+	return &KubernetesIssuer{apiServer: "https://" + host + ":" + port, tokenPath: serviceAccountTokenPath, http: &http.Client{Transport: transport, Timeout: 15 * time.Second}}, nil
 }
 
 func (issuer *KubernetesIssuer) Issue(ctx context.Context, namespace, serviceAccount string, ttl time.Duration, existingSecret string) (string, string, time.Time, error) {
@@ -119,6 +115,10 @@ func (issuer *KubernetesIssuer) secretUID(ctx context.Context, namespace, name s
 }
 
 func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string, input, output any) error {
+	bearer, err := os.ReadFile(issuer.tokenPath)
+	if err != nil {
+		return fmt.Errorf("read service account token: %w", err)
+	}
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -131,7 +131,7 @@ func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+issuer.bearer)
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(bearer)))
 	request.Header.Set("Content-Type", "application/json")
 	response, err := issuer.http.Do(request)
 	if err != nil {
