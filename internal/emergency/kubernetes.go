@@ -69,7 +69,6 @@ func (issuer *KubernetesIssuer) Issue(ctx context.Context, namespace, serviceAcc
 	requestBody := map[string]any{
 		"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
 		"spec": map[string]any{
-			"audiences":         []string{"https://kubernetes.default.svc"},
 			"expirationSeconds": seconds,
 			"boundObjectRef":    map[string]any{"apiVersion": "v1", "kind": "Secret", "name": secret, "uid": uid},
 		},
