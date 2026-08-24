@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/jr200-labs/keymint/compare/v1.4.1...v1.4.2) (2026-08-24)
+
+
+### Bug Fixes
+
+* use API server audience for emergency tokens ([#77](https://github.com/jr200-labs/keymint/issues/77)) ([01b62bd](https://github.com/jr200-labs/keymint/commit/01b62bded0c4621e6d27e0b2d9554c19f28a18d8))
+
 ## [1.4.1](https://github.com/jr200-labs/keymint/compare/v1.4.0...v1.4.1) (2026-08-24)
 
 
