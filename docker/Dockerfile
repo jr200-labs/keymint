@@ -1,4 +1,6 @@
-FROM golang:1.27-alpine AS builder
+# renovate: datasource=docker depName=golang versioning=docker
+ARG GOVERSION=1.27
+FROM golang:${GOVERSION}-alpine AS builder
 
 ARG BUILD_ARCH
 ARG BUILD_OS
