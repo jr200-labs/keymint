@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.3](https://github.com/jr200-labs/keymint/compare/v1.4.2...v1.4.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* build Keymint with Go 1.27 ([#79](https://github.com/jr200-labs/keymint/issues/79)) ([ce80c73](https://github.com/jr200-labs/keymint/commit/ce80c736c13aec7a6a0d1bed6e38eadacac93f51))
+
 ## [1.4.2](https://github.com/jr200-labs/keymint/compare/v1.4.1...v1.4.2) (2026-08-24)
 
 
