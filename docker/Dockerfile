@@ -1,5 +1,4 @@
-ARG GOVERSION=1.26
-FROM golang:${GOVERSION}-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ARG BUILD_ARCH
 ARG BUILD_OS
