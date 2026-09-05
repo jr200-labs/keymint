@@ -34,3 +34,12 @@ _Avoid_: Break-glass token, login
 A GitHub OAuth device-flow emergency session with explicit scopes and an allowed
 immutable user ID.
 _Avoid_: GitHub App installation token
+
+**Emergency event journal**:
+The embedded SQLite log of credential-free Emergency session lifecycle changes.
+It supports replay and bounded HTTP long polling; it is not the store for live
+credentials or authentication ceremony material.
+
+**Emergency event cursor**:
+An opaque consumer position containing the journal stream generation and event
+position. Consumers persist and return it unchanged.

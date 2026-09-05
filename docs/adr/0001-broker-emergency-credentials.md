@@ -14,6 +14,10 @@ GitHub OAuth tokens do not expire with the local 15-minute session. Keymint
 therefore holds the OAuth App client secret and revokes the token at GitHub on
 session expiry, explicit revocation, or profile removal.
 
-Session state is memory-only: broker restart invalidates it, so deployments with
-emergency profiles run one replica. Add an encrypted shared session store only
-if failover during a 15-minute emergency session becomes a measured need.
+Credential-bearing session state is memory-only: broker restart invalidates it,
+so deployments with emergency profiles run one replica. Credential-free
+lifecycle metadata is persisted separately in the event journal described by
+[ADR 0003](0003-publish-durable-emergency-session-events.md); after a restart it
+records invalidation of unfinished sessions so consumers can remove their stale
+bindings. Add an encrypted shared session store only if failover during a
+15-minute emergency session becomes a measured need.
