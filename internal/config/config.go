@@ -65,6 +65,8 @@ type Config struct {
 	// explicitly activated operator identity, not routine workload identity.
 	EmergencyProfiles map[string]EmergencyProfile `yaml:"emergency_profiles,omitempty"`
 	Passkeys          *PasskeyConfig              `yaml:"passkeys,omitempty"`
+	// EmergencyStateFile stores the durable, credential-free lifecycle journal.
+	EmergencyStateFile string `yaml:"emergency_state_file,omitempty"`
 }
 
 // PasskeyConfig defines Keymint's WebAuthn relying party and persistent state.

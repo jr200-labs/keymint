@@ -339,6 +339,11 @@ SOPS files.`,
 			if err != nil {
 				return err
 			}
+			defer func() {
+				if err := emergencyService.Close(); err != nil {
+					log.Error("close emergency event state", zap.Error(err))
+				}
+			}()
 			srv, err := server.New(cfg, mintFn, reviewer, m, emergencyService)
 			if err != nil {
 				return err

@@ -199,6 +199,36 @@ func TestProfileIsHiddenFromUnallowedWorkload(t *testing.T) {
 	}
 }
 
+func TestSessionMutationsPublishResumableEvents(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
+		EmergencyProfiles: map[string]config.EmergencyProfile{
+			"cluster-admin": {Provider: "kubernetes", Namespace: "operators", ServiceAccount: "breakglass-admin", TOTPSecretFile: "/dev/null"},
+		},
+		Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"cluster-admin"}}},
+	}
+	service, err := New(cfg, http.DefaultClient, &fakeIssuer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	session, err := service.Create(context.Background(), "allowed", "cluster-admin", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.Events(context.Background(), "allowed", "", 0)
+	if err != nil || len(created.Events) != 1 || created.Events[0].Type != "session.created" || created.Events[0].SessionID != session.ID {
+		t.Fatalf("created events = %+v, error = %v", created, err)
+	}
+	if err := service.Revoke(context.Background(), "allowed", session.ID); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := service.Events(context.Background(), "allowed", created.NextCursor, 0)
+	if err != nil || len(revoked.Events) != 1 || revoked.Events[0].Type != "session.revoked" {
+		t.Fatalf("revoked events = %+v, error = %v", revoked, err)
+	}
+}
+
 func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -215,7 +245,7 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.sessions["E-1"] = &Session{ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
+	service.sessions["E-1"] = &Session{ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, subject: "allowed", accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
 	service.now = func() time.Time { return time.Unix(2, 0) }
 	if err := service.Prune(context.Background()); err != nil {
 		t.Fatal(err)
