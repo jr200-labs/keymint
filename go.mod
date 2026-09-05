@@ -1,6 +1,6 @@
 module github.com/jr200-labs/keymint
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1
