@@ -34,6 +34,7 @@ const (
 	AwaitingPasskey State = "awaiting_passkey"
 	Active          State = "active"
 	Expired         State = "expired"
+	Invalidated     State = "invalidated"
 )
 
 type Profile struct {
@@ -106,6 +107,7 @@ type Service struct {
 	passkeys               *passkeys
 	passkeyVerificationURL string
 	ceremonies             map[string]passkeyCeremony
+	events                 *eventStore
 	now                    func() time.Time
 }
 
@@ -116,13 +118,19 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, now: time.Now}
+	events, err := openEventStore(cfg.EmergencyStateFile)
+	if err != nil {
+		return nil, err
+	}
+	service := &Service{http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
 	if cfg.Passkeys != nil {
 		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
 	}
 	service.Reload(cfg)
 	return service, nil
 }
+
+func (service *Service) Close() error { return service.events.close() }
 
 func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Lock()
@@ -141,6 +149,7 @@ func (service *Service) Reload(cfg *config.Config) {
 		}
 	}
 	var revoked []revokedCredential
+	var invalidated []*Session
 	for id, session := range service.sessions {
 		if _, exists := service.profiles[session.Profile]; exists && service.allowed[session.subject][session.Profile] {
 			continue
@@ -148,12 +157,20 @@ func (service *Service) Reload(cfg *config.Config) {
 		if session.accessToken != "" || session.boundSecret != "" {
 			revoked = append(revoked, revokedCredential{profile: oldProfiles[session.Profile], token: session.accessToken, secret: session.boundSecret})
 		}
+		copy := *session
+		copy.State = Invalidated
+		invalidated = append(invalidated, &copy)
 		delete(service.sessions, id)
 	}
 	service.mu.Unlock()
 	for _, credential := range revoked {
 		if err := service.revokeCredential(context.Background(), credential); err != nil {
 			slog.Error("revoke credential removed by config reload", "provider", credential.profile.Provider, "error", err)
+		}
+	}
+	for _, session := range invalidated {
+		if err := service.record(context.Background(), "session.invalidated", session); err != nil {
+			slog.Error("record emergency session invalidated by config reload", "session", session.ID, "error", err)
 		}
 	}
 }
@@ -234,6 +251,17 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 	}
 	service.sessions[session.ID] = session
 	service.mu.Unlock()
+	if err := service.record(ctx, "session.created", session); err != nil {
+		service.mu.Lock()
+		delete(service.sessions, session.ID)
+		for token, ceremony := range service.ceremonies {
+			if ceremony.sessionID == session.ID {
+				delete(service.ceremonies, token)
+			}
+		}
+		service.mu.Unlock()
+		return Session{}, fmt.Errorf("record emergency session creation: %w", err)
+	}
 	return publicSession(session), nil
 }
 
@@ -292,13 +320,15 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 			return fmt.Errorf("verify passkey: %w", err)
 		}
 		service.mu.Lock()
-		defer service.mu.Unlock()
 		session := service.sessions[ceremony.sessionID]
 		if session == nil || session.subject != subject || session.State != AwaitingPasskey {
+			service.mu.Unlock()
 			return errors.New("emergency session is unavailable")
 		}
 		session.State = Active
-		return nil
+		copy := *session
+		service.mu.Unlock()
+		return service.record(request.Context(), "session.activated", &copy)
 	}
 	_, err := service.passkeys.finishRegistration(ceremony.data, request)
 	if err != nil {
@@ -340,7 +370,9 @@ func (service *Service) Prune(ctx context.Context) error {
 			}
 			service.mu.Unlock()
 			result = errors.Join(result, err)
+			continue
 		}
+		result = errors.Join(result, service.record(ctx, "session.expired", item.session))
 	}
 	return result
 }
@@ -370,6 +402,7 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 		service.mu.Unlock()
 	}
 	if copy.State == AwaitingGitHub && !copy.nextPoll.After(service.now()) {
+		previousState := copy.State
 		if err := service.pollGitHub(ctx, &copy, profile); err != nil {
 			return Session{}, err
 		}
@@ -378,35 +411,49 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 			*current = copy
 		}
 		service.mu.Unlock()
+		if previousState != copy.State && copy.State == Active {
+			if err := service.record(ctx, "session.activated", &copy); err != nil {
+				return Session{}, err
+			}
+		}
 	}
 	return publicSession(&copy), nil
 }
 
 func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 	service.mu.Lock()
-	defer service.mu.Unlock()
 	session, err := service.ownedSession(subject, id)
 	if err != nil {
+		service.mu.Unlock()
 		return Session{}, err
 	}
 	if session.State != AwaitingTOTP || !session.ExpiresAt.After(service.now()) {
+		service.mu.Unlock()
 		return Session{}, errors.New("session is not awaiting TOTP")
 	}
 	profile := service.profiles[session.Profile]
 	if session.verifyAttempts >= 5 {
 		session.State = Expired
+		service.mu.Unlock()
 		return Session{}, errors.New("too many invalid TOTP attempts")
 	}
 	secret, err := os.ReadFile(profile.TOTPSecretFile)
 	if err != nil {
+		service.mu.Unlock()
 		return Session{}, fmt.Errorf("read TOTP secret: %w", err)
 	}
 	if !validTOTP(strings.TrimSpace(string(secret)), code, service.now()) {
 		session.verifyAttempts++
+		service.mu.Unlock()
 		return Session{}, errors.New("invalid TOTP code")
 	}
 	session.State = Active
-	return publicSession(session), nil
+	copy := *session
+	service.mu.Unlock()
+	if err := service.record(context.Background(), "session.activated", &copy); err != nil {
+		return Session{}, err
+	}
+	return publicSession(&copy), nil
 }
 
 func (service *Service) Credential(ctx context.Context, subject, id string) (Credential, error) {
@@ -460,7 +507,19 @@ func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 	}
 	delete(service.sessions, id)
 	service.mu.Unlock()
-	return nil
+	return service.record(ctx, "session.revoked", session)
+}
+
+func (service *Service) Events(ctx context.Context, subject, after string, wait time.Duration) (EventPage, error) {
+	return service.events.watch(ctx, subject, after, wait)
+}
+
+func (service *Service) record(ctx context.Context, eventType string, session *Session) error {
+	return service.events.append(ctx, Event{
+		Type: eventType, SessionID: session.ID, Subject: session.subject,
+		Profile: session.Profile, Provider: session.Provider, State: session.State,
+		ExpiresAt: session.ExpiresAt, OccurredAt: service.now().UTC(),
+	})
 }
 
 func (service *Service) ownedSession(subject, id string) (*Session, error) {

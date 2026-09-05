@@ -382,6 +382,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token/{key}", s.handleMint)
 	mux.HandleFunc("GET /emergency/profiles", s.handleEmergencyProfiles)
+	mux.HandleFunc("GET /emergency/events", s.handleEmergencyEvents)
 	mux.HandleFunc("POST /emergency/sessions", s.handleEmergencyCreate)
 	mux.HandleFunc("GET /emergency/sessions/{id}", s.handleEmergencyGet)
 	mux.HandleFunc("POST /emergency/sessions/{id}/verify", s.handleEmergencyVerify)
@@ -394,6 +395,33 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
 	return mux
+}
+
+func (s *Server) handleEmergencyEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	after := r.URL.Query().Get("after")
+	wait := 30 * time.Second
+	if value := r.URL.Query().Get("wait"); value != "" {
+		var err error
+		wait, err = time.ParseDuration(value)
+		if err != nil || wait < 0 {
+			writeJSONError(w, http.StatusBadRequest, "wait must be a non-negative duration")
+			return
+		}
+	}
+	page, err := s.emergency.Events(r.Context(), subject, after, wait)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "watch emergency events")
+		return
+	}
+	writeJSON(w, page)
 }
 
 func (s *Server) handlePasskeyOptions(w http.ResponseWriter, r *http.Request) {
