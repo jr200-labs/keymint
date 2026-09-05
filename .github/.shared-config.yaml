@@ -1,4 +1,4 @@
-ref: shared-v0.1.39
+ref: shared-v0.1.45
 workflows:
   - hygiene
   - go
