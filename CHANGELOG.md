@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.5.0](https://github.com/jr200-labs/keymint/compare/v1.4.3...v1.5.0) (2026-09-05)
+
+
+### Features
+
+* **emergency:** publish durable lifecycle events ([#85](https://github.com/jr200-labs/keymint/issues/85)) ([8e1aeaa](https://github.com/jr200-labs/keymint/commit/8e1aeaa961f25ff25d36cc773a0a33204b6815ea))
+
+
+### Bug Fixes
+
+* **deps:** update all non-major dependencies ([#83](https://github.com/jr200-labs/keymint/issues/83)) ([c8eea73](https://github.com/jr200-labs/keymint/commit/c8eea73eca9e6ffd487fda3dba682623c017eac1))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.39 ([#84](https://github.com/jr200-labs/keymint/issues/84)) ([a0b022c](https://github.com/jr200-labs/keymint/commit/a0b022cfb67746dd36bbbab6f8402946105b4d05))
+* **deps:** update dependency jr200-labs/github-action-templates to shared-v0.1.45 ([#87](https://github.com/jr200-labs/keymint/issues/87)) ([a432350](https://github.com/jr200-labs/keymint/commit/a4323505bff3d33af000c0dd74e370388050224a))
+* **deps:** update go module directive to v1.27.1 ([#88](https://github.com/jr200-labs/keymint/issues/88)) ([46d4044](https://github.com/jr200-labs/keymint/commit/46d404417ee23854dfaf5de7168892d4327424d6))
+* restore configurable Go builder version ([#81](https://github.com/jr200-labs/keymint/issues/81)) ([f58201d](https://github.com/jr200-labs/keymint/commit/f58201d7451598b937ea84c0efdbe2c740efead7))
+
 ## [1.4.3](https://github.com/jr200-labs/keymint/compare/v1.4.2...v1.4.3) (2026-08-25)
 
 
