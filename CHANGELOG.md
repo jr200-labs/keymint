@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5.1](https://github.com/jr200-labs/keymint/compare/v1.5.0...v1.5.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* allow emergency long polls to complete ([#91](https://github.com/jr200-labs/keymint/issues/91)) ([3ab3ce5](https://github.com/jr200-labs/keymint/commit/3ab3ce510524abe02004083561d7f9805eadca44))
+* **deps:** update all non-major dependencies ([#90](https://github.com/jr200-labs/keymint/issues/90)) ([85b39ec](https://github.com/jr200-labs/keymint/commit/85b39ec86f616d9e4d34b3bccc789f01e3c2ad12))
+* **deps:** update module github.com/go-webauthn/webauthn to v0.18.1 ([#93](https://github.com/jr200-labs/keymint/issues/93)) ([512cda0](https://github.com/jr200-labs/keymint/commit/512cda01abab431934b498737bae68be94a44c3d))
+
 ## [1.5.0](https://github.com/jr200-labs/keymint/compare/v1.4.3...v1.5.0) (2026-09-05)
 
 
