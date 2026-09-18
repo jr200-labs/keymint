@@ -7,9 +7,23 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 )
+
+func TestRandomKubernetesNameIsDNSLabelSafe(t *testing.T) {
+	valid := regexp.MustCompile(`^[a-f0-9]{18}$`)
+	for range 256 {
+		name, err := randomKubernetesName()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !valid.MatchString(name) {
+			t.Fatalf("random Kubernetes name %q is not a lowercase DNS-label-safe hexadecimal value", name)
+		}
+	}
+}
 
 func TestKubernetesIssuerReadsRotatedServiceAccountTokenForEveryRequest(t *testing.T) {
 	tokenPath := filepath.Join(t.TempDir(), "token")

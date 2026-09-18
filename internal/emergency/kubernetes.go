@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -152,5 +152,5 @@ func randomKubernetesName() (string, error) {
 	if _, err := rand.Read(value); err != nil {
 		return "", err
 	}
-	return strings.ToLower(base64.RawURLEncoding.EncodeToString(value)), nil
+	return hex.EncodeToString(value), nil
 }
