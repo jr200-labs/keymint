@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.2](https://github.com/jr200-labs/keymint/compare/v1.5.1...v1.5.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* **emergency:** generate Kubernetes-safe secret names ([#96](https://github.com/jr200-labs/keymint/issues/96)) ([79d4cea](https://github.com/jr200-labs/keymint/commit/79d4cead6f6391a07031119cd680ac9ddd2df69f))
+
 ## [1.5.1](https://github.com/jr200-labs/keymint/compare/v1.5.0...v1.5.1) (2026-09-10)
 
 
