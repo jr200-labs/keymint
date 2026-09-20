@@ -36,6 +36,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,7 +63,34 @@ var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/se
 // MintFunc is the contract for producing an installation token given
 // a Key entry. It is injected so this package does not depend on
 // internal/mint or internal/sops directly.
-type MintFunc func(ctx context.Context, key config.Key) (token string, expiresAt time.Time, err error)
+type TokenScope struct {
+	Repositories []string          `json:"repositories,omitempty"`
+	Permissions  map[string]string `json:"permissions,omitempty"`
+}
+
+type MintFunc func(ctx context.Context, key config.Key, scope TokenScope) (token string, expiresAt time.Time, err error)
+
+var repositoryName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+
+func (scope TokenScope) Validate() error {
+	if len(scope.Repositories) > 100 {
+		return errors.New("token scope exceeds 100 repositories")
+	}
+	seen := map[string]bool{}
+	for _, repository := range scope.Repositories {
+		if !repositoryName.MatchString(repository) || seen[repository] {
+			return errors.New("token scope contains an invalid or duplicate repository")
+		}
+		seen[repository] = true
+	}
+	for permission, access := range scope.Permissions {
+		if !repositoryName.MatchString(permission) || !slices.Contains([]string{"read", "write", "admin", "triage", "maintain"}, access) {
+			return errors.New("token scope contains an invalid permission")
+		}
+	}
+	sort.Strings(scope.Repositories)
+	return nil
+}
 
 // configSnapshot is an immutable view of the config + the
 // pre-computed allowedSubject lookup, swapped atomically when
@@ -795,8 +825,32 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Mint
-	token, expiresAt, err := s.mint(ctx, keyEntry)
+	// 5. Parse an optional scope. An empty body preserves the existing broad
+	// installation-token endpoint for trusted in-cluster callers.
+	var scope TokenScope
+	if r.ContentLength > 8192 {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "token scope is too large")
+		return
+	}
+	if r.ContentLength != 0 {
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 8193))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&scope); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
+			return
+		}
+		if err := scope.Validate(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	// 6. Mint
+	token, expiresAt, err := s.mint(ctx, keyEntry, scope)
 	if err != nil {
 		s.recordOutcome(span, metricKey, metrics.OutcomeMintError)
 		span.RecordError(err)

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -198,7 +200,7 @@ SOPS files.`,
 			// once and caches the result. Always called under
 			// singleflight so concurrent callers for the same key
 			// collapse into one outbound request.
-			doMint := func(ctx context.Context, cacheKey string, k config.Key) (cachedToken, error) {
+			doMint := func(ctx context.Context, cacheKey string, k config.Key, scope server.TokenScope) (cachedToken, error) {
 				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
 				defer cancel()
 
@@ -209,6 +211,8 @@ SOPS files.`,
 				tok, err := mint.Mint(ctx, mint.Request{
 					AppID:          k.AppID,
 					InstallationID: k.InstallationID,
+					Repositories:   scope.Repositories,
+					Permissions:    scope.Permissions,
 					PrivateKey:     priv,
 					APIBaseURL:     k.APIBaseURL,
 					OnRateLimit: func(apiBase string, remaining int64, resetAt time.Time) {
@@ -226,7 +230,7 @@ SOPS files.`,
 				return ct, nil
 			}
 
-			mintFn := func(ctx context.Context, k config.Key) (string, time.Time, error) {
+			mintFn := func(ctx context.Context, k config.Key, scope server.TokenScope) (string, time.Time, error) {
 				// Cache key MUST disambiguate every dimension that
 				// could affect the minted token. AppID + InstallID
 				// alone collide if two configs reuse the same
@@ -238,9 +242,14 @@ SOPS files.`,
 				// imposing an os.Stat syscall on every inbound HTTP
 				// request.
 				gen := pemGenerations.current(k.PrivateKeyFile)
-				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d",
+				encodedScope, err := json.Marshal(scope)
+				if err != nil {
+					return "", time.Time{}, fmt.Errorf("encode token scope: %w", err)
+				}
+				scopeDigest := sha256.Sum256(encodedScope)
+				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d|%x",
 					k.AppID, k.InstallationID, k.APIBaseURL,
-					k.PrivateKeyFile, gen)
+					k.PrivateKeyFile, gen, scopeDigest)
 
 				ct, hasToken := tokenCache.Get(cacheKey)
 
@@ -270,7 +279,7 @@ SOPS files.`,
 							ctx, cancel := context.WithTimeout(context.Background(), mintTimeout)
 							defer cancel()
 							_, err, _ := sf.Do(cacheKey, func() (any, error) {
-								return doMint(ctx, cacheKey, k)
+								return doMint(ctx, cacheKey, k, scope)
 							})
 							if err != nil {
 								refreshCooldownUntil.Store(cacheKey,
@@ -303,7 +312,7 @@ SOPS files.`,
 					// context.WithoutCancel preserves trace/baggage
 					// values but drops Done/Err; doMint applies
 					// mintTimeout internally.
-					return doMint(context.WithoutCancel(ctx), cacheKey, k)
+					return doMint(context.WithoutCancel(ctx), cacheKey, k, scope)
 				})
 				if err != nil {
 					// Synchronous refresh failed (GitHub timeout, 5xx,

@@ -53,7 +53,9 @@ func newTestServer(t *testing.T, cfg *config.Config, mint MintFunc, reviewer Tok
 func TestHealthz(t *testing.T) {
 	cfg := &config.Config{Keys: map[string]config.Key{"x": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "", time.Time{}, nil
+		},
 		&fakeReviewer{},
 	)
 	defer srv.Close()
@@ -78,7 +80,7 @@ func TestMint_HappyPath(t *testing.T) {
 		},
 	}
 	expires := time.Date(2026, 4, 25, 13, 0, 0, 0, time.UTC)
-	mint := func(_ context.Context, k config.Key) (string, time.Time, error) {
+	mint := func(_ context.Context, k config.Key, _ TokenScope) (string, time.Time, error) {
 		if k.AppID != 1 {
 			t.Errorf("got AppID %d, want 1", k.AppID)
 		}
@@ -115,10 +117,42 @@ func TestMint_HappyPath(t *testing.T) {
 	}
 }
 
+func TestMint_ForwardsValidatedScope(t *testing.T) {
+	cfg := &config.Config{
+		Keys:      map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
+		Allowlist: []config.AllowEntry{{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}}},
+	}
+	mint := func(_ context.Context, _ config.Key, scope TokenScope) (string, time.Time, error) {
+		if len(scope.Repositories) != 1 || scope.Repositories[0] != "scotty" || scope.Permissions["contents"] != "read" {
+			t.Fatalf("unexpected scope: %#v", scope)
+		}
+		return "ghs_scoped", time.Now().Add(time.Hour), nil
+	}
+	srv := newTestServer(t, cfg, mint, &fakeReviewer{subjectByToken: map[string]string{
+		"valid-sa-token": "system:serviceaccount:agents:agent-runner",
+	}})
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/token/org-a",
+		strings.NewReader(`{"repositories":["scotty"],"permissions":{"contents":"read"}}`))
+	req.Header.Set("Authorization", "Bearer valid-sa-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestMint_MissingAuth(t *testing.T) {
 	cfg := &config.Config{Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "", time.Time{}, nil
+		},
 		&fakeReviewer{},
 	)
 	defer srv.Close()
@@ -137,7 +171,9 @@ func TestMint_TokenReviewRejects(t *testing.T) {
 	cfg := &config.Config{Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}}}
 	reviewer := &fakeReviewer{}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "", time.Time{}, nil
+		},
 		reviewer,
 	)
 	defer srv.Close()
@@ -165,7 +201,9 @@ func TestMint_SubjectNotInAllowlist(t *testing.T) {
 		subjectByToken: map[string]string{"caller-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "", time.Time{}, nil
+		},
 		reviewer,
 	)
 	defer srv.Close()
@@ -197,7 +235,9 @@ func TestMint_SubjectAllowedButWrongKey(t *testing.T) {
 		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "ghs_x", time.Now(), nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "ghs_x", time.Now(), nil
+		},
 		reviewer,
 	)
 	defer srv.Close()
@@ -226,7 +266,9 @@ func TestMint_UnknownKey(t *testing.T) {
 		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
 	srv := newTestServer(t, cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "ghs_x", time.Now(), nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "ghs_x", time.Now(), nil
+		},
 		reviewer,
 	)
 	defer srv.Close()
@@ -255,7 +297,7 @@ func TestMint_MintFailureBecomes500(t *testing.T) {
 	reviewer := &fakeReviewer{
 		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
-	failingMint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	failingMint := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "", time.Time{}, errors.New("synthetic mint failure")
 	}
 	srv := newTestServer(t, cfg, failingMint, reviewer)
@@ -274,7 +316,9 @@ func TestMint_MintFailureBecomes500(t *testing.T) {
 }
 
 func TestNew_Validation(t *testing.T) {
-	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil }
+	mint := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+		return "", time.Time{}, nil
+	}
 	rev := &fakeReviewer{}
 
 	if _, err := New(nil, mint, rev, nil); err == nil {
@@ -323,7 +367,7 @@ func TestPerSubjectRateLimit(t *testing.T) {
 	reviewer := &fakeReviewer{
 		subjectByToken: map[string]string{"sa-token": "system:serviceaccount:agents:agent-runner"},
 	}
-	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	mint := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "ghs_x", time.Now().Add(time.Hour), nil
 	}
 	srv, err := New(cfg, mint, reviewer, nil)
@@ -386,7 +430,7 @@ func TestUnknownKey_DoesNotExplodeMetricCardinality(t *testing.T) {
 			{Subject: "system:serviceaccount:agents:agent-runner", Keys: []string{"org-a"}},
 		},
 	}
-	mint := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	mint := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "ghs_x", time.Now().Add(time.Hour), nil
 	}
 	reviewer := &fakeReviewer{
@@ -541,7 +585,7 @@ func TestReviewCache_BypassesApiserverOnHit(t *testing.T) {
 			return "", false, nil
 		},
 	}
-	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	mintFn := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "ghs_x", time.Now().Add(time.Hour), nil
 	}
 	srv, err := New(cfg, mintFn, reviewer, nil)
@@ -586,7 +630,7 @@ func TestReload_AtomicallySwapsConfig(t *testing.T) {
 		},
 		ExpectedAudiences: []string{"keymint"},
 	}
-	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	mintFn := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "ghs_x", time.Now().Add(time.Hour), nil
 	}
 	reviewer := &fakeReviewer{
@@ -629,7 +673,9 @@ func TestReload_RejectsInvalidConfig(t *testing.T) {
 	cfg := &config.Config{
 		Keys: map[string]config.Key{"good": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
 	}
-	srv, err := New(cfg, func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil }, &fakeReviewer{}, nil)
+	srv, err := New(cfg, func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+		return "", time.Time{}, nil
+	}, &fakeReviewer{}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -663,7 +709,7 @@ func TestReviewCache_NegativeCacheBypassesApiserver(t *testing.T) {
 			return "", false, nil
 		},
 	}
-	mintFn := func(_ context.Context, _ config.Key) (string, time.Time, error) {
+	mintFn := func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
 		return "ghs_x", time.Now().Add(time.Hour), nil
 	}
 	srv, err := New(cfg, mintFn, reviewer, nil)
@@ -695,7 +741,9 @@ func TestProbes_LivezAndReadyz(t *testing.T) {
 		Keys: map[string]config.Key{"org-a": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/x"}},
 	}
 	srv, err := New(cfg,
-		func(_ context.Context, _ config.Key) (string, time.Time, error) { return "", time.Time{}, nil },
+		func(_ context.Context, _ config.Key, _ TokenScope) (string, time.Time, error) {
+			return "", time.Time{}, nil
+		},
 		&fakeReviewer{}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
