@@ -220,6 +220,33 @@ func TestMint_HappyPath(t *testing.T) {
 	}
 }
 
+func TestMint_DownscopesInstallationToken(t *testing.T) {
+	key := generateTestKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var scope struct {
+			Repositories []string          `json:"repositories"`
+			Permissions  map[string]string `json:"permissions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&scope); err != nil {
+			t.Fatalf("decode scope: %v", err)
+		}
+		if len(scope.Repositories) != 1 || scope.Repositories[0] != "scotty" || scope.Permissions["contents"] != "read" {
+			t.Fatalf("unexpected scope: %#v", scope)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(Token{Token: "ghs_scoped", ExpiresAt: time.Now().Add(time.Hour)})
+	}))
+	defer server.Close()
+
+	got, err := Mint(context.Background(), Request{
+		AppID: 12345, InstallationID: 678, PrivateKey: key, APIBaseURL: server.URL,
+		Repositories: []string{"scotty"}, Permissions: map[string]string{"contents": "read"},
+	})
+	if err != nil || got.Token != "ghs_scoped" {
+		t.Fatalf("Mint() = %#v, %v", got, err)
+	}
+}
+
 func TestMint_GitHubError(t *testing.T) {
 	key := generateTestKey(t)
 

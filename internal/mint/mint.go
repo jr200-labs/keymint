@@ -16,6 +16,7 @@
 package mint
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ed25519"
@@ -144,6 +145,16 @@ type Request struct {
 	// InstallationID is the numeric installation ID for the org/user
 	// the token should act on behalf of.
 	InstallationID int64
+
+	// Repositories limits the installation token to these repository names.
+	// Empty preserves GitHub's default of every repository granted to the
+	// installation. Callers forwarding a token outside their trust boundary
+	// should always set this field.
+	Repositories []string
+
+	// Permissions reduces the token's GitHub App permissions. Values are the
+	// GitHub access levels such as "read" or "write".
+	Permissions map[string]string
 
 	// PrivateKey is the App's signing key. Either *rsa.PrivateKey
 	// (signed with RS256) or ed25519.PrivateKey (signed with EdDSA)
@@ -341,13 +352,27 @@ type exchangeResult struct {
 
 func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Request, apiBase string) (exchangeResult, error) {
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", apiBase, req.InstallationID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	var requestBody io.Reader
+	if len(req.Repositories) != 0 || len(req.Permissions) != 0 {
+		encoded, err := json.Marshal(struct {
+			Repositories []string          `json:"repositories,omitempty"`
+			Permissions  map[string]string `json:"permissions,omitempty"`
+		}{Repositories: req.Repositories, Permissions: req.Permissions})
+		if err != nil {
+			return exchangeResult{}, fmt.Errorf("mint: encode token scope: %w", err)
+		}
+		requestBody = bytes.NewReader(encoded)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, requestBody)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: build request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+appJWT)
 	httpReq.Header.Set("Accept", "application/vnd.github+json")
 	httpReq.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if requestBody != nil {
+		httpReq.Header.Set("Content-Type", "application/json")
+	}
 
 	client := req.HTTPClient
 	if client == nil {
