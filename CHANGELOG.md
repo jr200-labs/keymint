@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.6.0](https://github.com/jr200-labs/keymint/compare/v1.5.1...v1.6.0) (2026-09-20)
+
+
+### Features
+
+* **tokens:** support repository-scoped installation tokens ([#98](https://github.com/jr200-labs/keymint/issues/98)) ([648409e](https://github.com/jr200-labs/keymint/commit/648409eedef755db5383df29d36b2e2d228cd175))
+
+
+### Bug Fixes
+
+* **deps:** update all non-major dependencies ([#95](https://github.com/jr200-labs/keymint/issues/95)) ([49a69a3](https://github.com/jr200-labs/keymint/commit/49a69a39af806d4f425ab9db43fcf29e301f6a9d))
+* **emergency:** generate Kubernetes-safe secret names ([#96](https://github.com/jr200-labs/keymint/issues/96)) ([79d4cea](https://github.com/jr200-labs/keymint/commit/79d4cead6f6391a07031119cd680ac9ddd2df69f))
+
 ## [1.5.1](https://github.com/jr200-labs/keymint/compare/v1.5.0...v1.5.1) (2026-09-10)
 
 
