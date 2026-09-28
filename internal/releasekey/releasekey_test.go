@@ -17,8 +17,8 @@ func TestSealReturnsDestinationBoundCiphertextWithoutPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	privateText := base64.StdEncoding.EncodeToString(private.Seed())
-	path := filepath.Join(t.TempDir(), "sparkle-seed")
+	privateText := base64.StdEncoding.EncodeToString(append(append([]byte{}, private...), private.Public().(ed25519.PublicKey)...))
+	path := filepath.Join(t.TempDir(), "sparkle-private-key")
 	if err := os.WriteFile(path, []byte(privateText+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -42,15 +42,15 @@ func TestSealReturnsDestinationBoundCiphertextWithoutPlaintext(t *testing.T) {
 	}
 	opened, ok := box.OpenAnonymous(nil, ciphertext, recipientPublic, recipientPrivate)
 	if !ok || string(opened) != privateText {
-		t.Fatal("destination could not recover the exact Sparkle seed")
+		t.Fatal("destination could not recover the exact Sparkle private-key export")
 	}
 	if sealed.PublicKey != base64.StdEncoding.EncodeToString(private.Public().(ed25519.PublicKey)) {
-		t.Fatal("derived public key does not match the seed")
+		t.Fatal("derived public key does not match the private-key export")
 	}
 }
 
-func TestSealRejectsNonSeedPrivateMaterial(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sparkle-seed")
+func TestSealRejectsNonSparklePrivateMaterial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sparkle-private-key")
 	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(make([]byte, 64))), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +62,28 @@ func TestSealRejectsNonSeedPrivateMaterial(t *testing.T) {
 		KeyID: "key", PublicKey: base64.StdEncoding.EncodeToString(public[:]),
 	})
 	if err == nil {
-		t.Fatal("accepted a non-seed private key")
+		t.Fatal("accepted a non-Sparkle private key")
+	}
+}
+
+func TestSealRejectsInconsistentSparklePrivateMaterial(t *testing.T) {
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := append(append([]byte{}, private...), make([]byte, ed25519.PublicKeySize)...)
+	path := filepath.Join(t.TempDir(), "sparkle-private-key")
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(bundle)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	public, _, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Seal(config.ReleaseKey{PrivateKeyFile: path}, Destination{
+		KeyID: "key", PublicKey: base64.StdEncoding.EncodeToString(public[:]),
+	})
+	if err == nil {
+		t.Fatal("accepted mismatched Sparkle private and public key material")
 	}
 }

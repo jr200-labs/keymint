@@ -34,7 +34,7 @@ type Config struct {
 	// in the SA allowlist).
 	Keys map[string]Key `yaml:"keys"`
 
-	// ReleaseKeys are durable release-signing seeds that Keymint may seal
+	// ReleaseKeys are durable release-signing keys that Keymint may seal
 	// directly to a destination public key after human authentication.
 	// Service mode reads them from Secret-mounted files and never returns
 	// plaintext key material.
@@ -140,7 +140,7 @@ type Key struct {
 	APIBaseURL string `yaml:"api_base_url,omitempty"`
 }
 
-// ReleaseKey binds one Sparkle Ed25519 seed to exactly one GitHub repository.
+// ReleaseKey binds one Sparkle Ed25519 private-key export to one GitHub repository.
 type ReleaseKey struct {
 	Kind           string `yaml:"kind"`
 	PrivateKeyFile string `yaml:"private_key_file"`

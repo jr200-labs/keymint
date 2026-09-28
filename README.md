@@ -21,9 +21,9 @@ ciphertext for CLI and in-cluster callers.
   Direct passkeys work with the browser's configured provider; TOTP remains the
   external-service-independent enrollment and recovery method.
 - **Release-key sealing**: after an active emergency session, read an
-  allowlisted Sparkle Ed25519 seed from a Secret-mounted file and seal it
+  allowlisted Sparkle Ed25519 private-key export from a Secret-mounted file and seal it
   directly to GitHub's repository Actions public key. The API returns the
-  derived public signing key and ciphertext, never the plaintext seed.
+  derived public signing key and ciphertext, never the plaintext private key.
 
 The two modes share the same Go binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo
