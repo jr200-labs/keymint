@@ -2,14 +2,16 @@
 
 ## What this is
 
-Single Go binary that mints short-lived GitHub App installation tokens.
+Single Go binary that brokers short-lived credentials and destination-bound
+release-signing ciphertext.
 Two modes:
 
 - **CLI** (`keymint mint <key>`, `keymint helper`) — laptop dev tool, reads
   SOPS-encrypted PEM on demand
 - **Service** (`keymint serve`) — in-cluster HTTP broker, validates
   Kubernetes ServiceAccount tokens via TokenReview, mints for callers
-  in the configured allowlist
+  in the configured allowlist, and seals recoverable release keys after
+  human authentication
 
 ## Project conventions
 

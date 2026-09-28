@@ -48,6 +48,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
 	"github.com/jr200-labs/keymint/internal/metrics"
+	"github.com/jr200-labs/keymint/internal/releasekey"
 	"github.com/sony/gobreaker/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -98,6 +99,7 @@ func (scope TokenScope) Validate() error {
 type configSnapshot struct {
 	cfg            *config.Config
 	allowedSubject map[string]map[string]bool // subject -> keys -> true
+	allowedRelease map[string]map[string]bool // subject -> release keys -> true
 	trustedProxies []*net.IPNet               // parsed once at snapshot build
 }
 
@@ -356,12 +358,19 @@ func (s *Server) Stop() {
 // parsed trusted-proxy CIDRs for fast lookup at request time.
 func buildSnapshot(cfg *config.Config) *configSnapshot {
 	allowed := make(map[string]map[string]bool, len(cfg.Allowlist))
+	allowedRelease := make(map[string]map[string]bool, len(cfg.Allowlist))
 	for _, e := range cfg.Allowlist {
 		if allowed[e.Subject] == nil {
 			allowed[e.Subject] = make(map[string]bool)
 		}
 		for _, k := range e.Keys {
 			allowed[e.Subject][k] = true
+		}
+		if len(e.ReleaseKeys) != 0 && allowedRelease[e.Subject] == nil {
+			allowedRelease[e.Subject] = make(map[string]bool)
+		}
+		for _, key := range e.ReleaseKeys {
+			allowedRelease[e.Subject][key] = true
 		}
 	}
 	// Validate has already accepted these CIDRs; parse failures
@@ -370,6 +379,7 @@ func buildSnapshot(cfg *config.Config) *configSnapshot {
 	return &configSnapshot{
 		cfg:            cfg,
 		allowedSubject: allowed,
+		allowedRelease: allowedRelease,
 		trustedProxies: proxies,
 	}
 }
@@ -417,6 +427,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /emergency/sessions/{id}", s.handleEmergencyGet)
 	mux.HandleFunc("POST /emergency/sessions/{id}/verify", s.handleEmergencyVerify)
 	mux.HandleFunc("POST /emergency/sessions/{id}/credential", s.handleEmergencyCredential)
+	mux.HandleFunc("POST /emergency/sessions/{id}/seal-release-key", s.handleSealReleaseKey)
 	mux.HandleFunc("DELETE /emergency/sessions/{id}", s.handleEmergencyRevoke)
 	mux.HandleFunc("GET /emergency/passkeys/ceremonies/{token}", s.handlePasskeyOptions)
 	mux.HandleFunc("POST /emergency/passkeys/ceremonies/{token}", s.handlePasskeyVerify)
@@ -664,6 +675,54 @@ func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "no-store")
 	zap.L().Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
 	writeJSON(w, credential)
+}
+
+func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	if err := s.emergency.Authorize(subject, r.PathValue("id")); err != nil {
+		writeJSONError(w, http.StatusConflict, err.Error())
+		return
+	}
+	var input struct {
+		GitHubOwner      string `json:"github_owner"`
+		GitHubRepository string `json:"github_repository"`
+		DestinationKeyID string `json:"destination_key_id"`
+		DestinationKey   string `json:"destination_public_key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil ||
+		!repositoryName.MatchString(input.GitHubOwner) || !repositoryName.MatchString(input.GitHubRepository) {
+		writeJSONError(w, http.StatusBadRequest, "invalid release-key sealing request")
+		return
+	}
+	snapshot := s.snapshot.Load()
+	var name string
+	var key config.ReleaseKey
+	for candidate, configured := range snapshot.cfg.ReleaseKeys {
+		if configured.GitHubOwner == input.GitHubOwner && configured.GitHubRepo == input.GitHubRepository &&
+			snapshot.allowedRelease[subject][candidate] {
+			name, key = candidate, configured
+			break
+		}
+	}
+	if name == "" {
+		writeJSONError(w, http.StatusForbidden, "release signing key is unavailable")
+		return
+	}
+	sealed, err := releasekey.Seal(key, releasekey.Destination{
+		KeyID: input.DestinationKeyID, PublicKey: input.DestinationKey,
+	})
+	if err != nil {
+		zap.L().Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
+		writeJSONError(w, http.StatusInternalServerError, "release signing key could not be sealed")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	zap.L().Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
+		zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
+	writeJSON(w, sealed)
 }
 
 func (s *Server) handleEmergencyRevoke(w http.ResponseWriter, r *http.Request) {

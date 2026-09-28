@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,12 @@ type Config struct {
 	// positional arg to `keymint mint <key>` and as the lookup name
 	// in the SA allowlist).
 	Keys map[string]Key `yaml:"keys"`
+
+	// ReleaseKeys are durable release-signing seeds that Keymint may seal
+	// directly to a destination public key after human authentication.
+	// Service mode reads them from Secret-mounted files and never returns
+	// plaintext key material.
+	ReleaseKeys map[string]ReleaseKey `yaml:"release_keys,omitempty"`
 
 	// Allowlist is consulted only in Service mode. Each entry maps a
 	// Kubernetes ServiceAccount subject (`system:serviceaccount:NS:NAME`)
@@ -133,6 +140,15 @@ type Key struct {
 	APIBaseURL string `yaml:"api_base_url,omitempty"`
 }
 
+// ReleaseKey binds one Sparkle Ed25519 seed to exactly one GitHub repository.
+type ReleaseKey struct {
+	Kind           string `yaml:"kind"`
+	PrivateKeyFile string `yaml:"private_key_file"`
+	GitHubOwner    string `yaml:"github_owner"`
+	GitHubRepo     string `yaml:"github_repository"`
+	SecretName     string `yaml:"secret_name"`
+}
+
 // AllowEntry maps a Kubernetes ServiceAccount subject to the set of
 // Keys it is permitted to mint tokens for.
 type AllowEntry struct {
@@ -146,6 +162,10 @@ type AllowEntry struct {
 	// EmergencyProfiles are the human-authenticated profiles this workload may
 	// activate. Empty means routine installation tokens only.
 	EmergencyProfiles []string `yaml:"emergency_profiles,omitempty"`
+
+	// ReleaseKeys are the destination-bound signing keys this workload may
+	// request after activating one of its EmergencyProfiles.
+	ReleaseKeys []string `yaml:"release_keys,omitempty"`
 }
 
 // Load reads and parses a config file from disk. If path is empty,
@@ -206,12 +226,25 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("key %q: must set private_key_file or private_key_sops", name)
 		}
 	}
+	identifier := regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+	for name, key := range c.ReleaseKeys {
+		if !identifier.MatchString(name) {
+			return fmt.Errorf("release key name %q is invalid", name)
+		}
+		if key.Kind != "sparkle_ed25519" {
+			return fmt.Errorf("release key %q: kind must be sparkle_ed25519", name)
+		}
+		if key.PrivateKeyFile == "" || !identifier.MatchString(key.GitHubOwner) ||
+			!identifier.MatchString(key.GitHubRepo) || key.SecretName != "SPARKLE_EDDSA_PRIVATE_KEY" {
+			return fmt.Errorf("release key %q: private_key_file, repository binding, and Sparkle secret name are required", name)
+		}
+	}
 	for i, e := range c.Allowlist {
 		if e.Subject == "" {
 			return fmt.Errorf("allowlist[%d]: subject is required", i)
 		}
-		if len(e.Keys) == 0 && len(e.EmergencyProfiles) == 0 {
-			return fmt.Errorf("allowlist[%d]: keys or emergency_profiles is required", i)
+		if len(e.Keys) == 0 && len(e.EmergencyProfiles) == 0 && len(e.ReleaseKeys) == 0 {
+			return fmt.Errorf("allowlist[%d]: keys, emergency_profiles, or release_keys is required", i)
 		}
 		for _, ref := range e.Keys {
 			if _, ok := c.Keys[ref]; !ok {
@@ -221,6 +254,11 @@ func (c *Config) Validate() error {
 		for _, ref := range e.EmergencyProfiles {
 			if _, ok := c.EmergencyProfiles[ref]; !ok {
 				return fmt.Errorf("allowlist[%d]: unknown emergency profile %q", i, ref)
+			}
+		}
+		for _, ref := range e.ReleaseKeys {
+			if _, ok := c.ReleaseKeys[ref]; !ok {
+				return fmt.Errorf("allowlist[%d]: unknown release key %q", i, ref)
 			}
 		}
 	}
