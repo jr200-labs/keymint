@@ -3,14 +3,11 @@
 # Always edit the source workflow in jr200-labs/github-action-templates, then sync.
 name: sync-shared-drift
 
-# If the shared workflow drift check fails, repair the default branch by
-# running sync-shared and opening/updating a normal PR. This keeps generated
-# workflow updates out of unrelated Renovate or feature PRs.
+# Manually repair shared workflow drift on the default branch by running
+# sync-shared and opening or updating a normal PR. Automated shared-ref
+# updates repair their own branches before CI, so this is a recovery tool.
 
 on:
-  workflow_run:
-    workflows: [drift-check]
-    types: [completed]
   workflow_dispatch:
     inputs:
       runner:
@@ -33,7 +30,6 @@ concurrency:
 
 jobs:
   sync-shared-drift:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure'
     runs-on: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.runner == 'self-hosted' && 'self-hosted' || github.event_name == 'workflow_dispatch' && github.event.inputs.runner == 'github-hosted' && 'ubuntu-latest' || fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
     steps:
       - name: Mint app token
@@ -90,6 +86,7 @@ jobs:
           pr_json="$(gh pr view "${PR_NUMBER}" --json title,headRefName,files)"
           title="$(jq -r '.title' <<<"${pr_json}")"
           branch="$(jq -r '.headRefName' <<<"${pr_json}")"
+          managed_files="$(./scripts/sync-shared --list-supporting-files)"
 
           if [ "${title}" != "chore: sync shared workflows" ] || [ "${branch}" != "chore/sync-shared-workflows" ]; then
             echo "Refusing auto-merge for unexpected PR ${PR_NUMBER}: ${branch} / ${title}" >&2
@@ -101,10 +98,17 @@ jobs:
               .github/workflows/*.yaml|.github/workflows/*.yml|.githooks/commit-msg|.githooks/lint-message-text.sh|cog.toml|scripts/sync-shared|scripts/sync-shared-drift-check|package.json)
                 ;;
               *)
-                echo "Refusing auto-merge for unexpected sync-shared path: ${path}" >&2
-                exit 1
+                if ! grep -Fxq "${path}" <<<"${managed_files}"; then
+                  echo "Refusing auto-merge for unexpected sync-shared path: ${path}" >&2
+                  exit 1
+                fi
                 ;;
             esac
           done
+
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.allow_auto_merge')" != "true" ]; then
+            echo "::notice title=Shared workflow repair PR ready::PR ${PR_NUMBER} is ready for review; repository auto-merge is disabled."
+            exit 0
+          fi
 
           gh pr merge "${PR_NUMBER}" --squash --auto --delete-branch # lint-no-auto-merge:allow
