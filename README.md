@@ -1,7 +1,7 @@
 # keymint
 
-Mint short-lived GitHub App installation tokens — for use as a CLI on
-your laptop or as an in-cluster broker service.
+Broker short-lived GitHub credentials and destination-bound release-signing
+ciphertext for CLI and in-cluster callers.
 
 ## What it does
 
@@ -20,6 +20,12 @@ your laptop or as an in-cluster broker service.
   the Kubernetes binding Secret. Kubernetes profiles may use either method;
   Direct passkeys work with the browser's configured provider; TOTP remains the
   external-service-independent enrollment and recovery method.
+- **Release-key sealing**: after an active emergency session, read an
+  allowlisted Sparkle Ed25519 private-key export from a Secret-mounted file and seal it
+  directly to GitHub's repository Actions public key. The API returns the
+  derived public signing key and ciphertext, never the plaintext private key. A
+  key may serve multiple internal projects, but every repository must be listed
+  explicitly in its release-key configuration.
 
 The two modes share the same Go binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo

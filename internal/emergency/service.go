@@ -491,6 +491,21 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 	return Credential{Provider: profile.Provider, Token: token, ExpiresAt: expiresAt}, nil
 }
 
+// Authorize verifies that a session belongs to the caller and still represents
+// completed human authentication without issuing or exposing its credential.
+func (service *Service) Authorize(subject, id string) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	session, err := service.ownedSession(subject, id)
+	if err != nil {
+		return err
+	}
+	if session.State != Active || !session.ExpiresAt.After(service.now()) {
+		return errors.New("emergency session is not active")
+	}
+	return nil
+}
+
 func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 	service.mu.Lock()
 	session, err := service.ownedSession(subject, id)

@@ -107,6 +107,28 @@ allowlist:
 	}
 }
 
+func TestValidateReleaseKeyBindingAndAllowlist(t *testing.T) {
+	cfg := Config{
+		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
+		ReleaseKeys: map[string]ReleaseKey{"translatepane": {
+			Kind: "sparkle_ed25519", PrivateKeyFile: "/run/secrets/translatepane",
+			Repositories: []string{"janeway-labs/translatepane", "jr200-labs/example"}, SecretName: "SPARKLE_EDDSA_PRIVATE_KEY",
+		}},
+		Allowlist: []AllowEntry{{Subject: "allowed", ReleaseKeys: []string{"translatepane"}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ReleaseKeys["translatepane"].AllowsRepository("janeway-labs", "translatepane") ||
+		cfg.ReleaseKeys["translatepane"].AllowsRepository("janeway-labs", "other") {
+		t.Fatal("release key repository allowlist was not enforced")
+	}
+	cfg.Allowlist[0].ReleaseKeys = []string{"missing"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("unknown release key error = %v", err)
+	}
+}
+
 func TestValidateAllowsGitHubAuthenticatedKubernetesProfile(t *testing.T) {
 	cfg := Config{
 		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},

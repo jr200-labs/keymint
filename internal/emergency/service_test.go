@@ -65,8 +65,14 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 	if _, err := service.Credential(context.Background(), "system:serviceaccount:agents:relay", session.ID); err == nil {
 		t.Fatal("credential issued before human verification")
 	}
+	if err := service.Authorize("system:serviceaccount:agents:relay", session.ID); err == nil {
+		t.Fatal("release-key operation authorized before human verification")
+	}
 	if _, err := service.VerifyTOTP("system:serviceaccount:agents:relay", session.ID, "287082"); err != nil {
 		t.Fatal(err)
+	}
+	if err := service.Authorize("system:serviceaccount:agents:relay", session.ID); err != nil {
+		t.Fatalf("active session was not authorized: %v", err)
 	}
 	credential, err := service.Credential(context.Background(), "system:serviceaccount:agents:relay", session.ID)
 	if err != nil || credential.Token != "kubernetes-token" {
