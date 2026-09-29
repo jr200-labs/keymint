@@ -140,13 +140,26 @@ type Key struct {
 	APIBaseURL string `yaml:"api_base_url,omitempty"`
 }
 
-// ReleaseKey binds one Sparkle Ed25519 private-key export to one GitHub repository.
+// ReleaseKey binds one Sparkle Ed25519 private-key export to an explicit set of
+// GitHub repositories. A shared internal identity may be reused without making
+// it available to repositories that were not reviewed here.
 type ReleaseKey struct {
-	Kind           string `yaml:"kind"`
-	PrivateKeyFile string `yaml:"private_key_file"`
-	GitHubOwner    string `yaml:"github_owner"`
-	GitHubRepo     string `yaml:"github_repository"`
-	SecretName     string `yaml:"secret_name"`
+	Kind           string   `yaml:"kind"`
+	PrivateKeyFile string   `yaml:"private_key_file"`
+	Repositories   []string `yaml:"repositories"`
+	SecretName     string   `yaml:"secret_name"`
+}
+
+// AllowsRepository reports whether this release key may be provisioned for the
+// exact owner/repository pair.
+func (k ReleaseKey) AllowsRepository(owner, repository string) bool {
+	want := owner + "/" + repository
+	for _, configured := range k.Repositories {
+		if configured == want {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowEntry maps a Kubernetes ServiceAccount subject to the set of
@@ -234,9 +247,16 @@ func (c *Config) Validate() error {
 		if key.Kind != "sparkle_ed25519" {
 			return fmt.Errorf("release key %q: kind must be sparkle_ed25519", name)
 		}
-		if key.PrivateKeyFile == "" || !identifier.MatchString(key.GitHubOwner) ||
-			!identifier.MatchString(key.GitHubRepo) || key.SecretName != "SPARKLE_EDDSA_PRIVATE_KEY" {
-			return fmt.Errorf("release key %q: private_key_file, repository binding, and Sparkle secret name are required", name)
+		if key.PrivateKeyFile == "" || len(key.Repositories) == 0 || key.SecretName != "SPARKLE_EDDSA_PRIVATE_KEY" {
+			return fmt.Errorf("release key %q: private_key_file, repository bindings, and Sparkle secret name are required", name)
+		}
+		seen := make(map[string]bool, len(key.Repositories))
+		for _, repository := range key.Repositories {
+			parts := strings.Split(repository, "/")
+			if len(parts) != 2 || !identifier.MatchString(parts[0]) || !identifier.MatchString(parts[1]) || seen[repository] {
+				return fmt.Errorf("release key %q: repository binding %q is invalid or duplicated", name, repository)
+			}
+			seen[repository] = true
 		}
 	}
 	for i, e := range c.Allowlist {

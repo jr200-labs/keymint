@@ -701,7 +701,7 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 	var name string
 	var key config.ReleaseKey
 	for candidate, configured := range snapshot.cfg.ReleaseKeys {
-		if configured.GitHubOwner == input.GitHubOwner && configured.GitHubRepo == input.GitHubRepository &&
+		if configured.AllowsRepository(input.GitHubOwner, input.GitHubRepository) &&
 			snapshot.allowedRelease[subject][candidate] {
 			name, key = candidate, configured
 			break
