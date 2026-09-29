@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.7.0](https://github.com/jr200-labs/keymint/compare/v1.6.0...v1.7.0) (2026-09-29)
+
+
+### Features
+
+* **secrets:** seal shared recoverable release keys ([#100](https://github.com/jr200-labs/keymint/issues/100)) ([f649f76](https://github.com/jr200-labs/keymint/commit/f649f7637d51733e421c63d26f5b7e63cd3bfa15))
+
+
+### Bug Fixes
+
+* **ci:** update shared release configuration ([#103](https://github.com/jr200-labs/keymint/issues/103)) ([6feaa3d](https://github.com/jr200-labs/keymint/commit/6feaa3d90cf960b5dbbbf2f3112f2b1c935c62cf))
+* **deps:** update module modernc.org/sqlite to v1.60.0 ([#99](https://github.com/jr200-labs/keymint/issues/99)) ([1f5b54a](https://github.com/jr200-labs/keymint/commit/1f5b54a1fa7a2045f24583edb7e5a44abf6843b5))
+* **deps:** update module modernc.org/sqlite to v1.60.1 ([#101](https://github.com/jr200-labs/keymint/issues/101)) ([b725005](https://github.com/jr200-labs/keymint/commit/b72500596d9d36f1339f44dbaf753988ed3c6fc2))
+
 ## [1.6.0](https://github.com/jr200-labs/keymint/compare/v1.5.1...v1.6.0) (2026-09-20)
 
 
