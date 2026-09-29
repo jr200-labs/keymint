@@ -1,6 +1,7 @@
 # GENERATED/SHARED WORKFLOW: copied into consuming repos by sync-shared.
 # Do not edit in consuming repos; change jr200-labs/github-action-templates and sync.
 name: build-docker-image
+run-name: ${{ github.event.client_payload['release-tag'] || format('{0} by @{1}', github.event_name, github.actor) }}
 
 # Triggered by `release-published` repository_dispatch from
 # release-please.yaml when a tag is cut, or manually via
@@ -36,6 +37,11 @@ name: build-docker-image
 # JSON array such as ["linux/amd64"] or a comma-separated string such as
 # linux/amd64,linux/arm64. workflow_dispatch inputs override the
 # variable for ad-hoc runs.
+#
+# A persistent remote builder is optional. Self-hosted runners can provide
+# BUILDKIT_ENDPOINT, BUILDKIT_SERVER_NAME, and BUILDKIT_TLS_DIR in their runtime
+# environment; the reusable detects them automatically. Other runners retain
+# the per-job docker-container builder and external caches.
 
 on:
   repository_dispatch:
@@ -171,3 +177,19 @@ jobs:
       # can ignore the secret.
       build_secrets: |
         ghcr_token=${{ secrets.GITHUB_TOKEN }}
+
+  notify-renovate:
+    needs: [configure, main]
+    if: github.event_name == 'repository_dispatch'
+    uses: jr200-labs/github-action-templates/.github/workflows/notify_artifact_published.yaml@master
+    with:
+      checkout-ref: ${{ fromJson(needs.configure.outputs.context).checkout-ref }}
+      publisher: docker
+      component: ${{ fromJson(needs.configure.outputs.context).component || '.' }}
+      version: ${{ fromJson(needs.configure.outputs.context).tag }}
+      source-sha: ${{ fromJson(needs.configure.outputs.context).sha || '' }}
+      dispatch-client-id: ${{ vars.RENOVATE_DISPATCH_CLIENT_ID || vars.INTEGRATION_CLIENT_ID }}
+      runner: ${{ fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+    secrets:
+      dispatch_app_private_key: ${{ secrets.RENOVATE_DISPATCH_APP_PRIVATE_KEY }}
+      integration_app_private_key: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}
