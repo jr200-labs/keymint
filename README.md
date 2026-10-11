@@ -118,6 +118,15 @@ the deploy accordingly:
   every `TokenReview` call. Use a projected SA volume so the kubelet
   rotates the token in place; do not bake the token into an env var.
 
+- **Actionable permission errors.** When GitHub explicitly rejects token
+  permissions that the installation has not granted, `POST /token/<key>`
+  returns HTTP 422 with `code: github_permissions_not_granted` and a readable
+  `error` naming the key and requested permissions. Update the GitHub App
+  permissions and approve the installation update, or reduce the requested
+  scope. The requested list does not identify which permission is missing.
+  Unclassified mint failures remain HTTP 500 with `error: mint failed`;
+  internal errors and arbitrary upstream response bodies are not disclosed.
+
 - **Two-tier rate limiting.** Inbound requests are rate-limited
   per-remote-IP before authentication (10 r/s, burst 20) and
   per-resolved-ServiceAccount after authentication (100 r/s, burst

@@ -48,6 +48,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
 	"github.com/jr200-labs/keymint/internal/metrics"
+	"github.com/jr200-labs/keymint/internal/mint"
 	"github.com/jr200-labs/keymint/internal/releasekey"
 	"github.com/sony/gobreaker/v2"
 	"go.opentelemetry.io/otel"
@@ -61,14 +62,14 @@ import (
 // tracer is the OTel tracer used for spans emitted by this package.
 var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/server")
 
-// MintFunc is the contract for producing an installation token given
-// a Key entry. It is injected so this package does not depend on
-// internal/mint or internal/sops directly.
+// TokenScope limits the repositories and permissions of an installation token.
 type TokenScope struct {
 	Repositories []string          `json:"repositories,omitempty"`
 	Permissions  map[string]string `json:"permissions,omitempty"`
 }
 
+// MintFunc injects token issuance without coupling the server to private-key
+// loading. Permission rejections wrap mint.ErrPermissionsNotGranted.
 type MintFunc func(ctx context.Context, key config.Key, scope TokenScope) (token string, expiresAt time.Time, err error)
 
 var repositoryName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
@@ -915,6 +916,22 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "mint failed")
 		log.Error("mint failed", zap.Error(err))
+		if errors.Is(err, mint.ErrPermissionsNotGranted) {
+			permissions := make([]string, 0, len(scope.Permissions))
+			for name, level := range scope.Permissions {
+				permissions = append(permissions, name+"="+level)
+			}
+			sort.Strings(permissions)
+			message := fmt.Sprintf("GitHub rejected the requested token permissions for key %q", keyName)
+			if len(permissions) > 0 {
+				message += " (" + strings.Join(permissions, ", ") + ")"
+			}
+			message += ": the installation has not granted one or more requested permissions. Update the GitHub App permissions and approve the installation update, or request a narrower permission scope."
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			writeJSON(w, map[string]string{"error": message, "code": "github_permissions_not_granted"})
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, "mint failed")
 		return
 	}
