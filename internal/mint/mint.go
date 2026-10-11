@@ -124,6 +124,11 @@ func acquireEgress(ctx context.Context, apiBase string) (func(), error) {
 // via Request.APIBaseURL to point at GitHub Enterprise Server.
 const DefaultGitHubAPI = "https://api.github.com"
 
+// ErrPermissionsNotGranted identifies GitHub's explicit rejection of token
+// permissions that have not been granted to the App installation. It does not
+// include the upstream response body, which is unsafe to expose to callers.
+var ErrPermissionsNotGranted = errors.New("mint: GitHub installation has not granted the requested token permissions")
+
 // jwtLifetime is how long the App JWT is valid before exchange. GitHub
 // rejects JWTs older than 10 minutes; we set a slightly shorter window
 // to leave headroom for clock skew.
@@ -413,6 +418,14 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 	}
 
 	if resp.StatusCode != http.StatusCreated {
+		var rejection struct {
+			Message string `json:"message"`
+		}
+		if resp.StatusCode == http.StatusUnprocessableEntity &&
+			json.Unmarshal(body, &rejection) == nil &&
+			rejection.Message == "The permissions requested are not granted to this installation." {
+			return exchangeResult{callerErr: ErrPermissionsNotGranted}, nil
+		}
 		// 4xx is generally a caller-side problem (bad JWT, wrong
 		// installation, suspended app) and shouldn't trip the
 		// breaker. 5xx is GitHub-side. The exception is 429
