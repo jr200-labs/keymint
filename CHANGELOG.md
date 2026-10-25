@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.8.0](https://github.com/jr200-labs/keymint/compare/v1.7.2...v1.8.0) (2026-10-25)
+
+
+### Features
+
+* support restricted OAuth emergency sessions ([#115](https://github.com/jr200-labs/keymint/issues/115)) ([a843662](https://github.com/jr200-labs/keymint/commit/a843662b1fb5e708fcc7b9a6d02128a6ae396a03))
+
+
+### Bug Fixes
+
+* **deps:** update actions/create-github-app-token action to v3.3.0 ([#114](https://github.com/jr200-labs/keymint/issues/114)) ([6dc6a80](https://github.com/jr200-labs/keymint/commit/6dc6a800de8e31e7492ab8a778dc6b0c4a761eba))
+
 ## [1.7.2](https://github.com/jr200-labs/keymint/compare/v1.7.1...v1.7.2) (2026-10-24)
 
 
