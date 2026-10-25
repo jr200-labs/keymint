@@ -263,3 +263,67 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 		t.Fatal("expired session was retained after successful revocation")
 	}
 }
+
+func TestRestrictedGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
+	for _, granted := range []string{"repo,workflow", "admin:org,repo,workflow", "repo", ""} {
+		t.Run(granted, func(t *testing.T) {
+			requested, revoked := "", false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/login/device/code":
+					_ = r.ParseForm()
+					requested = r.Form.Get("scope")
+					_ = json.NewEncoder(w).Encode(map[string]any{"device_code": "device", "user_code": "ABCD-EFGH", "verification_uri": "https://github.com/login/device", "interval": 5})
+				case "/login/oauth/access_token":
+					_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "test-token", "scope": granted})
+				case "/user":
+					_ = json.NewEncoder(w).Encode(map[string]int64{"id": 42})
+				case "/applications/client/token":
+					revoked = true
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client := server.Client()
+			transport := client.Transport
+			client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				copy := r.Clone(r.Context())
+				copy.URL.Scheme, copy.URL.Host = "http", server.Listener.Addr().String()
+				return transport.RoundTrip(copy)
+			})
+			cfg := &config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": {Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{42}, Scopes: []string{"repo", "workflow", "admin:org"}, APIBaseURL: server.URL}}, Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"operator"}}}}
+			service, err := New(cfg, client, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = service.Close() })
+			ctx := context.Background()
+			if _, err = service.CreateWithScopes(ctx, "allowed", "operator", time.Minute, []string{"delete_repo"}); err == nil || requested != "" {
+				t.Fatal("scope escalation reached OAuth")
+			}
+			session, err := service.CreateWithScopes(ctx, "allowed", "operator", time.Minute, []string{"workflow", "repo"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requested != "repo workflow" {
+				t.Fatalf("requested excessive scopes: %q", requested)
+			}
+			result, err := service.Get(ctx, "allowed", session.ID)
+			if granted == "repo,workflow" {
+				if err != nil || result.State != Active || revoked {
+					t.Fatalf("restricted auth failed: %v %+v", err, result)
+				}
+				credential, err := service.Credential(ctx, "allowed", session.ID)
+				if err != nil || credential.Token != "test-token" {
+					t.Fatalf("credential unavailable: %v", err)
+				}
+			} else {
+				if err == nil || !revoked || service.sessions[session.ID] != nil {
+					t.Fatal("unexpected OAuth scopes were accepted or not revoked")
+				}
+			}
+		})
+	}
+}
