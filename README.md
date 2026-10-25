@@ -284,3 +284,20 @@ Never bump versions by hand.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Restricted OAuth emergency sessions
+
+`POST /emergency/sessions` accepts an optional `scopes` array. Nonempty scopes
+must be an exact subset of the allowed `github_user` profile's configured OAuth
+scopes; other providers and additional permissions are rejected before device
+authorization starts. For example, an administrative profile containing `repo`,
+`workflow`, and `admin:org` can issue a session requesting only `repo` and
+`workflow`, using the same OAuth application and workload allowlist. Omit the
+field to retain the configured profile's normal permissions.
+
+The session exposes its restriction as `scopes`. Restricted sessions validate
+the scopes returned by GitHub at token exchange; missing, extra or insufficient
+grants are rejected and token revocation is attempted. This prevents prior OAuth
+authorizations from silently broadening a reduced request. OAuth `repo` remains
+a broad permission, not a per-repository restriction. Consumers must enforce
+their own operation and repository approvals and must not reuse a broader session.

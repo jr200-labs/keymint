@@ -612,14 +612,15 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Profile    string `json:"profile"`
-		TTLSeconds int64  `json:"ttl_seconds"`
+		Profile    string   `json:"profile"`
+		TTLSeconds int64    `json:"ttl_seconds"`
+		Scopes     []string `json:"scopes"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	session, err := s.emergency.Create(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second)
+	session, err := s.emergency.CreateWithScopes(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second, input.Scopes)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return

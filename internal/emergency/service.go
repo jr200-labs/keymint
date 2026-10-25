@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
 )
+
+var errScopeMismatch = errors.New("GitHub granted scopes do not match the restricted request; token rejected")
 
 type State string
 
@@ -45,6 +48,7 @@ type Profile struct {
 }
 
 type Session struct {
+	Scopes          []string  `json:"scopes,omitempty"`
 	ID              string    `json:"id"`
 	Profile         string    `json:"profile"`
 	Provider        string    `json:"provider"`
@@ -189,12 +193,31 @@ func (service *Service) Profiles(subject string) []Profile {
 }
 
 func (service *Service) Create(ctx context.Context, subject, profileName string, requestedTTL time.Duration) (Session, error) {
+	return service.CreateWithScopes(ctx, subject, profileName, requestedTTL, nil)
+}
+
+// CreateWithScopes only permits a subset of the configured OAuth profile.
+func (service *Service) CreateWithScopes(ctx context.Context, subject, profileName string, requestedTTL time.Duration, scopes []string) (Session, error) {
 	service.mu.Lock()
 	profile, exists := service.profiles[profileName]
 	allowed := service.allowed[subject][profileName]
 	service.mu.Unlock()
 	if !exists || !allowed {
 		return Session{}, errors.New("emergency profile is unavailable")
+	}
+	if len(scopes) > 0 {
+		if profile.Provider != "github_user" {
+			return Session{}, errors.New("scope restrictions require a GitHub user profile")
+		}
+		for _, scope := range scopes {
+			if scope == "" || !slices.Contains(profile.Scopes, scope) {
+				return Session{}, errors.New("requested scope is not allowed by the emergency profile")
+			}
+		}
+		scopes = append([]string(nil), scopes...)
+		slices.Sort(scopes)
+		scopes = slices.Compact(scopes)
+		profile.Scopes = scopes
 	}
 	maxTTL, _ := profile.TTL()
 	if requestedTTL <= 0 || requestedTTL > maxTTL {
@@ -205,7 +228,7 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 	if err != nil {
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
-	session := &Session{ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
+	session := &Session{Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
 	switch profile.AuthenticationMethod() {
 	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
@@ -404,6 +427,17 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	if copy.State == AwaitingGitHub && !copy.nextPoll.After(service.now()) {
 		previousState := copy.State
 		if err := service.pollGitHub(ctx, &copy, profile); err != nil {
+			if errors.Is(err, errScopeMismatch) {
+				service.mu.Lock()
+				if service.sessions[id] == session {
+					delete(service.sessions, id)
+				}
+				service.mu.Unlock()
+				copy.State = Invalidated
+				if recordErr := service.record(ctx, "session.invalidated", &copy); recordErr != nil {
+					slog.ErrorContext(ctx, "record rejected OAuth scope grant", "error", recordErr)
+				}
+			}
 			return Session{}, err
 		}
 		service.mu.Lock()
@@ -585,6 +619,7 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	var token struct {
 		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
 		Error       string `json:"error"`
 	}
 	if err := service.doJSON(request, &token); err != nil {
@@ -599,6 +634,15 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		}
 		session.nextPoll = service.now().Add(session.pollEvery)
 		return nil
+	}
+	if len(session.Scopes) > 0 {
+		granted := strings.FieldsFunc(token.Scope, func(r rune) bool { return r == ',' || r == ' ' })
+		slices.Sort(granted)
+		granted = slices.Compact(granted)
+		if !slices.Equal(granted, session.Scopes) {
+			_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+			return errScopeMismatch
+		}
 	}
 	userID, err := service.githubUserID(ctx, profile, token.AccessToken)
 	if err != nil {
@@ -747,6 +791,7 @@ func randomID() (string, error) {
 
 func publicSession(session *Session) Session {
 	copy := *session
+	copy.Scopes = slices.Clone(session.Scopes)
 	copy.subject, copy.deviceCode, copy.accessToken, copy.boundSecret = "", "", "", ""
 	copy.credentialAt, copy.nextPoll, copy.pollEvery, copy.verifyAttempts = time.Time{}, time.Time{}, 0, 0
 	return copy
