@@ -451,7 +451,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
-	return mux
+	return s.observeHTTP(mux)
 }
 
 func (s *Server) handleEmergencyEvents(w http.ResponseWriter, r *http.Request) {
@@ -588,6 +588,11 @@ func (s *Server) emergencySubject(w http.ResponseWriter, r *http.Request) (strin
 		return "", false
 	}
 	subject, hit := s.reviewCache.get(bearer)
+	if hit {
+		s.recordCacheLookup(metrics.CacheHit)
+	} else {
+		s.recordCacheLookup(metrics.CacheMiss)
+	}
 	if hit && subject == reviewNegSentinel {
 		writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
 		return "", false
@@ -596,13 +601,22 @@ func (s *Server) emergencySubject(w http.ResponseWriter, r *http.Request) (strin
 		var err error
 		subject, ok, err = s.tokenReviewer.Review(r.Context(), bearer)
 		if err != nil {
+			if s.metrics != nil {
+				s.metrics.TokenReviewsTotal.WithLabelValues("error").Inc()
+			}
 			writeJSONError(w, http.StatusServiceUnavailable, "kubernetes tokenreview unavailable; retry")
 			return "", false
 		}
 		if !ok {
+			if s.metrics != nil {
+				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
+			}
 			s.reviewCache.putNegative(bearer)
 			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
 			return "", false
+		}
+		if s.metrics != nil {
+			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
 		}
 		s.reviewCache.putPositive(bearer, subject)
 	}

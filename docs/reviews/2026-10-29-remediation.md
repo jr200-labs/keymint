@@ -18,7 +18,7 @@ findings, not a claim that deployment has been changed.
 - [x] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
 - [x] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
 - [x] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
-- [ ] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
+- [x] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
 - [ ] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
 - [ ] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
 - [ ] 15 Use the configured zap logger consistently for emergency lifecycle failures.
@@ -132,3 +132,10 @@ server and emergency tests.
 App key parsing and signing reject Ed25519; RSA PKCS#1/PKCS#8 and RS256 remain
 supported. Sparkle Ed25519 sealing is unchanged. Verified rejection, RSA minting
 and release-key tests with the race detector.
+
+### 12 Emergency route instrumentation
+
+Shared HTTP middleware now records bounded route/method/status counts, duration,
+in-flight work and spans for all routes, including denied and unmatched requests.
+Emergency authentication records actual TokenReview outcomes and cache lookups.
+Verified success/rejection counters and race-enabled server/metrics tests.

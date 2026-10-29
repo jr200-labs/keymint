@@ -46,6 +46,9 @@ const (
 
 // Metrics holds all Prometheus instruments for the keymint binary.
 type Metrics struct {
+	HTTPRequests *prometheus.CounterVec
+	HTTPDuration *prometheus.HistogramVec
+	HTTPInFlight prometheus.Gauge
 	// MintRequestsTotal counts inbound mint requests by outcome and key.
 	MintRequestsTotal *prometheus.CounterVec
 
@@ -89,6 +92,9 @@ type Metrics struct {
 // Prometheus registry.
 func New() *Metrics {
 	m := &Metrics{
+		HTTPRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Name: "http_requests_total", Help: "All HTTP routes by bounded route, method and status."}, []string{"route", "method", "status"}),
+		HTTPDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: "http_duration_seconds", Help: "HTTP handler duration by route."}, []string{"route"}),
+		HTTPInFlight: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "http_in_flight", Help: "In-flight HTTP handlers."}),
 		MintRequestsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
@@ -171,6 +177,7 @@ func New() *Metrics {
 	}
 
 	prometheus.MustRegister(
+		m.HTTPRequests, m.HTTPDuration, m.HTTPInFlight,
 		m.MintRequestsTotal,
 		m.MintDuration,
 		m.MintInFlight,
