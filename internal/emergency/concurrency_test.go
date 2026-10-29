@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,5 +76,43 @@ func TestOAuthPollRejectsCompletionAfterRevoke(t *testing.T) {
 	records, err := svc.cleanup.list(context.Background())
 	if err != nil || len(records) != 0 {
 		t.Fatalf("cleanup=%v error=%v", records, err)
+	}
+}
+
+type reviewTargetIssuer struct{ namespace, account string }
+
+func (i *reviewTargetIssuer) Issue(_ context.Context, ns, sa string, ttl time.Duration, existing string) (string, string, time.Time, error) {
+	i.namespace, i.account = ns, sa
+	return "token", "secret", time.Now().Add(ttl), nil
+}
+func (i *reviewTargetIssuer) Revoke(context.Context, string, string) error { return nil }
+
+func TestReloadInvalidatesChangedProfile(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "totp")
+	if err := os.WriteFile(secret, []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": {Provider: "kubernetes", Namespace: "operators", ServiceAccount: "limited", TOTPSecretFile: secret}}, Allowlist: []config.AllowEntry{{Subject: "allowed", EmergencyProfiles: []string{"operator"}}}}
+	issuer := &reviewTargetIssuer{}
+	svc, err := New(cfg, http.DefaultClient, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	svc.now = func() time.Time { return time.Unix(59, 0) }
+	session, err := svc.Create(context.Background(), "allowed", "operator", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.VerifyTOTP("allowed", session.ID, "287082"); err != nil {
+		t.Fatal(err)
+	}
+	updated := &config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": {Provider: "kubernetes", Namespace: "admin", ServiceAccount: "cluster-admin", TOTPSecretFile: secret}}, Allowlist: cfg.Allowlist}
+	svc.Reload(updated)
+	if _, err := svc.Credential(context.Background(), "allowed", session.ID); err == nil {
+		t.Fatal("changed authority accepted old authentication")
+	}
+	if issuer.account != "" {
+		t.Fatal("issuer called for invalidated session")
 	}
 }

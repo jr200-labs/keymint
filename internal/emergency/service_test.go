@@ -251,7 +251,7 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.sessions["E-1"] = &Session{ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, subject: "allowed", accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
+	service.sessions["E-1"] = &Session{profile: profile, ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, subject: "allowed", accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
 	service.now = func() time.Time { return time.Unix(2, 0) }
 	if err := service.Prune(context.Background()); err != nil {
 		t.Fatal(err)
