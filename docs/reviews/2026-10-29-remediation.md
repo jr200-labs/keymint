@@ -21,7 +21,7 @@ findings, not a claim that deployment has been changed.
 - [x] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
 - [x] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
 - [x] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
-- [ ] 15 Use the configured zap logger consistently for emergency lifecycle failures.
+- [x] 15 Use the configured zap logger consistently for emergency lifecycle failures.
 - [ ] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
 - [ ] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
 - [ ] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
@@ -154,3 +154,10 @@ key lookups use client spans and propagate context; response-body closure ends
 the client span. Attributes omit URLs, headers and bodies. Completion logs carry
 trace/span IDs and bounded routes. Incoming/outgoing propagation regressions and
 all internal race-enabled tests pass.
+
+### 15 Consistent and redacted logging
+
+Emergency lifecycle errors use the configured zap logger and handler logs carry
+trace correlation. Raw upstream error bodies are no longer exposed in responses
+or logs. A zap observer verifies cleanup errors use the configured logger;
+race-enabled emergency, server and mint tests pass.

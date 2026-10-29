@@ -505,11 +505,11 @@ func (s *Server) handlePasskeyVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.emergency.VerifyPasskey(subject, r.PathValue("token"), r); err != nil {
-		zap.L().Warn("passkey verification rejected", zap.String("subject", subject), zap.Error(err))
+		logging.FromContext(r.Context()).Warn("passkey verification rejected", zap.String("subject", subject), zap.Error(err))
 		writeJSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	zap.L().Info("passkey ceremony completed", zap.String("subject", subject))
+	logging.FromContext(r.Context()).Info("passkey ceremony completed", zap.String("subject", subject))
 	writeJSON(w, map[string]string{"state": "complete"})
 }
 
@@ -531,7 +531,7 @@ func (s *Server) handlePasskeyEnrollmentCreate(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	zap.L().Info("passkey enrollment created", zap.String("subject", subject), zap.String("enrollment", enrollment.ID))
+	logging.FromContext(r.Context()).Info("passkey enrollment created", zap.String("subject", subject), zap.String("enrollment", enrollment.ID))
 	writeJSON(w, enrollment)
 }
 
@@ -656,7 +656,7 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	zap.L().Info("emergency session created", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID), zap.Time("expires_at", session.ExpiresAt))
+	logging.FromContext(r.Context()).Info("emergency session created", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID), zap.Time("expires_at", session.ExpiresAt))
 	writeJSON(w, session)
 }
 
@@ -687,11 +687,11 @@ func (s *Server) handleEmergencyVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	session, err := s.emergency.VerifyTOTP(subject, r.PathValue("id"), input.Code)
 	if err != nil {
-		zap.L().Warn("emergency verification rejected", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+		logging.FromContext(r.Context()).Warn("emergency verification rejected", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
 		writeJSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	zap.L().Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
+	logging.FromContext(r.Context()).Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
 	writeJSON(w, session)
 }
 
@@ -706,7 +706,7 @@ func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	zap.L().Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
+	logging.FromContext(r.Context()).Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
 	writeJSON(w, credential)
 }
 
@@ -768,12 +768,12 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 	}
 	sealed, err := releasekey.Seal(key, destination)
 	if err != nil {
-		zap.L().Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
+		logging.FromContext(r.Context()).Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "release signing key could not be sealed")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	zap.L().Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
+	logging.FromContext(r.Context()).Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
 		zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
 	writeJSON(w, sealed)
 }
@@ -787,7 +787,7 @@ func (s *Server) handleEmergencyRevoke(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	zap.L().Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+	logging.FromContext(r.Context()).Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
 	w.WriteHeader(http.StatusNoContent)
 }
 

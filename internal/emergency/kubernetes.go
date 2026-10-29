@@ -149,11 +149,10 @@ func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return &kubernetesHTTPError{code: response.StatusCode, message: strings.TrimSpace(string(message))}
+		return &kubernetesHTTPError{code: response.StatusCode}
 	}
 	if output != nil {
-		return json.NewDecoder(response.Body).Decode(output)
+		return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output)
 	}
 	return nil
 }

@@ -440,7 +440,7 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 		// continuing to hammer at full throttle would invite
 		// harder, longer-lasting bans, so 429 is reported as an
 		// infra failure that the breaker counts and opens on.
-		errMsg := fmt.Errorf("mint: GitHub returned %d: %s", resp.StatusCode, string(body))
+		errMsg := fmt.Errorf("mint: GitHub returned HTTP %d", resp.StatusCode)
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			return exchangeResult{}, errMsg
 		}

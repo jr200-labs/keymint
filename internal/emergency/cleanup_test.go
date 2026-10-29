@@ -3,6 +3,8 @@ package emergency
 import (
 	"context"
 	"github.com/jr200-labs/keymint/internal/config"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -142,5 +144,26 @@ func TestPartialIssuanceRetainsCleanup(t *testing.T) {
 	}
 	if issuer.revoked != first {
 		t.Fatal("partial Secret was not revoked")
+	}
+}
+
+func TestCleanupFailureUsesConfiguredLogger(t *testing.T) {
+	core, observed := observer.New(zap.ErrorLevel)
+	restore := zap.ReplaceGlobals(zap.New(core))
+	defer restore()
+	status, calls := 503, 0
+	profile := config.EmergencyProfile{Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}}
+	service, err := New(&config.Config{}, cleanupClient(&status, &calls), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	service.sessions["session"] = &Session{ID: "session", Profile: "removed", subject: "caller", State: Active, profile: profile}
+	if err = service.rememberCredential(context.Background(), "session", profile, "token", "", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	service.Reload(&config.Config{})
+	if observed.FilterMessage("retry credential cleanup after config reload").Len() != 1 {
+		t.Fatal("cleanup error bypassed configured zap logger")
 	}
 }

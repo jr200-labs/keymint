@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +26,8 @@ import (
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/logging"
+	"go.uber.org/zap"
 )
 
 var errScopeMismatch = errors.New("GitHub granted scopes do not match the restricted request; token rejected")
@@ -160,7 +161,7 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := service.drainCleanup(ctx, true); err != nil {
-		slog.Error("recover emergency credential cleanup", "error", err)
+		logging.FromContext(ctx).Error("recover emergency credential cleanup", zap.Error(err))
 	}
 	return service, nil
 }
@@ -201,13 +202,13 @@ func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Unlock()
 	if len(invalidated) > 0 {
 		if err := service.drainCleanup(context.Background(), false); err != nil {
-			slog.Error("retry credential cleanup after config reload", "error", err)
+			zap.L().Error("retry credential cleanup after config reload", zap.Error(err))
 		}
 	}
 
 	for _, session := range invalidated {
 		if err := service.record(context.Background(), "session.invalidated", session); err != nil {
-			slog.Error("record emergency session invalidated by config reload", "session", session.ID, "error", err)
+			zap.L().Error("record emergency session invalidated by config reload", zap.String("session", session.ID), zap.Error(err))
 		}
 	}
 }
@@ -295,7 +296,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		return Session{}, errors.New("unsupported emergency authentication")
 	}
 	if err := service.Prune(ctx); err != nil {
-		slog.Error("prune expired emergency credentials", "error", err)
+		logging.FromContext(ctx).Error("prune expired emergency credentials", zap.Error(err))
 	}
 	service.mu.Lock()
 	if service.revision != revision || !service.allowed[subject][profileName] || len(service.sessions) >= maxSessions {
@@ -791,8 +792,7 @@ func (service *Service) revokeCredential(ctx context.Context, credential revoked
 			} else {
 				defer func() { _ = response.Body.Close() }()
 				if response.StatusCode < 200 || response.StatusCode >= 300 {
-					message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-					result = errors.Join(result, fmt.Errorf("revoke GitHub token: %s: %s", response.Status, strings.TrimSpace(string(message))))
+					result = errors.Join(result, fmt.Errorf("revoke GitHub token: HTTP %d", response.StatusCode))
 				}
 			}
 		}
@@ -830,10 +830,9 @@ func (service *Service) doJSON(request *http.Request, target any) error {
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("%s: %s", response.Status, strings.TrimSpace(string(message)))
+		return fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
 	}
-	return json.NewDecoder(response.Body).Decode(target)
+	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(target)
 }
 
 func validTOTP(secret, code string, now time.Time) bool {
