@@ -66,6 +66,7 @@ type Session struct {
 	pollEvery      time.Duration
 	boundSecret    string
 	verifyAttempts int
+	polling        bool
 }
 
 type PasskeyEnrollment struct {
@@ -438,45 +439,50 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	}
 	copy := *session
 	profile := service.profiles[session.Profile]
-	revoked := revokedCredential{id: session.ID, profile: profile, token: session.accessToken, secret: session.boundSecret}
-	service.mu.Unlock()
 	if copy.State == Expired {
-		if err := service.revokeCredential(ctx, revoked); err != nil {
-			return Session{}, err
-		}
-		service.mu.Lock()
-		if current := service.sessions[id]; current == session {
-			current.accessToken, current.boundSecret = "", ""
+		service.mu.Unlock()
+		err = service.revokeCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		return publicSession(&copy), err
+	}
+	if session.State != AwaitingGitHub || session.polling || session.nextPoll.After(service.now()) {
+		service.mu.Unlock()
+		return publicSession(&copy), nil
+	}
+	// Reserve exactly one exchange for this session. No other poll can overwrite
+	// it; removal and expiry remain possible while network I/O is in progress.
+	session.polling = true
+	service.mu.Unlock()
+	err = service.pollGitHub(ctx, &copy, profile)
+	service.mu.Lock()
+	current := service.sessions[id]
+	valid := current == session && current.State == AwaitingGitHub && current.ExpiresAt.After(service.now())
+	if current == session {
+		current.polling = false
+	}
+	if err != nil {
+		if valid && errors.Is(err, errScopeMismatch) {
+			copy.State = Invalidated
+			delete(service.sessions, id)
+			err = errors.Join(err, service.record(ctx, "session.invalidated", &copy))
 		}
 		service.mu.Unlock()
+		return Session{}, err
 	}
-	if copy.State == AwaitingGitHub && !copy.nextPoll.After(service.now()) {
-		previousState := copy.State
-		if err := service.pollGitHub(ctx, &copy, profile); err != nil {
-			if errors.Is(err, errScopeMismatch) {
-				service.mu.Lock()
-				if service.sessions[id] == session {
-					delete(service.sessions, id)
-				}
-				service.mu.Unlock()
-				copy.State = Invalidated
-				if recordErr := service.record(ctx, "session.invalidated", &copy); recordErr != nil {
-					slog.ErrorContext(ctx, "record rejected OAuth scope grant", "error", recordErr)
-				}
-			}
+	if !valid {
+		service.mu.Unlock()
+		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		return Session{}, errors.Join(errors.New("session changed during authentication"), cleanupErr)
+	}
+	copy.polling = false
+	if copy.State == Active {
+		if err = service.record(ctx, "session.activated", &copy); err != nil {
+			service.mu.Unlock()
+			_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken})
 			return Session{}, err
 		}
-		service.mu.Lock()
-		if current := service.sessions[id]; current != nil && current.subject == subject {
-			*current = copy
-		}
-		service.mu.Unlock()
-		if previousState != copy.State && copy.State == Active {
-			if err := service.record(ctx, "session.activated", &copy); err != nil {
-				return Session{}, err
-			}
-		}
 	}
+	*current = copy
+	service.mu.Unlock()
 	return publicSession(&copy), nil
 }
 

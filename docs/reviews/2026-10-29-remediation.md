@@ -10,7 +10,7 @@ findings, not a claim that deployment has been changed.
 - [x] 01 P1 Bind release-key encryption to a broker-resolved GitHub repository public key; reject caller substitution.
 - [x] 02 P1 Recover remote credential cleanup after graceful shutdown and crash; metadata invalidation alone does not revoke OAuth credentials.
 - [x] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
-- [ ] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
+- [x] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
 - [ ] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
 - [ ] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
 - [ ] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
@@ -73,3 +73,10 @@ Removed sessions no longer discard cleanup ownership. The cleanup worker retries
 records with no live session immediately, using their persisted original
 identity, regardless of original expiry. Verified profile removal during a 503
 followed by successful janitor retry (`go test -race ./internal/emergency`).
+
+### 04 Guard OAuth polling transitions
+
+A per-session polling reservation prevents overlapping exchanges. Completion
+checks the exact live session and expiry before publishing activation; obsolete
+results are revoked using tracked cleanup. The deterministic blocked-exchange /
+concurrent-Revoke reproduction is now a passing regression under `-race`.
