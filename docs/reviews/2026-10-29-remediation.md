@@ -14,7 +14,7 @@ findings, not a claim that deployment has been changed.
 - [x] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
 - [x] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
 - [x] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
-- [ ] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
+- [x] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
 - [ ] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
 - [ ] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
 - [ ] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
@@ -102,3 +102,10 @@ that identity, partial failures retain it, and deleting an absent Secret is
 idempotent. Device-authenticated Kubernetes sessions retain both OAuth and Secret
 cleanup. Verified failed issuance, repeated retry, and explicit cleanup under
 race-enabled emergency/server tests.
+
+### 08 Exact credential destinations
+
+Credential routing now compares parsed hostnames and ports to the configured
+GitHub endpoint, supports only HTTPS/SSH URL parsing, and the credential helper
+emits credentials only for HTTPS. Verified sibling-host, plaintext, public-host
+cross-routing and port mismatch rejection with race-enabled config/helper tests.

@@ -204,3 +204,15 @@ func TestDefaultPath(t *testing.T) {
 		t.Errorf("path %q should end with config.yaml", got)
 	}
 }
+
+func TestEnterpriseHostIsExact(t *testing.T) {
+	cfg := &Config{Keys: map[string]Key{"enterprise": {GitHubOwner: "org", APIBaseURL: "https://github.corp.example/api/v3"}}}
+	for _, remote := range []string{"https://hub.corp.example/org/repo", "http://github.corp.example/org/repo", "https://github.com/org/repo", "https://github.corp.example:444/org/repo"} {
+		if _, _, ok := cfg.FindByGitHubURL(remote); ok {
+			t.Errorf("accepted unconfigured destination %s", remote)
+		}
+	}
+	if _, _, ok := cfg.FindByGitHubURL("https://github.corp.example/org/repo"); !ok {
+		t.Fatal("configured host rejected")
+	}
+}

@@ -56,6 +56,9 @@ func Get(ctx context.Context, in io.Reader, out io.Writer, cfg *config.Config, m
 		return err
 	}
 
+	if protocol := attrs["protocol"]; protocol != "" && protocol != "https" {
+		return nil
+	}
 	url := reconstructURL(attrs)
 	if url == "" {
 		return errors.New("credhelper: missing host attribute from git")

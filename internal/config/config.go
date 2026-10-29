@@ -394,12 +394,19 @@ func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
 	if err != nil {
 		return "", nil, false
 	}
-	host := u.Host
-	if strings.Contains(host, ":") {
-		h, _, err := net.SplitHostPort(host)
-		if err == nil {
-			host = h
-		}
+	if u.Scheme != "https" && u.Scheme != "ssh" {
+		return "", nil, false
+	}
+	if u.Scheme == "https" && u.User != nil {
+		return "", nil, false
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "443" && u.Scheme == "https" {
+		port = ""
+	}
+	if port == "22" && u.Scheme == "ssh" {
+		port = ""
 	}
 
 	owner := parseGitHubOwner(gitURL)
@@ -407,7 +414,21 @@ func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
 		return "", nil, false
 	}
 	for name, k := range c.Keys {
-		isGitHub := strings.EqualFold(host, "github.com") || (k.APIBaseURL != "" && strings.Contains(k.APIBaseURL, host))
+		expectedHost, expectedPort := "github.com", ""
+		if k.APIBaseURL != "" {
+			endpoint, err := url.Parse(k.APIBaseURL)
+			if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" {
+				continue
+			}
+			expectedHost, expectedPort = endpoint.Hostname(), endpoint.Port()
+			if expectedPort == "443" {
+				expectedPort = ""
+			}
+			if strings.EqualFold(expectedHost, "api.github.com") {
+				expectedHost = "github.com"
+			}
+		}
+		isGitHub := strings.EqualFold(host, expectedHost) && port == expectedPort
 		if !isGitHub {
 			continue
 		}
