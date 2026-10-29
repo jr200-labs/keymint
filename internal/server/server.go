@@ -36,6 +36,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -389,13 +390,27 @@ func buildSnapshot(cfg *config.Config) *configSnapshot {
 // error if the new config fails validation; the existing snapshot
 // is left unchanged in that case so a bad reload cannot break a
 // running server.
-func (s *Server) Reload(cfg *config.Config) error {
+func (s *Server) ValidateReload(cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("server: nil config")
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("server: reload validation: %w", err)
 	}
+	current := s.currentConfig()
+	if !reflect.DeepEqual(current.Passkeys, cfg.Passkeys) || current.EmergencyStateFile != cfg.EmergencyStateFile || !reflect.DeepEqual(current.ExpectedAudiences, cfg.ExpectedAudiences) {
+		return errors.New("passkeys, emergency_state_file and expected_audiences changes require restart")
+	}
+	if s.emergency != nil && len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
+		return errors.New("emergency_state_file is required for emergency profiles")
+	}
+	return nil
+}
+func (s *Server) Reload(cfg *config.Config) error {
+	if err := s.ValidateReload(cfg); err != nil {
+		return err
+	}
+
 	s.snapshot.Store(buildSnapshot(cfg))
 	if s.emergency != nil {
 		s.emergency.Reload(cfg)

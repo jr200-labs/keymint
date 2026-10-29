@@ -16,7 +16,7 @@ findings, not a claim that deployment has been changed.
 - [x] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
 - [x] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
 - [x] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
-- [ ] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
+- [x] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
 - [ ] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
 - [ ] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
 - [ ] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
@@ -117,3 +117,12 @@ session lock. Failed activation remains unauthorized. Explicit revocation emits
 a terminal Revoked state and retains a denied session if its event needs retry.
 Expiry journal failures remain denied and retryable. SQLite-trigger failure and
 revocation/restart regressions pass in race-enabled emergency/server tests.
+
+### 10 Reload resource reconciliation
+
+PEM watchers synchronously reconcile added/removed directories before config
+publication and close with the service. Kubernetes issuance is initialized even
+when no Kubernetes profile exists yet. Changes to audience, passkey or journal
+settings explicitly require restart instead of silently retaining stale
+resources. Verified newly-added PEM rotation plus race-enabled command,
+server and emergency tests.

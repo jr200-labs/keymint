@@ -183,7 +183,7 @@ the deploy accordingly:
   config is validated and the in-process snapshot is swapped
   atomically. Pod restarts are not required for routine admin
   changes. (Note: `expected_audiences` is read at startup only —
-  changes there require a restart.)
+  changes there require a restart, as do passkey and emergency journal settings; reload rejects such changes.)
 
 - **GitHub API circuit breaker.** Calls to
   `/app/installations/<id>/access_tokens` are wrapped in a circuit
