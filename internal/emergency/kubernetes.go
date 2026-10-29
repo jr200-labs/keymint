@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"os"
@@ -52,9 +53,9 @@ func (issuer *KubernetesIssuer) Issue(ctx context.Context, namespace, serviceAcc
 			return "", "", time.Time{}, fmt.Errorf("create bound Secret name: %w", err)
 		}
 		secret = "keymint-emergency-" + name
-		if err := issuer.createSecret(ctx, namespace, secret); err != nil {
-			return "", "", time.Time{}, err
-		}
+	}
+	if err := issuer.createSecret(ctx, namespace, secret); err != nil {
+		return "", secret, time.Time{}, err
 	}
 	uid, err := issuer.secretUID(ctx, namespace, secret)
 	if err != nil {
@@ -90,12 +91,22 @@ func (issuer *KubernetesIssuer) Issue(ctx context.Context, namespace, serviceAcc
 }
 
 func (issuer *KubernetesIssuer) Revoke(ctx context.Context, namespace, secret string) error {
-	return issuer.request(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s", namespace, secret), nil, nil)
+	err := issuer.request(ctx, http.MethodDelete, fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s", namespace, secret), nil, nil)
+	var status *kubernetesHTTPError
+	if errors.As(err, &status) && status.code == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 func (issuer *KubernetesIssuer) createSecret(ctx context.Context, namespace, name string) error {
 	body := map[string]any{"apiVersion": "v1", "kind": "Secret", "metadata": map[string]any{"name": name, "labels": map[string]string{"app.kubernetes.io/managed-by": "keymint"}}}
-	return issuer.request(ctx, http.MethodPost, "/api/v1/namespaces/"+namespace+"/secrets", body, nil)
+	err := issuer.request(ctx, http.MethodPost, "/api/v1/namespaces/"+namespace+"/secrets", body, nil)
+	var status *kubernetesHTTPError
+	if errors.As(err, &status) && status.code == http.StatusConflict {
+		return nil
+	}
+	return err
 }
 
 func (issuer *KubernetesIssuer) secretUID(ctx context.Context, namespace, name string) (string, error) {
@@ -132,17 +143,16 @@ func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(bearer)))
 	request.Header.Set("Content-Type", "application/json")
-	response, err := issuer.http.Do(request)
+	response, err := tracing.HTTPClient(issuer.http).Do(request)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("Kubernetes returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		return &kubernetesHTTPError{code: response.StatusCode}
 	}
 	if output != nil {
-		return json.NewDecoder(response.Body).Decode(output)
+		return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output)
 	}
 	return nil
 }
@@ -153,4 +163,13 @@ func randomKubernetesName() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(value), nil
+}
+
+type kubernetesHTTPError struct {
+	code    int
+	message string
+}
+
+func (err *kubernetesHTTPError) Error() string {
+	return fmt.Sprintf("Kubernetes returned HTTP %d: %s", err.code, err.message)
 }

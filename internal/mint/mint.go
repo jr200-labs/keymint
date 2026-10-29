@@ -19,13 +19,13 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"strconv"
@@ -162,10 +162,8 @@ type Request struct {
 	Permissions map[string]string
 
 	// PrivateKey is the App's signing key. Either *rsa.PrivateKey
-	// (signed with RS256) or ed25519.PrivateKey (signed with EdDSA)
-	// is accepted; ParsePrivateKey returns the right concrete type
-	// for whichever PEM the operator supplies. Both algorithms are
-	// supported by GitHub Apps.
+	// signed with RS256; other key types are rejected.
+	// ParsePrivateKey accepts RSA in PKCS#1 or PKCS#8 format.
 	PrivateKey crypto.PrivateKey
 
 	// APIBaseURL overrides the GitHub API base URL. Empty means use
@@ -183,7 +181,9 @@ type Request struct {
 	// the caller (typically the service-mode entrypoint) to push
 	// the values into Prometheus without coupling the mint package
 	// to the metrics package.
-	OnRateLimit func(apiBase string, remaining int64, resetAt time.Time)
+	OnRateLimit   func(apiBase string, remaining int64, resetAt time.Time)
+	OnExchange    func(apiBase, status string, duration time.Duration)
+	OnClockOffset func(apiBase string, offset time.Duration)
 }
 
 // Token is a minted installation access token.
@@ -203,10 +203,10 @@ type Token struct {
 // Accepts:
 //
 //   - "RSA PRIVATE KEY"  (PKCS#1)         — RSA only, the legacy GitHub default
-//   - "PRIVATE KEY"      (PKCS#8)         — RSA or Ed25519 (current GitHub default for Ed25519 Apps)
+//   - "PRIVATE KEY"      (PKCS#8)         — RSA only
 //   - "OPENSSH PRIVATE KEY" — explicitly rejected (unsupported by x509)
 //
-// Returned value is either *rsa.PrivateKey or ed25519.PrivateKey;
+// Returned value is *rsa.PrivateKey;
 // signAppJWT inspects the concrete type at signing time.
 func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	block, _ := pem.Decode(pemBytes)
@@ -229,10 +229,8 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		switch k := key.(type) {
 		case *rsa.PrivateKey:
 			return k, nil
-		case ed25519.PrivateKey:
-			return k, nil
 		default:
-			return nil, fmt.Errorf("mint: PKCS8 key is %T, want *rsa.PrivateKey or ed25519.PrivateKey", key)
+			return nil, fmt.Errorf("mint: PKCS8 key is %T, want *rsa.PrivateKey", key)
 		}
 	default:
 		return nil, fmt.Errorf("mint: unsupported PEM block type %q", block.Type)
@@ -286,7 +284,7 @@ func storeClockOffset(apiBase string, offset time.Duration) {
 // signAppJWT produces a JWT signed with the App's private key,
 // suitable for use as a Bearer token against the
 // /app/installations/... endpoints. RSA keys sign with RS256;
-// Ed25519 keys sign with EdDSA. GitHub accepts both.
+// GitHub requires RS256 for App authentication.
 func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, error) {
 	claims := jwt.MapClaims{
 		// "iat" — issued-at. Set 60s in the past to tolerate small
@@ -307,11 +305,8 @@ func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, erro
 	case *rsa.PrivateKey:
 		method = jwt.SigningMethodRS256
 		signer = k
-	case ed25519.PrivateKey:
-		method = jwt.SigningMethodEdDSA
-		signer = k
 	default:
-		return "", fmt.Errorf("mint: unsupported key type %T (want *rsa.PrivateKey or ed25519.PrivateKey)", key)
+		return "", fmt.Errorf("mint: unsupported key type %T (want *rsa.PrivateKey)", key)
 	}
 
 	token := jwt.NewWithClaims(method, claims)
@@ -390,15 +385,27 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 	}
 	defer release()
 
-	resp, err := client.Do(httpReq)
+	started := time.Now()
+	status := "transport_error"
+	defer func() {
+		if req.OnExchange != nil {
+			req.OnExchange(apiBase, status, time.Since(started))
+		}
+	}()
+	resp, err := tracing.HTTPClient(client).Do(httpReq)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: POST access_tokens: %w", err)
 	}
+	status = strconv.Itoa(resp.StatusCode)
 	defer func() { _ = resp.Body.Close() }()
 
 	if dateHdr := resp.Header.Get("Date"); dateHdr != "" {
-		if ghTime, err := time.Parse(time.RFC1123, dateHdr); err == nil {
-			storeClockOffset(apiBase, time.Until(ghTime))
+		if ghTime, err := http.ParseTime(dateHdr); err == nil {
+			offset := time.Until(ghTime)
+			storeClockOffset(apiBase, offset)
+			if req.OnClockOffset != nil {
+				req.OnClockOffset(apiBase, offset)
+			}
 		}
 	}
 
@@ -433,7 +440,7 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 		// continuing to hammer at full throttle would invite
 		// harder, longer-lasting bans, so 429 is reported as an
 		// infra failure that the breaker counts and opens on.
-		errMsg := fmt.Errorf("mint: GitHub returned %d: %s", resp.StatusCode, string(body))
+		errMsg := fmt.Errorf("mint: GitHub returned HTTP %d", resp.StatusCode)
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			return exchangeResult{}, errMsg
 		}
@@ -448,4 +455,22 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 		return exchangeResult{}, fmt.Errorf("mint: parse response: %w", err)
 	}
 	return exchangeResult{token: tok}, nil
+}
+
+// GithubBreakerStates reports the bounded set of configured endpoints observed.
+func GithubBreakerStates() map[string]int {
+	result := map[string]int{}
+	githubBreakers.Range(func(key, value any) bool {
+		state := value.(*gobreaker.CircuitBreaker[exchangeResult]).State()
+		switch state {
+		case gobreaker.StateClosed:
+			result[key.(string)] = 0
+		case gobreaker.StateHalfOpen:
+			result[key.(string)] = 1
+		case gobreaker.StateOpen:
+			result[key.(string)] = 2
+		}
+		return true
+	})
+	return result
 }

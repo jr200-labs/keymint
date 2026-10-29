@@ -111,7 +111,7 @@ func TestValidateReleaseKeyBindingAndAllowlist(t *testing.T) {
 	cfg := Config{
 		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
 		ReleaseKeys: map[string]ReleaseKey{"translatepane": {
-			Kind: "sparkle_ed25519", PrivateKeyFile: "/run/secrets/translatepane",
+			GitHubKey: "routine", Kind: "sparkle_ed25519", PrivateKeyFile: "/run/secrets/translatepane",
 			Repositories: []string{"janeway-labs/translatepane", "jr200-labs/example"}, SecretName: "SPARKLE_EDDSA_PRIVATE_KEY",
 		}},
 		Allowlist: []AllowEntry{{Subject: "allowed", ReleaseKeys: []string{"translatepane"}}},
@@ -202,5 +202,17 @@ func TestDefaultPath(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "config.yaml") {
 		t.Errorf("path %q should end with config.yaml", got)
+	}
+}
+
+func TestEnterpriseHostIsExact(t *testing.T) {
+	cfg := &Config{Keys: map[string]Key{"enterprise": {GitHubOwner: "org", APIBaseURL: "https://github.corp.example/api/v3"}}}
+	for _, remote := range []string{"https://hub.corp.example/org/repo", "http://github.corp.example/org/repo", "https://github.com/org/repo", "https://github.corp.example:444/org/repo"} {
+		if _, _, ok := cfg.FindByGitHubURL(remote); ok {
+			t.Errorf("accepted unconfigured destination %s", remote)
+		}
+	}
+	if _, _, ok := cfg.FindByGitHubURL("https://github.corp.example/org/repo"); !ok {
+		t.Fatal("configured host rejected")
 	}
 }

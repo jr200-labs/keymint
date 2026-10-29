@@ -35,8 +35,8 @@ func TestNew_Registers(t *testing.T) {
 	m.MintRequestsTotal.WithLabelValues(OutcomeSuccess, "org-a").Inc()
 	m.MintDuration.WithLabelValues("org-a").Observe(0.1)
 	m.TokenReviewsTotal.WithLabelValues(TokenReviewAccepted).Inc()
-	m.GitHubAPILatency.WithLabelValues("201").Observe(0.05)
-	m.JWTClockOffsetSeconds.Set(0.0)
+	m.GitHubAPILatency.WithLabelValues("201", "https://api.github.com").Observe(0.05)
+	m.JWTClockOffsetSeconds.WithLabelValues("https://api.github.com").Set(0.0)
 	m.MintInFlight.Inc()
 
 	srv := httptest.NewServer(Handler())

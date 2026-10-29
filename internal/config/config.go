@@ -144,6 +144,7 @@ type Key struct {
 // GitHub repositories. A shared internal identity may be reused without making
 // it available to repositories that were not reviewed here.
 type ReleaseKey struct {
+	GitHubKey      string   `yaml:"github_key"` // configured installation used to resolve the repository encryption key
 	Kind           string   `yaml:"kind"`
 	PrivateKeyFile string   `yaml:"private_key_file"`
 	Repositories   []string `yaml:"repositories"`
@@ -243,6 +244,9 @@ func (c *Config) Validate() error {
 	for name, key := range c.ReleaseKeys {
 		if !identifier.MatchString(name) {
 			return fmt.Errorf("release key name %q is invalid", name)
+		}
+		if _, exists := c.Keys[key.GitHubKey]; !exists {
+			return fmt.Errorf("release key %q: github_key must reference a configured installation key", name)
 		}
 		if key.Kind != "sparkle_ed25519" {
 			return fmt.Errorf("release key %q: kind must be sparkle_ed25519", name)
@@ -390,12 +394,19 @@ func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
 	if err != nil {
 		return "", nil, false
 	}
-	host := u.Host
-	if strings.Contains(host, ":") {
-		h, _, err := net.SplitHostPort(host)
-		if err == nil {
-			host = h
-		}
+	if u.Scheme != "https" && u.Scheme != "ssh" {
+		return "", nil, false
+	}
+	if u.Scheme == "https" && u.User != nil {
+		return "", nil, false
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "443" && u.Scheme == "https" {
+		port = ""
+	}
+	if port == "22" && u.Scheme == "ssh" {
+		port = ""
 	}
 
 	owner := parseGitHubOwner(gitURL)
@@ -403,7 +414,21 @@ func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
 		return "", nil, false
 	}
 	for name, k := range c.Keys {
-		isGitHub := strings.EqualFold(host, "github.com") || (k.APIBaseURL != "" && strings.Contains(k.APIBaseURL, host))
+		expectedHost, expectedPort := "github.com", ""
+		if k.APIBaseURL != "" {
+			endpoint, err := url.Parse(k.APIBaseURL)
+			if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" {
+				continue
+			}
+			expectedHost, expectedPort = endpoint.Hostname(), endpoint.Port()
+			if expectedPort == "443" {
+				expectedPort = ""
+			}
+			if strings.EqualFold(expectedHost, "api.github.com") {
+				expectedHost = "github.com"
+			}
+		}
+		isGitHub := strings.EqualFold(host, expectedHost) && port == expectedPort
 		if !isGitHub {
 			continue
 		}

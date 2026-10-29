@@ -2,6 +2,8 @@ package emergency
 
 import (
 	"context"
+	"github.com/jr200-labs/keymint/internal/config"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -58,5 +60,54 @@ func TestEventStoreWatchWakesForNewEvent(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("watch did not wake")
+	}
+}
+
+func TestFailedActivationEventDoesNotAuthorizeSession(t *testing.T) {
+	service, err := New(&config.Config{}, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	session := &Session{ID: "session", subject: "caller", State: AwaitingTOTP, ExpiresAt: time.Now().Add(time.Minute)}
+	service.sessions[session.ID] = session
+	_, err = service.events.db.Exec(`CREATE TRIGGER reject_activation BEFORE INSERT ON emergency_events WHEN NEW.type='session.activated' BEGIN SELECT RAISE(ABORT,'injected journal failure'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.mu.Lock()
+	err = service.transitionLocked(context.Background(), session, Active, "session.activated")
+	service.mu.Unlock()
+	if err == nil {
+		t.Fatal("journal failure ignored")
+	}
+	if err = service.Authorize("caller", session.ID); err == nil {
+		t.Fatal("unjournaled activation authorized")
+	}
+}
+
+func TestRevocationRecordsTerminalState(t *testing.T) {
+	service, err := New(&config.Config{}, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	service.sessions["session"] = &Session{ID: "session", subject: "caller", State: Active, ExpiresAt: time.Now().Add(time.Minute)}
+	if err = service.Revoke(context.Background(), "caller", "session"); err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.Events(context.Background(), "caller", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 || page.Events[0].State != RevocationPending || page.Events[1].State != Revoked {
+		t.Fatalf("events=%+v", page.Events)
+	}
+	if err = service.events.invalidateOpenSessions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	page, err = service.Events(context.Background(), "caller", page.NextCursor, 0)
+	if err != nil || len(page.Events) != 0 {
+		t.Fatal("revoked session treated as unfinished")
 	}
 }

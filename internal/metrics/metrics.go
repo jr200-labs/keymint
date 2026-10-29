@@ -8,6 +8,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -46,6 +47,15 @@ const (
 
 // Metrics holds all Prometheus instruments for the keymint binary.
 type Metrics struct {
+	OperationsTotal            *prometheus.CounterVec
+	OperationDuration          *prometheus.HistogramVec
+	CleanupRecords             prometheus.Gauge
+	CleanupDue                 prometheus.Gauge
+	CleanupOldestSeconds       prometheus.Gauge
+	GitHubEndpointBreakerState *prometheus.GaugeVec
+	HTTPRequests               *prometheus.CounterVec
+	HTTPDuration               *prometheus.HistogramVec
+	HTTPInFlight               prometheus.Gauge
 	// MintRequestsTotal counts inbound mint requests by outcome and key.
 	MintRequestsTotal *prometheus.CounterVec
 
@@ -63,7 +73,7 @@ type Metrics struct {
 
 	// JWTClockOffsetSeconds is the most recent observed clock drift between
 	// keymint and GitHub, in seconds. Negative means keymint is ahead.
-	JWTClockOffsetSeconds prometheus.Gauge
+	JWTClockOffsetSeconds *prometheus.GaugeVec
 
 	// TokenReviewCacheTotal counts TokenReview lookups by result
 	// ("hit" / "miss"). Operators graph hit ratio to see how
@@ -89,6 +99,15 @@ type Metrics struct {
 // Prometheus registry.
 func New() *Metrics {
 	m := &Metrics{
+		OperationsTotal:            prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Name: "operations_total", Help: "Internal operations by fixed operation and outcome."}, []string{"operation", "outcome"}),
+		OperationDuration:          prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: "operation_duration_seconds", Help: "Internal operation latency."}, []string{"operation"}),
+		CleanupRecords:             prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "credential_cleanup_records", Help: "Tracked credentials awaiting scheduled or immediate revocation."}),
+		CleanupDue:                 prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "credential_cleanup_due", Help: "Credential cleanup records due for immediate revocation."}),
+		CleanupOldestSeconds:       prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "credential_cleanup_oldest_overdue_seconds", Help: "Age of oldest overdue cleanup record."}),
+		GitHubEndpointBreakerState: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: namespace, Name: "github_endpoint_breaker_state", Help: "Per-endpoint breaker state: closed=0 half-open=1 open=2."}, []string{"api_base_url"}),
+		HTTPRequests:               prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Name: "http_requests_total", Help: "All HTTP routes by bounded route, method and status."}, []string{"route", "method", "status"}),
+		HTTPDuration:               prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: "http_duration_seconds", Help: "HTTP handler duration by route."}, []string{"route"}),
+		HTTPInFlight:               prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "http_in_flight", Help: "In-flight HTTP handlers."}),
 		MintRequestsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
@@ -128,14 +147,14 @@ func New() *Metrics {
 				Help:      "Latency of POST /app/installations/<id>/access_tokens calls, by HTTP status.",
 				Buckets:   prometheus.DefBuckets,
 			},
-			[]string{"status"},
+			[]string{"status", "api_base_url"},
 		),
-		JWTClockOffsetSeconds: prometheus.NewGauge(
+		JWTClockOffsetSeconds: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Name:      "jwt_clock_offset_seconds",
 				Help:      "Most recent observed clock drift between this pod and GitHub (seconds).",
-			},
+			}, []string{"api_base_url"},
 		),
 		TokenReviewCacheTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -171,6 +190,8 @@ func New() *Metrics {
 	}
 
 	prometheus.MustRegister(
+		m.OperationsTotal, m.OperationDuration, m.CleanupRecords, m.CleanupDue, m.CleanupOldestSeconds, m.GitHubEndpointBreakerState,
+		m.HTTPRequests, m.HTTPDuration, m.HTTPInFlight,
 		m.MintRequestsTotal,
 		m.MintDuration,
 		m.MintInFlight,
@@ -189,3 +210,16 @@ func New() *Metrics {
 // Handler returns the http.Handler that exposes the registered metrics
 // in Prometheus text format.
 func Handler() http.Handler { return promhttp.Handler() }
+
+// ObserveOperation only accepts operation names chosen by code, never request IDs.
+func (m *Metrics) ObserveOperation(operation string, started time.Time, err error) {
+	if m == nil {
+		return
+	}
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	m.OperationsTotal.WithLabelValues(operation, outcome).Inc()
+	m.OperationDuration.WithLabelValues(operation).Observe(time.Since(started).Seconds())
+}

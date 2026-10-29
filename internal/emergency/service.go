@@ -12,11 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,9 @@ import (
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/logging"
+	"github.com/jr200-labs/keymint/internal/metrics"
+	"go.uber.org/zap"
 )
 
 var errScopeMismatch = errors.New("GitHub granted scopes do not match the restricted request; token rejected")
@@ -38,6 +42,7 @@ const (
 	Active          State = "active"
 	Expired         State = "expired"
 	Invalidated     State = "invalidated"
+	Revoked         State = "revoked"
 )
 
 type Profile struct {
@@ -58,14 +63,15 @@ type Session struct {
 	UserCode        string    `json:"user_code,omitempty"`
 	ExpiresAt       time.Time `json:"expires_at"`
 
-	subject        string
-	deviceCode     string
-	accessToken    string
-	credentialAt   time.Time
-	nextPoll       time.Time
-	pollEvery      time.Duration
-	boundSecret    string
-	verifyAttempts int
+	profile     config.EmergencyProfile
+	subject     string
+	deviceCode  string
+	accessToken string
+	nextPoll    time.Time
+	pollEvery   time.Duration
+	boundSecret string
+	operation   operation
+	gate        chan struct{}
 }
 
 type PasskeyEnrollment struct {
@@ -76,12 +82,13 @@ type PasskeyEnrollment struct {
 }
 
 type passkeyCeremony struct {
-	subject   string
-	sessionID string
-	kind      string
-	options   any
-	data      webauthn.SessionData
-	expiresAt time.Time
+	proofSessionID string
+	subject        string
+	sessionID      string
+	kind           string
+	options        any
+	data           webauthn.SessionData
+	expiresAt      time.Time
 }
 
 type Credential struct {
@@ -91,6 +98,7 @@ type Credential struct {
 }
 
 type revokedCredential struct {
+	id      string
 	profile config.EmergencyProfile
 	token   string
 	secret  string
@@ -102,7 +110,10 @@ type TokenIssuer interface {
 }
 
 type Service struct {
+	metrics                *metrics.Metrics
 	mu                     sync.Mutex
+	revision               uint64
+	closed                 bool
 	profiles               map[string]config.EmergencyProfile
 	allowed                map[string]map[string]bool
 	sessions               map[string]*Session
@@ -112,12 +123,13 @@ type Service struct {
 	passkeyVerificationURL string
 	ceremonies             map[string]passkeyCeremony
 	events                 *eventStore
+	cleanup                *cleanupStore
 	now                    func() time.Time
 }
 
 const maxSessions = 1024
 
-func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service, error) {
+func New(cfg *config.Config, client *http.Client, issuer TokenIssuer, instruments ...*metrics.Metrics) (*Service, error) {
 	manager, err := newPasskeys(cfg.Passkeys)
 	if err != nil {
 		return nil, err
@@ -126,19 +138,71 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	cleanup, err := openCleanupStore(events.db, cfg.EmergencyStateFile)
+	if err != nil {
+		_ = events.close()
+		return nil, err
+	}
+	service := &Service{cleanup: cleanup, http: tracing.HTTPClient(client), issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	if len(instruments) > 0 {
+		service.metrics = instruments[0]
+		events.metrics = instruments[0]
+	}
 	if cfg.Passkeys != nil {
 		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
 	}
 	service.Reload(cfg)
+	restored, err := cleanup.list(context.Background())
+	if err != nil {
+		_ = events.close()
+		return nil, err
+	}
+	for _, record := range restored {
+		record.Due = service.now()
+		if err = cleanup.put(context.Background(), record); err != nil {
+			_ = events.close()
+			return nil, err
+		}
+	}
+	// Every restored cleanup belongs to a previous process, never a live session.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := service.drainCleanup(ctx, true); err != nil {
+		logging.FromContext(ctx).Error("recover emergency credential cleanup", zap.Error(err))
+	}
 	return service, nil
 }
 
-func (service *Service) Close() error { return service.events.close() }
+func (service *Service) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	service.mu.Lock()
+	service.closed = true
+	service.revision++
+	var gates []chan struct{}
+	for _, session := range service.sessions {
+		if !terminal(session.State) {
+			_ = service.transitionLocked(ctx, session, Invalidated, eventFor(Invalidated))
+		}
+		if session.gate != nil {
+			gates = append(gates, session.gate)
+		}
+	}
+	service.mu.Unlock()
+	for _, gate := range gates {
+		select {
+		case gate <- struct{}{}:
+			<-gate
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), service.events.close())
+		}
+	}
+	return errors.Join(service.drainCleanup(ctx, true), service.events.close())
+}
 
 func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Lock()
-	oldProfiles := service.profiles
+	service.revision++
 	service.profiles = make(map[string]config.EmergencyProfile, len(cfg.EmergencyProfiles))
 	for name, profile := range cfg.EmergencyProfiles {
 		service.profiles[name] = profile
@@ -152,31 +216,31 @@ func (service *Service) Reload(cfg *config.Config) {
 			service.allowed[entry.Subject][name] = true
 		}
 	}
-	var revoked []revokedCredential
 	var invalidated []*Session
 	for id, session := range service.sessions {
-		if _, exists := service.profiles[session.Profile]; exists && service.allowed[session.subject][session.Profile] {
+		if current, exists := service.profiles[session.Profile]; exists && service.allowed[session.subject][session.Profile] && reflect.DeepEqual(current, session.profile) {
 			continue
 		}
-		if session.accessToken != "" || session.boundSecret != "" {
-			revoked = append(revoked, revokedCredential{profile: oldProfiles[session.Profile], token: session.accessToken, secret: session.boundSecret})
+
+		if err := service.transitionLocked(context.Background(), session, Invalidated, eventFor(Invalidated)); err != nil {
+			zap.L().Error("record emergency invalidation", zap.Error(err))
+			continue
 		}
 		copy := *session
-		copy.State = Invalidated
 		invalidated = append(invalidated, &copy)
-		delete(service.sessions, id)
+		if session.operation == idle {
+			delete(service.sessions, id)
+		}
 	}
 	service.mu.Unlock()
-	for _, credential := range revoked {
-		if err := service.revokeCredential(context.Background(), credential); err != nil {
-			slog.Error("revoke credential removed by config reload", "provider", credential.profile.Provider, "error", err)
+	reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if len(invalidated) > 0 {
+		if err := service.drainCleanup(reloadCtx, false); err != nil {
+			zap.L().Error("retry credential cleanup after config reload", zap.Error(err))
 		}
 	}
-	for _, session := range invalidated {
-		if err := service.record(context.Background(), "session.invalidated", session); err != nil {
-			slog.Error("record emergency session invalidated by config reload", "session", session.ID, "error", err)
-		}
-	}
+
 }
 
 func (service *Service) Profiles(subject string) []Profile {
@@ -201,6 +265,8 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 	service.mu.Lock()
 	profile, exists := service.profiles[profileName]
 	allowed := service.allowed[subject][profileName]
+	revision := service.revision
+	originalProfile := profile
 	service.mu.Unlock()
 	if !exists || !allowed {
 		return Session{}, errors.New("emergency profile is unavailable")
@@ -228,7 +294,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 	if err != nil {
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
-	session := &Session{Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
+	session := &Session{profile: originalProfile, Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
 	switch profile.AuthenticationMethod() {
 	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
@@ -260,23 +326,19 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		return Session{}, errors.New("unsupported emergency authentication")
 	}
 	if err := service.Prune(ctx); err != nil {
-		slog.Error("prune expired emergency credentials", "error", err)
+		logging.FromContext(ctx).Error("prune expired emergency credentials", zap.Error(err))
 	}
 	service.mu.Lock()
-	if len(service.sessions) >= maxSessions {
+	if service.closed || service.revision != revision || !service.allowed[subject][profileName] || len(service.sessions) >= maxSessions {
 		for token, ceremony := range service.ceremonies {
 			if ceremony.sessionID == session.ID {
 				delete(service.ceremonies, token)
 			}
 		}
 		service.mu.Unlock()
-		return Session{}, errors.New("too many active emergency sessions")
+		return Session{}, errors.New("session capacity or authorization changed during creation")
 	}
-	service.sessions[session.ID] = session
-	service.mu.Unlock()
 	if err := service.record(ctx, "session.created", session); err != nil {
-		service.mu.Lock()
-		delete(service.sessions, session.ID)
 		for token, ceremony := range service.ceremonies {
 			if ceremony.sessionID == session.ID {
 				delete(service.ceremonies, token)
@@ -285,7 +347,10 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		service.mu.Unlock()
 		return Session{}, fmt.Errorf("record emergency session creation: %w", err)
 	}
-	return publicSession(session), nil
+	service.sessions[session.ID] = session
+	result := publicSession(session)
+	service.mu.Unlock()
+	return result, nil
 }
 
 func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (PasskeyEnrollment, error) {
@@ -314,7 +379,7 @@ func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (
 	now := service.now().UTC()
 	enrollment := PasskeyEnrollment{ID: id, State: "awaiting_passkey", VerificationURI: service.passkeyVerificationURL + "/#" + token, ExpiresAt: now.Add(5 * time.Minute)}
 	service.mu.Lock()
-	service.ceremonies[token] = passkeyCeremony{subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
+	service.ceremonies[token] = passkeyCeremony{proofSessionID: proofSessionID, subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
 	service.mu.Unlock()
 	return enrollment, nil
 }
@@ -348,12 +413,21 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 			service.mu.Unlock()
 			return errors.New("emergency session is unavailable")
 		}
-		session.State = Active
-		copy := *session
+		if !session.ExpiresAt.After(service.now()) {
+			service.mu.Unlock()
+			return errors.New("session expired during passkey verification")
+		}
+		err := service.transitionLocked(request.Context(), session, Active, "session.activated")
 		service.mu.Unlock()
-		return service.record(request.Context(), "session.activated", &copy)
+		return err
 	}
-	_, err := service.passkeys.finishRegistration(ceremony.data, request)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	proof, err := service.ownedSession(subject, ceremony.proofSessionID)
+	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) || service.closed {
+		return errors.New("passkey enrollment proof is no longer active")
+	}
+	_, err = service.passkeys.finishRegistration(ceremony.data, request)
 	if err != nil {
 		return fmt.Errorf("register passkey: %w", err)
 	}
@@ -367,15 +441,29 @@ func (service *Service) Prune(ctx context.Context) error {
 		credential revokedCredential
 	}
 	now := service.now()
+	var result error
 	service.mu.Lock()
 	var expired []expiredSession
 	for id, current := range service.sessions {
-		if current.ExpiresAt.After(now) {
+		if current.operation != idle {
 			continue
 		}
-		current.State = Expired
-		profile := service.profiles[current.Profile]
-		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{profile: profile, token: current.accessToken, secret: current.boundSecret}})
+		if current.ExpiresAt.After(now) && !terminal(current.State) && current.State != RevocationPending {
+			continue
+		}
+		target, event := Expired, "session.expired"
+		if current.State == RevocationPending {
+			target, event = Revoked, eventFor(Revoked)
+		} else if terminal(current.State) {
+			target, event = current.State, eventFor(current.State)
+		}
+		if err := service.transitionLocked(ctx, current, target, event); err != nil {
+			current.State = target
+			result = errors.Join(result, err)
+			continue
+		}
+		profile := current.profile
+		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{id: current.ID, profile: profile, token: current.accessToken, secret: current.boundSecret}})
 		delete(service.sessions, id)
 	}
 	for token, ceremony := range service.ceremonies {
@@ -384,73 +472,78 @@ func (service *Service) Prune(ctx context.Context) error {
 		}
 	}
 	service.mu.Unlock()
-	var result error
 	for _, item := range expired {
 		if err := service.revokeCredential(ctx, item.credential); err != nil {
-			service.mu.Lock()
-			if service.sessions[item.id] == nil {
-				service.sessions[item.id] = item.session
-			}
-			service.mu.Unlock()
+
 			result = errors.Join(result, err)
 			continue
 		}
-		result = errors.Join(result, service.record(ctx, "session.expired", item.session))
+
 	}
-	return result
+	return errors.Join(result, service.drainCleanup(ctx, false))
 }
 
 func (service *Service) Get(ctx context.Context, subject, id string) (Session, error) {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, polling)
 	if err != nil {
+		return Session{}, err
+	}
+	defer release()
+
+	if !session.ExpiresAt.After(service.now()) && !terminal(session.State) && session.State != RevocationPending {
+		if err = service.transitionLocked(ctx, session, Expired, eventFor(Expired)); err != nil {
+			service.mu.Unlock()
+			return Session{}, err
+		}
+	}
+	copy := *session
+	profile := session.profile
+	if copy.State == Expired {
+		service.mu.Unlock()
+		err = service.revokeCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		if err == nil {
+			service.mu.Lock()
+			session.accessToken, session.boundSecret = "", ""
+			service.mu.Unlock()
+		}
+		return publicSession(&copy), err
+	}
+	if session.State != AwaitingGitHub || session.nextPoll.After(service.now()) {
+		service.mu.Unlock()
+		return publicSession(&copy), nil
+	}
+	// Reserve exactly one exchange for this session. No other poll can overwrite
+	// it; removal and expiry remain possible while network I/O is in progress.
+	service.mu.Unlock()
+	err = service.pollGitHub(ctx, &copy, profile)
+	service.mu.Lock()
+	current := service.sessions[id]
+	valid := current == session && current.State == AwaitingGitHub && current.ExpiresAt.After(service.now())
+	if err != nil {
+		if valid && errors.Is(err, errScopeMismatch) {
+			journalErr := service.transitionLocked(ctx, current, Invalidated, eventFor(Invalidated))
+			if journalErr == nil {
+				delete(service.sessions, id)
+			}
+			err = errors.Join(err, journalErr)
+		}
 		service.mu.Unlock()
 		return Session{}, err
 	}
-	if !session.ExpiresAt.After(service.now()) {
-		session.State = Expired
+	if !valid {
+		service.mu.Unlock()
+		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		return Session{}, errors.Join(errors.New("session changed during authentication"), cleanupErr)
 	}
-	copy := *session
-	profile := service.profiles[session.Profile]
-	revoked := revokedCredential{profile: profile, token: session.accessToken, secret: session.boundSecret}
+	if copy.State == Active {
+		if err = service.transitionLocked(ctx, current, Active, eventFor(Active)); err != nil {
+			service.mu.Unlock()
+			_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken})
+			return Session{}, err
+		}
+	}
+	*current = copy
 	service.mu.Unlock()
-	if copy.State == Expired {
-		if err := service.revokeCredential(ctx, revoked); err != nil {
-			return Session{}, err
-		}
-		service.mu.Lock()
-		if current := service.sessions[id]; current == session {
-			current.accessToken, current.boundSecret = "", ""
-		}
-		service.mu.Unlock()
-	}
-	if copy.State == AwaitingGitHub && !copy.nextPoll.After(service.now()) {
-		previousState := copy.State
-		if err := service.pollGitHub(ctx, &copy, profile); err != nil {
-			if errors.Is(err, errScopeMismatch) {
-				service.mu.Lock()
-				if service.sessions[id] == session {
-					delete(service.sessions, id)
-				}
-				service.mu.Unlock()
-				copy.State = Invalidated
-				if recordErr := service.record(ctx, "session.invalidated", &copy); recordErr != nil {
-					slog.ErrorContext(ctx, "record rejected OAuth scope grant", "error", recordErr)
-				}
-			}
-			return Session{}, err
-		}
-		service.mu.Lock()
-		if current := service.sessions[id]; current != nil && current.subject == subject {
-			*current = copy
-		}
-		service.mu.Unlock()
-		if previousState != copy.State && copy.State == Active {
-			if err := service.record(ctx, "session.activated", &copy); err != nil {
-				return Session{}, err
-			}
-		}
-	}
 	return publicSession(&copy), nil
 }
 
@@ -465,43 +558,35 @@ func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 		service.mu.Unlock()
 		return Session{}, errors.New("session is not awaiting TOTP")
 	}
-	profile := service.profiles[session.Profile]
-	if session.verifyAttempts >= 5 {
-		session.State = Expired
-		service.mu.Unlock()
-		return Session{}, errors.New("too many invalid TOTP attempts")
-	}
+	profile := session.profile
 	secret, err := os.ReadFile(profile.TOTPSecretFile)
 	if err != nil {
 		service.mu.Unlock()
 		return Session{}, fmt.Errorf("read TOTP secret: %w", err)
 	}
-	if !validTOTP(strings.TrimSpace(string(secret)), code, service.now()) {
-		session.verifyAttempts++
+	if err := service.verifyTOTPCode(strings.TrimSpace(string(secret)), code); err != nil {
 		service.mu.Unlock()
-		return Session{}, errors.New("invalid TOTP code")
-	}
-	session.State = Active
-	copy := *session
-	service.mu.Unlock()
-	if err := service.record(context.Background(), "session.activated", &copy); err != nil {
 		return Session{}, err
 	}
-	return publicSession(&copy), nil
+
+	err = service.transitionLocked(context.Background(), session, Active, "session.activated")
+	result := publicSession(session)
+	service.mu.Unlock()
+	return result, err
 }
 
 func (service *Service) Credential(ctx context.Context, subject, id string) (Credential, error) {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, issuing)
 	if err != nil {
-		service.mu.Unlock()
 		return Credential{}, err
 	}
+	defer release()
+
 	if session.State != Active || !session.ExpiresAt.After(service.now()) {
 		service.mu.Unlock()
 		return Credential{}, errors.New("emergency session is not active")
 	}
-	profile := service.profiles[session.Profile]
+	profile := session.profile
 	if profile.Provider == "github_user" {
 		credential := Credential{Provider: profile.Provider, Token: session.accessToken, ExpiresAt: session.ExpiresAt}
 		service.mu.Unlock()
@@ -513,10 +598,34 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		service.mu.Unlock()
 		return Credential{}, errors.New("Kubernetes emergency issuer is unavailable")
 	}
-	// ponytail: emergency issuance holds the global session lock; use per-session
-	// locks only if emergency-session concurrency becomes operationally relevant.
+	// Reserve cleanup before releasing the registry lock for external issuance.
+	if boundSecret == "" {
+		name, err := randomKubernetesName()
+		if err != nil {
+			service.mu.Unlock()
+			return Credential{}, err
+		}
+		boundSecret = "keymint-emergency-" + name
+		if err = service.rememberCredential(ctx, session.ID, profile, session.accessToken, boundSecret, session.ExpiresAt); err != nil {
+			service.mu.Unlock()
+			return Credential{}, err
+		}
+		session.boundSecret = boundSecret
+	}
+	service.mu.Unlock()
 	token, secret, expiresAt, err := service.issuer.Issue(ctx, profile.Namespace, profile.ServiceAccount, ttl, boundSecret)
+	service.mu.Lock()
+	if service.sessions[id] != session || session.State != Active || !session.ExpiresAt.After(service.now()) || service.closed {
+		service.mu.Unlock()
+		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: session.accessToken, secret: boundSecret})
+		return Credential{}, errors.Join(errors.New("session changed during credential issuance"), cleanupErr)
+	}
 	if err != nil {
+		service.mu.Unlock()
+		return Credential{}, err
+	}
+	if err := service.rememberCredential(ctx, session.ID, profile, session.accessToken, secret, session.ExpiresAt); err != nil {
+		_ = service.issuer.Revoke(context.WithoutCancel(ctx), profile.Namespace, secret)
 		service.mu.Unlock()
 		return Credential{}, err
 	}
@@ -541,22 +650,36 @@ func (service *Service) Authorize(subject, id string) error {
 }
 
 func (service *Service) Revoke(ctx context.Context, subject, id string) error {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, revoking)
 	if err != nil {
+		return err
+	}
+	defer release()
+	if terminal(session.State) {
+		service.mu.Unlock()
+		return nil
+	}
+	if err = service.transitionLocked(ctx, session, RevocationPending, eventFor(RevocationPending)); err != nil {
 		service.mu.Unlock()
 		return err
 	}
-	revoked := revokedCredential{profile: service.profiles[session.Profile], token: session.accessToken, secret: session.boundSecret}
-	// ponytail: emergency revocation holds the global session lock so no
-	// credential can be issued concurrently; use per-session locks at scale.
-	if err := service.revokeCredential(ctx, revoked); err != nil {
-		service.mu.Unlock()
+	credential := revokedCredential{id: id, profile: session.profile, token: session.accessToken, secret: session.boundSecret}
+	service.mu.Unlock()
+	err = service.revokeCredential(ctx, credential)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if terminal(session.State) {
+		delete(service.sessions, id)
+		return nil
+	}
+	if err = service.transitionLocked(ctx, session, Revoked, eventFor(Revoked)); err != nil {
 		return err
 	}
 	delete(service.sessions, id)
-	service.mu.Unlock()
-	return service.record(ctx, "session.revoked", session)
+	return nil
 }
 
 func (service *Service) Events(ctx context.Context, subject, after string, wait time.Duration) (EventPage, error) {
@@ -635,23 +758,31 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		session.nextPoll = service.now().Add(session.pollEvery)
 		return nil
 	}
+	// Stage cleanup immediately after exchange, before identity/scope validation.
+	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", service.now()); err != nil {
+		_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{profile: profile, token: token.AccessToken})
+		return fmt.Errorf("persist credential cleanup: %w", err)
+	}
 	if len(session.Scopes) > 0 {
 		granted := strings.FieldsFunc(token.Scope, func(r rune) bool { return r == ',' || r == ' ' })
 		slices.Sort(granted)
 		granted = slices.Compact(granted)
 		if !slices.Equal(granted, session.Scopes) {
-			_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+			_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 			return errScopeMismatch
 		}
 	}
 	userID, err := service.githubUserID(ctx, profile, token.AccessToken)
 	if err != nil {
-		_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return err
 	}
 	if !containsID(allowedUserIDs, userID) {
-		_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return errors.New("authenticated GitHub user is not allowed for this profile")
+	}
+	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", session.ExpiresAt); err != nil {
+		return err
 	}
 	session.accessToken, session.State = token.AccessToken, Active
 	return nil
@@ -695,8 +826,9 @@ func githubIdentity(profile config.EmergencyProfile) (string, string, []int64, e
 	return clientID, clientSecret, allowed, nil
 }
 
-func (service *Service) revokeCredential(ctx context.Context, credential revokedCredential) error {
-	var result error
+func (service *Service) revokeCredential(ctx context.Context, credential revokedCredential) (result error) {
+	started := time.Now()
+	defer func() { service.metrics.ObserveOperation("credential_revoke", started, result) }()
 	if credential.token != "" {
 		clientID, clientSecret, _, err := githubIdentity(credential.profile)
 		if err != nil {
@@ -717,14 +849,16 @@ func (service *Service) revokeCredential(ctx context.Context, credential revoked
 			} else {
 				defer func() { _ = response.Body.Close() }()
 				if response.StatusCode < 200 || response.StatusCode >= 300 {
-					message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-					result = errors.Join(result, fmt.Errorf("revoke GitHub token: %s: %s", response.Status, strings.TrimSpace(string(message))))
+					result = errors.Join(result, fmt.Errorf("revoke GitHub token: HTTP %d", response.StatusCode))
 				}
 			}
 		}
 	}
 	if credential.secret != "" && service.issuer != nil {
 		result = errors.Join(result, service.issuer.Revoke(ctx, credential.profile.Namespace, credential.secret))
+	}
+	if result == nil && credential.id != "" {
+		result = service.cleanup.remove(ctx, credential.id)
 	}
 	return result
 }
@@ -753,16 +887,20 @@ func (service *Service) doJSON(request *http.Request, target any) error {
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("%s: %s", response.Status, strings.TrimSpace(string(message)))
+		return fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
 	}
-	return json.NewDecoder(response.Body).Decode(target)
+	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(target)
 }
 
 func validTOTP(secret, code string, now time.Time) bool {
+	_, ok := totpStep(secret, code, now)
+	return ok
+}
+
+func totpStep(secret, code string, now time.Time) (int64, bool) {
 	decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.ReplaceAll(secret, " ", "")))
-	if err != nil || len(code) != 6 {
-		return false
+	if err != nil || len(decoded) < 16 || len(code) != 6 {
+		return 0, false
 	}
 	for offset := int64(-1); offset <= 1; offset++ {
 		counter := uint64(now.Unix()/30 + offset)
@@ -775,10 +913,10 @@ func validTOTP(secret, code string, now time.Time) bool {
 		value := (uint32(sum[index])&0x7f)<<24 | uint32(sum[index+1])<<16 | uint32(sum[index+2])<<8 | uint32(sum[index+3])
 		want := fmt.Sprintf("%06d", value%1_000_000)
 		if hmac.Equal([]byte(want), []byte(code)) {
-			return true
+			return int64(counter), true
 		}
 	}
-	return false
+	return 0, false
 }
 
 func randomID() (string, error) {
@@ -793,7 +931,10 @@ func publicSession(session *Session) Session {
 	copy := *session
 	copy.Scopes = slices.Clone(session.Scopes)
 	copy.subject, copy.deviceCode, copy.accessToken, copy.boundSecret = "", "", "", ""
-	copy.credentialAt, copy.nextPoll, copy.pollEvery, copy.verifyAttempts = time.Time{}, time.Time{}, 0, 0
+	copy.nextPoll, copy.pollEvery = time.Time{}, 0
+	copy.profile = config.EmergencyProfile{}
+	copy.gate = nil
+	copy.operation = idle
 	return copy
 }
 

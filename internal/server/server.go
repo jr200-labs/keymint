@@ -32,12 +32,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
+	"github.com/jr200-labs/keymint/internal/logging"
 	"github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/jr200-labs/keymint/internal/mint"
 	"github.com/jr200-labs/keymint/internal/releasekey"
@@ -62,37 +64,13 @@ import (
 // tracer is the OTel tracer used for spans emitted by this package.
 var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/server")
 
-// TokenScope limits the repositories and permissions of an installation token.
-type TokenScope struct {
-	Repositories []string          `json:"repositories,omitempty"`
-	Permissions  map[string]string `json:"permissions,omitempty"`
-}
+// TokenScope is shared with the installation-token broker.
+type TokenScope = mint.Scope
 
-// MintFunc injects token issuance without coupling the server to private-key
-// loading. Permission rejections wrap mint.ErrPermissionsNotGranted.
-type MintFunc func(ctx context.Context, key config.Key, scope TokenScope) (token string, expiresAt time.Time, err error)
+// MintFunc injects installation issuance.
+type MintFunc func(context.Context, config.Key, mint.Scope) (string, time.Time, error)
 
 var repositoryName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
-
-func (scope TokenScope) Validate() error {
-	if len(scope.Repositories) > 100 {
-		return errors.New("token scope exceeds 100 repositories")
-	}
-	seen := map[string]bool{}
-	for _, repository := range scope.Repositories {
-		if !repositoryName.MatchString(repository) || seen[repository] {
-			return errors.New("token scope contains an invalid or duplicate repository")
-		}
-		seen[repository] = true
-	}
-	for permission, access := range scope.Permissions {
-		if !repositoryName.MatchString(permission) || !slices.Contains([]string{"read", "write", "admin", "triage", "maintain"}, access) {
-			return errors.New("token scope contains an invalid permission")
-		}
-	}
-	sort.Strings(scope.Repositories)
-	return nil
-}
 
 // configSnapshot is an immutable view of the config + the
 // pre-computed allowedSubject lookup, swapped atomically when
@@ -165,15 +143,14 @@ func (c *reviewCache) putNegative(token string) {
 
 // Server holds wired-up HTTP server state.
 type Server struct {
-	snapshot      atomic.Pointer[configSnapshot]
-	mint          MintFunc
-	tokenReviewer TokenReviewer
-	preAuthLimit  *limiterMap // per-IP, evaluated before auth
-	subjectLimit  *limiterMap // per-resolved-SA, evaluated after auth
-	reviewCache   *reviewCache
-	metrics       *metrics.Metrics
-	emergency     *emergency.Service
+	snapshot  atomic.Pointer[configSnapshot]
+	mint      MintFunc
+	auth      *authenticator
+	metrics   *metrics.Metrics
+	emergency *emergency.Service
 
+	workers     sync.WaitGroup
+	stopOnce    sync.Once
 	janitorStop chan struct{} // closed by Stop() to halt limiter GC goroutines
 }
 
@@ -302,27 +279,20 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 	}
 
 	s := &Server{
-		mint:          mint,
-		tokenReviewer: reviewer,
-		// Pre-auth (per-IP): tight bucket. Anonymous floods here just
-		// burn the attacker's own bucket and never reach the
-		// kubernetes TokenReview API.
-		preAuthLimit: newLimiterMap(rate.Limit(10), 20),
-		// Post-auth (per-subject): generous bucket for legitimate
-		// authenticated callers minting frequently.
-		subjectLimit: newLimiterMap(rate.Limit(100), 200),
-		reviewCache:  newReviewCache(),
-		metrics:      m,
-		janitorStop:  make(chan struct{}),
+		mint:        mint,
+		auth:        newAuthenticator(reviewer, m),
+		metrics:     m,
+		janitorStop: make(chan struct{}),
 	}
 	s.snapshot.Store(buildSnapshot(cfg))
 	if len(emergencyServices) != 0 {
 		s.emergency = emergencyServices[0]
 	}
-	go s.preAuthLimit.runJanitor(s.janitorStop)
-	go s.subjectLimit.runJanitor(s.janitorStop)
+	preAuthLimit, subjectLimit := s.auth.preAuthLimit, s.auth.subjectLimit
+	s.runBackground(func() { preAuthLimit.runJanitor(s.janitorStop) })
+	s.runBackground(func() { subjectLimit.runJanitor(s.janitorStop) })
 	if s.emergency != nil {
-		go s.runEmergencyJanitor()
+		s.runBackground(s.runEmergencyJanitor)
 	}
 	return s, nil
 }
@@ -344,16 +314,13 @@ func (s *Server) runEmergencyJanitor() {
 	}
 }
 
-// Stop releases background goroutines (rate-limiter janitors). Safe
-// to call multiple times.
-func (s *Server) Stop() {
-	select {
-	case <-s.janitorStop:
-		// already closed
-	default:
-		close(s.janitorStop)
-	}
+func (s *Server) runBackground(work func()) {
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); work() }()
 }
+
+// Stop joins background janitors. Safe to call multiple times.
+func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.janitorStop) }); s.workers.Wait() }
 
 // buildSnapshot precomputes the subject -> keys allow map and
 // parsed trusted-proxy CIDRs for fast lookup at request time.
@@ -389,13 +356,27 @@ func buildSnapshot(cfg *config.Config) *configSnapshot {
 // error if the new config fails validation; the existing snapshot
 // is left unchanged in that case so a bad reload cannot break a
 // running server.
-func (s *Server) Reload(cfg *config.Config) error {
+func (s *Server) ValidateReload(cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("server: nil config")
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("server: reload validation: %w", err)
 	}
+	current := s.currentConfig()
+	if !reflect.DeepEqual(current.Passkeys, cfg.Passkeys) || current.EmergencyStateFile != cfg.EmergencyStateFile || !reflect.DeepEqual(current.ExpectedAudiences, cfg.ExpectedAudiences) {
+		return errors.New("passkeys, emergency_state_file and expected_audiences changes require restart")
+	}
+	if s.emergency != nil && len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
+		return errors.New("emergency_state_file is required for emergency profiles")
+	}
+	return nil
+}
+func (s *Server) Reload(cfg *config.Config) error {
+	if err := s.ValidateReload(cfg); err != nil {
+		return err
+	}
+
 	s.snapshot.Store(buildSnapshot(cfg))
 	if s.emergency != nil {
 		s.emergency.Reload(cfg)
@@ -405,9 +386,6 @@ func (s *Server) Reload(cfg *config.Config) error {
 
 // snapshot accessors used by handlers.
 func (s *Server) currentConfig() *config.Config { return s.snapshot.Load().cfg }
-func (s *Server) currentAllowed() map[string]map[string]bool {
-	return s.snapshot.Load().allowedSubject
-}
 
 // Routes returns an http.Handler that serves keymint's API.
 //
@@ -436,7 +414,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias
-	return mux
+	return s.observeHTTP(mux)
 }
 
 func (s *Server) handleEmergencyEvents(w http.ResponseWriter, r *http.Request) {
@@ -488,11 +466,11 @@ func (s *Server) handlePasskeyVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.emergency.VerifyPasskey(subject, r.PathValue("token"), r); err != nil {
-		zap.L().Warn("passkey verification rejected", zap.String("subject", subject), zap.Error(err))
+		logging.FromContext(r.Context()).Warn("passkey verification rejected", zap.String("subject", subject), zap.Error(err))
 		writeJSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	zap.L().Info("passkey ceremony completed", zap.String("subject", subject))
+	logging.FromContext(r.Context()).Info("passkey ceremony completed", zap.String("subject", subject))
 	writeJSON(w, map[string]string{"state": "complete"})
 }
 
@@ -514,7 +492,7 @@ func (s *Server) handlePasskeyEnrollmentCreate(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	zap.L().Info("passkey enrollment created", zap.String("subject", subject), zap.String("enrollment", enrollment.ID))
+	logging.FromContext(r.Context()).Info("passkey enrollment created", zap.String("subject", subject), zap.String("enrollment", enrollment.ID))
 	writeJSON(w, enrollment)
 }
 
@@ -563,36 +541,9 @@ func (s *Server) emergencySubject(w http.ResponseWriter, r *http.Request) (strin
 		writeJSONError(w, http.StatusServiceUnavailable, "emergency sessions are unavailable")
 		return "", false
 	}
-	if !s.preAuthLimit.allow(clientIP(r, s.snapshot.Load().trustedProxies)) {
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
-		return "", false
-	}
-	bearer, ok := bearerToken(r)
-	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
-		return "", false
-	}
-	subject, hit := s.reviewCache.get(bearer)
-	if hit && subject == reviewNegSentinel {
-		writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
-		return "", false
-	}
-	if !hit {
-		var err error
-		subject, ok, err = s.tokenReviewer.Review(r.Context(), bearer)
-		if err != nil {
-			writeJSONError(w, http.StatusServiceUnavailable, "kubernetes tokenreview unavailable; retry")
-			return "", false
-		}
-		if !ok {
-			s.reviewCache.putNegative(bearer)
-			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
-			return "", false
-		}
-		s.reviewCache.putPositive(bearer, subject)
-	}
-	if !s.subjectLimit.allow(subject) {
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+	subject, failure := s.auth.authenticate(r.Context(), r, s.snapshot.Load().trustedProxies)
+	if failure != nil {
+		writeJSONError(w, failure.status, failure.message)
 		return "", false
 	}
 	return subject, true
@@ -625,7 +576,7 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	zap.L().Info("emergency session created", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID), zap.Time("expires_at", session.ExpiresAt))
+	logging.FromContext(r.Context()).Info("emergency session created", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID), zap.Time("expires_at", session.ExpiresAt))
 	writeJSON(w, session)
 }
 
@@ -656,11 +607,11 @@ func (s *Server) handleEmergencyVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	session, err := s.emergency.VerifyTOTP(subject, r.PathValue("id"), input.Code)
 	if err != nil {
-		zap.L().Warn("emergency verification rejected", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+		logging.FromContext(r.Context()).Warn("emergency verification rejected", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
 		writeJSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	zap.L().Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
+	logging.FromContext(r.Context()).Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
 	writeJSON(w, session)
 }
 
@@ -675,7 +626,7 @@ func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	zap.L().Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
+	logging.FromContext(r.Context()).Info("emergency credential issued", zap.String("subject", subject), zap.String("provider", credential.Provider), zap.String("session", r.PathValue("id")), zap.String("token_fingerprint", tokenFingerprint(credential.Token)), zap.Time("expires_at", credential.ExpiresAt))
 	writeJSON(w, credential)
 }
 
@@ -713,17 +664,37 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "release signing key is unavailable")
 		return
 	}
-	sealed, err := releasekey.Seal(key, releasekey.Destination{
-		KeyID: input.DestinationKeyID, PublicKey: input.DestinationKey,
-	})
+	installation, exists := snapshot.cfg.Keys[key.GitHubKey]
+	if !exists {
+		writeJSONError(w, http.StatusServiceUnavailable, "release-key destination resolver is unavailable")
+		return
+	}
+	token, _, err := s.mint(r.Context(), installation, TokenScope{Repositories: []string{input.GitHubRepository}, Permissions: map[string]string{"secrets": "read"}})
 	if err != nil {
-		zap.L().Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
+		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
+		return
+	}
+	destination, err := releasekey.GitHubDestination(r.Context(), nil, installation.APIBaseURL, token, input.GitHubOwner, input.GitHubRepository)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
+		return
+	}
+	// Retain compatibility with clients sending GitHub's key, but reject stale
+	// or substituted keys. Only the broker-resolved value reaches Seal.
+	if (input.DestinationKeyID != "" && input.DestinationKeyID != destination.KeyID) ||
+		(input.DestinationKey != "" && input.DestinationKey != destination.PublicKey) {
+		writeJSONError(w, http.StatusBadRequest, "destination does not match the repository encryption key")
+		return
+	}
+	sealed, err := releasekey.Seal(key, destination)
+	if err != nil {
+		logging.FromContext(r.Context()).Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "release signing key could not be sealed")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	zap.L().Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
-		zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
+	logging.FromContext(r.Context()).Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
+		zap.String("destination_key_id", destination.KeyID), zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
 	writeJSON(w, sealed)
 }
 
@@ -736,7 +707,7 @@ func (s *Server) handleEmergencyRevoke(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	zap.L().Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
+	logging.FromContext(r.Context()).Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -747,6 +718,7 @@ func writeJSON(w http.ResponseWriter, value any) {
 
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	keyName := r.PathValue("key")
+	snapshot := s.snapshot.Load()
 
 	// Sanitize the path segment to a bounded label value for metrics
 	// + spans. Without this, an attacker hitting /token/<random-uuid>
@@ -755,7 +727,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// error message and structured log fields where cardinality is
 	// not a concern.
 	metricKey := metrics.UnknownKey
-	if _, ok := s.currentConfig().Keys[keyName]; ok {
+	if _, ok := snapshot.cfg.Keys[keyName]; ok {
 		metricKey = keyName
 	}
 
@@ -776,99 +748,20 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
+	log := logging.FromContext(ctx).With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
 
-	// Pre-auth rate limit: per-remote-IP. Cheap, scoped to attacker so
-	// flooders cannot exhaust authenticated callers' budget.
-	if !s.preAuthLimit.allow(clientIP(r, s.snapshot.Load().trustedProxies)) {
-		s.recordOutcome(span, metricKey, metrics.OutcomeRateLimited)
-		span.SetStatus(codes.Error, "rate limited (pre-auth)")
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
+	subject, failure := s.auth.authenticate(ctx, r, snapshot.trustedProxies)
+	if failure != nil {
+		s.recordOutcome(span, metricKey, failure.outcome)
+		span.SetStatus(codes.Error, failure.message)
+		writeJSONError(w, failure.status, failure.message)
 		return
-	}
-
-	// 1. Extract bearer token
-	bearer, ok := bearerToken(r)
-	if !ok {
-		s.recordOutcome(span, metricKey, metrics.OutcomeBadAuth)
-		span.SetStatus(codes.Error, "missing bearer")
-		writeJSONError(w, http.StatusUnauthorized, "missing or malformed Authorization header")
-		return
-	}
-
-	// 2. Validate via TokenReview (audience-bound, SA token re-read).
-	//    Two-tier short-lived cache shields the apiserver from
-	//    bursts: positive entries expire in 60s (revoked SAs lose
-	//    access promptly), negative entries expire in 15s (retries
-	//    of bad creds get a fresh review fast).
-	subject, cacheHit := s.reviewCache.get(bearer)
-	if cacheHit {
-		s.recordCacheLookup(metrics.CacheHit)
-		if subject == reviewNegSentinel {
-			// Negative cache hit: token was rejected very recently.
-			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
-			span.SetStatus(codes.Error, "tokenreview cached negative")
-			log.Warn("tokenreview rejected (cached)")
-			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
-			return
-		}
-	} else {
-		s.recordCacheLookup(metrics.CacheMiss)
-		var (
-			ok  bool
-			err error
-		)
-		subject, ok, err = s.tokenReviewer.Review(ctx, bearer)
-		switch {
-		case err != nil:
-			// Infrastructure failure — apiserver 5xx, transport
-			// error, or breaker open. Do NOT touch the negative
-			// cache: a transient kubernetes-API blip must not
-			// poison legitimate callers' tokens for 15s. Tell
-			// the caller to back off and retry via 503.
-			if s.metrics != nil {
-				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
-			}
-			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "tokenreview infra failure")
-			log.Error("tokenreview infra failure", zap.Error(err))
-			writeJSONError(w, http.StatusServiceUnavailable, "kubernetes tokenreview unavailable; retry")
-			return
-		case !ok:
-			// Apiserver authoritatively rejected the caller's
-			// token. Cache the rejection briefly so a flood of
-			// the same bad token doesn't keep waking the
-			// apiserver.
-			if s.metrics != nil {
-				s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewRejected).Inc()
-			}
-			s.reviewCache.putNegative(bearer)
-			s.recordOutcome(span, metricKey, metrics.OutcomeTokenReviewError)
-			span.SetStatus(codes.Error, "tokenreview rejected")
-			log.Warn("tokenreview rejected")
-			writeJSONError(w, http.StatusUnauthorized, "tokenreview rejected the bearer token")
-			return
-		}
-		if s.metrics != nil {
-			s.metrics.TokenReviewsTotal.WithLabelValues(metrics.TokenReviewAccepted).Inc()
-		}
-		s.reviewCache.putPositive(bearer, subject)
 	}
 	span.SetAttributes(attribute.String("k8s.serviceaccount.subject", subject))
 	log = log.With(zap.String("subject", subject))
 
-	// Post-auth rate limit: per-subject. Caps any single legitimate
-	// service that goes haywire.
-	if !s.subjectLimit.allow(subject) {
-		s.recordOutcome(span, metricKey, metrics.OutcomeRateLimited)
-		span.SetStatus(codes.Error, "rate limited (per-subject)")
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests")
-		return
-	}
-
 	// 3. Allowlist check
-	if !s.subjectMayMint(subject, keyName) {
+	if !snapshot.allowedSubject[subject][keyName] {
 		s.recordOutcome(span, metricKey, metrics.OutcomeForbidden)
 		span.SetStatus(codes.Error, "forbidden")
 		log.Warn("subject not permitted")
@@ -878,7 +771,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Look up key (already validated when computing metricKey, but
 	// keep an explicit branch for the 404 outcome).
-	keyEntry, ok := s.currentConfig().Keys[keyName]
+	keyEntry, ok := snapshot.cfg.Keys[keyName]
 	if !ok {
 		s.recordOutcome(span, metricKey, metrics.OutcomeUnknownKey)
 		span.SetStatus(codes.Error, "unknown key")
@@ -890,6 +783,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	// installation-token endpoint for trusted in-cluster callers.
 	var scope TokenScope
 	if r.ContentLength > 8192 {
+		s.recordOutcome(span, metricKey, "invalid_scope")
 		writeJSONError(w, http.StatusRequestEntityTooLarge, "token scope is too large")
 		return
 	}
@@ -897,14 +791,17 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		decoder := json.NewDecoder(io.LimitReader(r.Body, 8193))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&scope); err != nil {
+			s.recordOutcome(span, metricKey, "invalid_scope")
 			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
 			return
 		}
 		if err := decoder.Decode(new(any)); err != io.EOF {
+			s.recordOutcome(span, metricKey, "invalid_scope")
 			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
 			return
 		}
 		if err := scope.Validate(); err != nil {
+			s.recordOutcome(span, metricKey, "invalid_scope")
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -971,20 +868,6 @@ func (s *Server) recordOutcome(span trace.Span, keyName, outcome string) {
 	if s.metrics != nil {
 		s.metrics.MintRequestsTotal.WithLabelValues(outcome, keyName).Inc()
 	}
-}
-
-func (s *Server) recordCacheLookup(result string) {
-	if s.metrics != nil {
-		s.metrics.TokenReviewCacheTotal.WithLabelValues(result).Inc()
-	}
-}
-
-func (s *Server) subjectMayMint(subject, key string) bool {
-	keys, ok := s.currentAllowed()[subject]
-	if !ok {
-		return false
-	}
-	return keys[key]
 }
 
 // clientIP returns the best estimate of the original client IP for
@@ -1257,7 +1140,7 @@ func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (revi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := tracing.HTTPClient(r.httpClient).Do(req)
 	if err != nil {
 		return reviewResult{}, fmt.Errorf("server: tokenreview POST: %w", err)
 	}
@@ -1271,7 +1154,7 @@ func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (revi
 		// Apiserver-side issue (HTTP 5xx, our SA token is wrong, etc.).
 		// 401/403 here would mean keymint's own SA token is bad — that
 		// IS an infra problem the breaker should react to.
-		return reviewResult{}, fmt.Errorf("server: tokenreview returned %d: %s", resp.StatusCode, string(respBody))
+		return reviewResult{}, fmt.Errorf("server: tokenreview returned HTTP %d", resp.StatusCode)
 	}
 
 	var out tokenReviewResponse

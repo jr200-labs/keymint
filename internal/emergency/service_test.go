@@ -20,7 +20,7 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
-type fakeIssuer struct{ revoked string }
+type fakeIssuer struct{ revoked, issued string }
 
 func (issuer *fakeIssuer) Issue(_ context.Context, namespace, serviceAccount string, ttl time.Duration, existing string) (string, string, time.Time, error) {
 	if namespace != "operators" || serviceAccount != "breakglass-admin" || ttl <= 0 {
@@ -29,6 +29,7 @@ func (issuer *fakeIssuer) Issue(_ context.Context, namespace, serviceAccount str
 	if existing == "" {
 		existing = "bound-secret"
 	}
+	issuer.issued = existing
 	return "kubernetes-token", existing, time.Unix(900, 0), nil
 }
 
@@ -81,7 +82,7 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 	if err := service.Revoke(context.Background(), "system:serviceaccount:agents:relay", session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if issuer.revoked != "bound-secret" {
+	if issuer.revoked != issuer.issued {
 		t.Fatalf("revoked %q", issuer.revoked)
 	}
 }
@@ -183,7 +184,7 @@ func TestKubernetesSessionCanUseGitHubDeviceAuthentication(t *testing.T) {
 	if err := service.Revoke(context.Background(), "allowed", session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if !githubRevoked || issuer.revoked != "bound-secret" {
+	if !githubRevoked || issuer.revoked != issuer.issued {
 		t.Fatalf("revoked GitHub=%v Kubernetes=%q", githubRevoked, issuer.revoked)
 	}
 }
@@ -230,7 +231,7 @@ func TestSessionMutationsPublishResumableEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	revoked, err := service.Events(context.Background(), "allowed", created.NextCursor, 0)
-	if err != nil || len(revoked.Events) != 1 || revoked.Events[0].Type != "session.revoked" {
+	if err != nil || len(revoked.Events) != 2 || revoked.Events[1].Type != "session.revoked" {
 		t.Fatalf("revoked events = %+v, error = %v", revoked, err)
 	}
 }
@@ -251,7 +252,7 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.sessions["E-1"] = &Session{ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, subject: "allowed", accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
+	service.sessions["E-1"] = &Session{profile: profile, ID: "E-1", Profile: "operator", Provider: "github_user", State: Active, subject: "allowed", accessToken: "personal", ExpiresAt: time.Unix(1, 0)}
 	service.now = func() time.Time { return time.Unix(2, 0) }
 	if err := service.Prune(context.Background()); err != nil {
 		t.Fatal(err)

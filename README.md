@@ -183,7 +183,7 @@ the deploy accordingly:
   config is validated and the in-process snapshot is swapped
   atomically. Pod restarts are not required for routine admin
   changes. (Note: `expected_audiences` is read at startup only —
-  changes there require a restart.)
+  changes there require a restart, as do passkey and emergency journal settings; reload rejects such changes.)
 
 - **GitHub API circuit breaker.** Calls to
   `/app/installations/<id>/access_tokens` are wrapped in a circuit
@@ -201,7 +201,7 @@ the deploy accordingly:
 
 - **Cryptographic audit fingerprint.** Each minted installation token is hashed with SHA-256 and the hex digest is emitted as a `token_fingerprint` field on the structured log line and as a `keymint.token_fingerprint` OpenTelemetry span attribute. If a token ever leaks (in CI logs, a screenshot, etc.), security teams can hash it locally and grep audit logs to pinpoint the exact pod, ServiceAccount, and minute that issued it — without ever persisting the raw token.
 
-- **Ed25519 + RSA private keys.** `ParsePrivateKey` accepts both PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY") PEM blocks; PKCS#8 may be either RSA or Ed25519. The signing path picks `RS256` for RSA keys and `EdDSA` for Ed25519 automatically. GitHub Apps support both; Ed25519 keys are smaller and faster to sign with.
+- **RSA App private keys.** GitHub App JWTs require RS256. PKCS#1 and PKCS#8 RSA keys are accepted; other App key types are rejected. Sparkle release signing continues to use Ed25519.
 
 - **Trusted-proxy-aware client IP extraction.** Set
   `trusted_proxies:` in the config to a list of CIDR blocks for your
@@ -237,21 +237,37 @@ the deploy accordingly:
 Service mode emits structured (zap) logs, OpenTelemetry traces, and
 Prometheus metrics.
 
-- **Logs** — JSON by default. Control via `--log-level` and
+- **Logs** — unsampled JSON by default, with trace/span IDs on request logs. Control via `--log-level` and
   `--log-human` flags.
 - **Tracing** — opt in by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP
   gRPC) or `OTEL_TRACES_EXPORTER=console` (stdout, dev). Disabled if
   neither is set. `OTEL_DEPLOYMENT_ENVIRONMENT` adds a deployment
-  environment resource attribute. Spans wrap the `/token/<key>`
-  handler with attributes for the key, k8s subject, and outcome.
+  environment resource attribute. All HTTP routes extract incoming trace context;
+  authentication and GitHub/Kubernetes/OAuth calls create child spans and
+  propagate context. Dependency attributes omit URLs, headers and bodies.
 - **Metrics** — scrapeable on a separate listener (default `:9100`,
   configurable via `--metrics-listen`). Exported series:
   - `keymint_mint_requests_total{outcome,key}`
   - `keymint_mint_duration_seconds{key}` (histogram)
   - `keymint_mint_in_flight`
   - `keymint_tokenreviews_total{result}`
-  - `keymint_github_api_latency_seconds{status}` (histogram)
-  - `keymint_jwt_clock_offset_seconds`
+  - `keymint_github_api_latency_seconds{status,api_base_url}` (histogram)
+  - `keymint_jwt_clock_offset_seconds{api_base_url}`
+
+Additional route metrics are `keymint_http_requests_total{route,method,status}`,
+`keymint_http_duration_seconds{route}` and `keymint_http_in_flight`. Routes use
+registered patterns, with a fixed unmatched label. Internal operations expose
+`keymint_operations_total{operation,outcome}` and
+`keymint_operation_duration_seconds{operation}` for authentication, cache/refresh,
+revocation, journal writes and reloads. Cleanup gauges are
+`keymint_credential_cleanup_records`, `keymint_credential_cleanup_due`, and
+`keymint_credential_cleanup_oldest_overdue_seconds`. Alert on sustained due work,
+increasing overdue age, journal errors and failed reloads. Per-endpoint breaker
+state is `keymint_github_endpoint_breaker_state{api_base_url}`.
+
+Dashboards using the exchange latency or clock offset metrics must account for
+the new `api_base_url` label. These signals cover the service's application paths;
+cluster scrape, exporter delivery and alert routing still require deployment checks.
 
 The metrics listener should be reachable only from your monitoring
 namespace; use a NetworkPolicy to lock it down.
@@ -301,3 +317,23 @@ grants are rejected and token revocation is attempted. This prevents prior OAuth
 authorizations from silently broadening a reduced request. OAuth `repo` remains
 a broad permission, not a per-repository restriction. Consumers must enforce
 their own operation and repository approvals and must not reuse a broader session.
+
+### Release-key destination lookup
+
+Each `release_keys` entry must set `github_key` to a configured installation
+key. That installation must be able to read Actions secrets metadata for every
+listed repository. The broker mints a repository-scoped token with `secrets:
+read` and obtains the encryption key directly from the configured HTTPS GitHub
+API. Caller-supplied destination fields are optional and, when present, must
+match the broker lookup. Existing deployments must add `github_key` before
+upgrading; unbound release-key configuration fails validation.
+
+### Emergency cleanup storage
+
+Service deployments with emergency profiles must configure
+`emergency_state_file` on persistent storage. Keep its adjacent `.cleanup-key`
+file with the database, restrict both to the broker identity, and run one
+replica. Live authorization remains memory-only, but encrypted revocation
+records survive restart until remote cleanup succeeds. The event stream never
+contains tokens or revocation secrets. Losing either persistent file prevents
+reliable cleanup; retain both during upgrades and recovery.

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/metrics"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,10 +38,11 @@ type EventPage struct {
 }
 
 type eventStore struct {
-	db     *sql.DB
-	mu     sync.Mutex
-	notify chan struct{}
-	stream string
+	metrics *metrics.Metrics
+	db      *sql.DB
+	mu      sync.Mutex
+	notify  chan struct{}
+	stream  string
 }
 
 func openEventStore(path string) (*eventStore, error) {
@@ -65,6 +67,7 @@ CREATE TABLE IF NOT EXISTS emergency_events (
 id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, type TEXT NOT NULL,
 session_id TEXT NOT NULL, profile TEXT NOT NULL, provider TEXT NOT NULL,
 state TEXT NOT NULL, expires_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS emergency_totp (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, attempts INTEGER NOT NULL, last_step INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);`); err != nil {
 		_ = db.Close()
@@ -94,7 +97,9 @@ CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subje
 
 func (store *eventStore) close() error { return store.db.Close() }
 
-func (store *eventStore) append(ctx context.Context, event Event) error {
+func (store *eventStore) append(ctx context.Context, event Event) (result error) {
+	started := time.Now()
+	defer func() { store.metrics.ObserveOperation("journal_append", started, result) }()
 	if event.SessionID == "" || event.Subject == "" || event.Type == "" {
 		return errors.New("emergency event type, subject, and session are required")
 	}
