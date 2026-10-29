@@ -82,12 +82,13 @@ type PasskeyEnrollment struct {
 }
 
 type passkeyCeremony struct {
-	subject   string
-	sessionID string
-	kind      string
-	options   any
-	data      webauthn.SessionData
-	expiresAt time.Time
+	proofSessionID string
+	subject        string
+	sessionID      string
+	kind           string
+	options        any
+	data           webauthn.SessionData
+	expiresAt      time.Time
 }
 
 type Credential struct {
@@ -232,8 +233,10 @@ func (service *Service) Reload(cfg *config.Config) {
 		}
 	}
 	service.mu.Unlock()
+	reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	if len(invalidated) > 0 {
-		if err := service.drainCleanup(context.Background(), false); err != nil {
+		if err := service.drainCleanup(reloadCtx, false); err != nil {
 			zap.L().Error("retry credential cleanup after config reload", zap.Error(err))
 		}
 	}
@@ -376,7 +379,7 @@ func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (
 	now := service.now().UTC()
 	enrollment := PasskeyEnrollment{ID: id, State: "awaiting_passkey", VerificationURI: service.passkeyVerificationURL + "/#" + token, ExpiresAt: now.Add(5 * time.Minute)}
 	service.mu.Lock()
-	service.ceremonies[token] = passkeyCeremony{subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
+	service.ceremonies[token] = passkeyCeremony{proofSessionID: proofSessionID, subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
 	service.mu.Unlock()
 	return enrollment, nil
 }
@@ -418,7 +421,13 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 		service.mu.Unlock()
 		return err
 	}
-	_, err := service.passkeys.finishRegistration(ceremony.data, request)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	proof, err := service.ownedSession(subject, ceremony.proofSessionID)
+	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) || service.closed {
+		return errors.New("passkey enrollment proof is no longer active")
+	}
+	_, err = service.passkeys.finishRegistration(ceremony.data, request)
 	if err != nil {
 		return fmt.Errorf("register passkey: %w", err)
 	}
@@ -492,6 +501,11 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	if copy.State == Expired {
 		service.mu.Unlock()
 		err = service.revokeCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		if err == nil {
+			service.mu.Lock()
+			session.accessToken, session.boundSecret = "", ""
+			service.mu.Unlock()
+		}
 		return publicSession(&copy), err
 	}
 	if session.State != AwaitingGitHub || session.nextPoll.After(service.now()) {

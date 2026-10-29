@@ -237,21 +237,37 @@ the deploy accordingly:
 Service mode emits structured (zap) logs, OpenTelemetry traces, and
 Prometheus metrics.
 
-- **Logs** — JSON by default. Control via `--log-level` and
+- **Logs** — unsampled JSON by default, with trace/span IDs on request logs. Control via `--log-level` and
   `--log-human` flags.
 - **Tracing** — opt in by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP
   gRPC) or `OTEL_TRACES_EXPORTER=console` (stdout, dev). Disabled if
   neither is set. `OTEL_DEPLOYMENT_ENVIRONMENT` adds a deployment
-  environment resource attribute. Spans wrap the `/token/<key>`
-  handler with attributes for the key, k8s subject, and outcome.
+  environment resource attribute. All HTTP routes extract incoming trace context;
+  authentication and GitHub/Kubernetes/OAuth calls create child spans and
+  propagate context. Dependency attributes omit URLs, headers and bodies.
 - **Metrics** — scrapeable on a separate listener (default `:9100`,
   configurable via `--metrics-listen`). Exported series:
   - `keymint_mint_requests_total{outcome,key}`
   - `keymint_mint_duration_seconds{key}` (histogram)
   - `keymint_mint_in_flight`
   - `keymint_tokenreviews_total{result}`
-  - `keymint_github_api_latency_seconds{status}` (histogram)
-  - `keymint_jwt_clock_offset_seconds`
+  - `keymint_github_api_latency_seconds{status,api_base_url}` (histogram)
+  - `keymint_jwt_clock_offset_seconds{api_base_url}`
+
+Additional route metrics are `keymint_http_requests_total{route,method,status}`,
+`keymint_http_duration_seconds{route}` and `keymint_http_in_flight`. Routes use
+registered patterns, with a fixed unmatched label. Internal operations expose
+`keymint_operations_total{operation,outcome}` and
+`keymint_operation_duration_seconds{operation}` for authentication, cache/refresh,
+revocation, journal writes and reloads. Cleanup gauges are
+`keymint_credential_cleanup_records`, `keymint_credential_cleanup_due`, and
+`keymint_credential_cleanup_oldest_overdue_seconds`. Alert on sustained due work,
+increasing overdue age, journal errors and failed reloads. Per-endpoint breaker
+state is `keymint_github_endpoint_breaker_state{api_base_url}`.
+
+Dashboards using the exchange latency or clock offset metrics must account for
+the new `api_base_url` label. These signals cover the service's application paths;
+cluster scrape, exporter delivery and alert routing still require deployment checks.
 
 The metrics listener should be reachable only from your monitoring
 namespace; use a NetworkPolicy to lock it down.

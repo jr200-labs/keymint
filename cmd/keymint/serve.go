@@ -85,13 +85,13 @@ SOPS files.`,
 
 			m := keymintMetrics.New()
 
-			cfg, err := config.Load(configPath)
+			cfg, err := loadServiceConfig(configPath)
 			if err != nil {
 				return err
 			}
 
-			if len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
-				return errors.New("serve: emergency_state_file is required for recoverable credential revocation")
+			if (certFile == "") != (keyFile == "") {
+				return errors.New("TLS certificate and key must be configured together")
 			}
 
 			reviewer, err := server.NewK8sTokenReviewer(cfg.ExpectedAudiences)
@@ -155,37 +155,42 @@ SOPS files.`,
 			// look like under the hood) — re-establish the watch in
 			// that case.
 			watcherStop := make(chan struct{})
-			go watchConfigFile(configPath, watcherStop, func() {
-				started := time.Now()
-				outcome := "error"
-				defer func() {
-					m.OperationsTotal.WithLabelValues("config_reload", outcome).Inc()
-					m.OperationDuration.WithLabelValues("config_reload").Observe(time.Since(started).Seconds())
-				}()
-				newCfg, err := config.Load(configPath)
-				if err != nil {
-					log.Error("config reload failed; keeping previous config", zap.Error(err))
-					return
-				}
-				if err := srv.ValidateReload(newCfg); err != nil {
-					log.Error("config reload requires restart or correction", zap.Error(err))
-					return
-				}
-				if err := tokens.Reload(newCfg); err != nil {
-					log.Error("config reload watcher reconciliation failed", zap.Error(err))
-					return
-				}
-				if err := srv.Reload(newCfg); err != nil {
-					log.Error("config reload validation failed; keeping previous config", zap.Error(err))
-					return
-				}
-				outcome = "success"
-				log.Info("config hot-reloaded",
-					zap.Int("keys", len(newCfg.Keys)),
-					zap.Int("allowlist_entries", len(newCfg.Allowlist)),
-				)
-			})
-			defer close(watcherStop)
+			var watcherWorkers sync.WaitGroup
+			watcherWorkers.Add(1)
+			go func() {
+				defer watcherWorkers.Done()
+				watchConfigFile(configPath, watcherStop, func() {
+					started := time.Now()
+					outcome := "error"
+					defer func() {
+						m.OperationsTotal.WithLabelValues("config_reload", outcome).Inc()
+						m.OperationDuration.WithLabelValues("config_reload").Observe(time.Since(started).Seconds())
+					}()
+					newCfg, err := loadServiceConfig(configPath)
+					if err != nil {
+						log.Error("config reload failed; keeping previous config", zap.Error(err))
+						return
+					}
+					if err := srv.ValidateReload(newCfg); err != nil {
+						log.Error("config reload requires restart or correction", zap.Error(err))
+						return
+					}
+					if err := tokens.Reload(newCfg); err != nil {
+						log.Error("config reload watcher reconciliation failed", zap.Error(err))
+						return
+					}
+					if err := srv.Reload(newCfg); err != nil {
+						log.Error("config reload validation failed; keeping previous config", zap.Error(err))
+						return
+					}
+					outcome = "success"
+					log.Info("config hot-reloaded",
+						zap.Int("keys", len(newCfg.Keys)),
+						zap.Int("allowlist_entries", len(newCfg.Allowlist)),
+					)
+				})
+			}()
+			defer func() { close(watcherStop); watcherWorkers.Wait() }()
 
 			// Pump the GitHub breaker state into a Prometheus gauge
 			// so operators can alert when it opens.
@@ -388,4 +393,15 @@ func pumpGitHubBreakerState(m *keymintMetrics.Metrics, stop <-chan struct{}) {
 			publish()
 		}
 	}
+}
+
+func loadServiceConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
+		return nil, errors.New("serve: emergency_state_file is required for recoverable credential revocation")
+	}
+	return cfg, nil
 }

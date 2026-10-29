@@ -23,6 +23,8 @@ func Setup(level string, humanReadable bool) {
 	} else {
 		cfg = zap.NewProductionConfig()
 	}
+	// Audit events must not disappear through message-based sampling.
+	cfg.Sampling = nil
 	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
 
 	logger, err := cfg.Build(zap.AddStacktrace(zapcore.ErrorLevel))

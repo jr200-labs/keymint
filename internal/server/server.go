@@ -149,6 +149,8 @@ type Server struct {
 	metrics   *metrics.Metrics
 	emergency *emergency.Service
 
+	workers     sync.WaitGroup
+	stopOnce    sync.Once
 	janitorStop chan struct{} // closed by Stop() to halt limiter GC goroutines
 }
 
@@ -286,10 +288,11 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 	if len(emergencyServices) != 0 {
 		s.emergency = emergencyServices[0]
 	}
-	go s.auth.preAuthLimit.runJanitor(s.janitorStop)
-	go s.auth.subjectLimit.runJanitor(s.janitorStop)
+	preAuthLimit, subjectLimit := s.auth.preAuthLimit, s.auth.subjectLimit
+	s.runBackground(func() { preAuthLimit.runJanitor(s.janitorStop) })
+	s.runBackground(func() { subjectLimit.runJanitor(s.janitorStop) })
 	if s.emergency != nil {
-		go s.runEmergencyJanitor()
+		s.runBackground(s.runEmergencyJanitor)
 	}
 	return s, nil
 }
@@ -311,16 +314,13 @@ func (s *Server) runEmergencyJanitor() {
 	}
 }
 
-// Stop releases background goroutines (rate-limiter janitors). Safe
-// to call multiple times.
-func (s *Server) Stop() {
-	select {
-	case <-s.janitorStop:
-		// already closed
-	default:
-		close(s.janitorStop)
-	}
+func (s *Server) runBackground(work func()) {
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); work() }()
 }
+
+// Stop joins background janitors. Safe to call multiple times.
+func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.janitorStop) }); s.workers.Wait() }
 
 // buildSnapshot precomputes the subject -> keys allow map and
 // parsed trusted-proxy CIDRs for fast lookup at request time.
@@ -694,7 +694,7 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	logging.FromContext(r.Context()).Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
-		zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
+		zap.String("destination_key_id", destination.KeyID), zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
 	writeJSON(w, sealed)
 }
 

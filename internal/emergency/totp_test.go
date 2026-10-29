@@ -12,7 +12,7 @@ func TestTOTPRejectsReplayAndSharesAttemptBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	service.now = func() time.Time { return time.Unix(59, 0) }
 	secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 	if err = service.verifyTOTPCode(secret, "287082"); err != nil {

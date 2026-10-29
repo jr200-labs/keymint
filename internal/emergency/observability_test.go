@@ -20,7 +20,7 @@ func TestCleanupAndJournalFailureObservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	profile := config.EmergencyProfile{ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}}
 	if err = service.rememberCredential(context.Background(), "session", profile, "token", "", time.Now().Add(-time.Minute)); err != nil {
 		t.Fatal(err)

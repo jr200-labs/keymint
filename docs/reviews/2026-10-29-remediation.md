@@ -26,7 +26,7 @@ findings, not a claim that deployment has been changed.
 - [x] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
 - [x] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
 - [x] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
-- [ ] 20 Add regression coverage for emergency HTTP routes, passkey verification, startup/cache orchestration, and failure/interleaving cases; run final race tests, vet and vulnerability scan.
+- [x] 20 Add regression coverage for emergency HTTP routes, passkey verification, startup/cache orchestration, and failure/interleaving cases; run final race tests, vet and vulnerability scan.
 
 ## Baseline verification
 
@@ -198,3 +198,39 @@ proxy handling, two-tier limits, coalesced TokenReview/cache access, error
 classification, tracing and metrics. Mint authorization uses one immutable
 configuration snapshot. Verified one TokenReview across both route families,
 existing auth failure/cache/rate-limit regressions, and race-enabled tests.
+
+
+### 20 Regression suite and final verification
+
+Added authenticated/denied HTTP coverage across every emergency API route,
+synthetic WebAuthn registration and signed assertions, wrong-origin rejection,
+and revoked enrollment-proof rejection. Startup tests enforce durable emergency
+storage; broker tests cover the extracted cache/startup orchestration. Final
+hardening disables HTTP response caching and log sampling, observes panics,
+bounds reload cleanup, and joins janitors/watchers before closing resources.
+Expired-session cleanup clears credentials after successful revocation.
+
+Final verification:
+
+- `go test -race -coverprofile=/tmp/keymint-remediation-coverage.out -timeout=10m ./...`: pass.
+- Overall statement coverage: **66.1%**, up from 49.8%; broker 80.6%, emergency
+  73.7%, server 77.4%. This is regression coverage, not proof of every branch;
+  Cobra command entrypoints and live service startup retain limited coverage.
+- `go vet ./...`: pass.
+- Shared golangci-lint configuration: **0 issues**. Used the broker-attached
+  github-action-templates configuration locally instead of Makefile's remote
+  curl sync; no shared workflow or configuration files were changed.
+- `CGO_ENABLED=0 go build -o /tmp/keymint-review ./cmd/keymint`: pass.
+- `govulncheck@v1.9.0 -show verbose ./...`: no affected code or imported
+  packages. Module-only advisories GO-2026-6866, GO-2026-6860 and GO-2026-5932
+  concern packages this binary does not import; dependencies were not upgraded.
+- `git diff --check`: pass. Root `preview-checkpoint.json` is absent, so no
+  checkpoint command is declared.
+
+Deployment migration: configure `release_keys.*.github_key` with scoped GitHub
+Secrets read access; persist `emergency_state_file` and its adjacent mode-0600
+`.cleanup-key` together, with one service replica owning the store. Audience,
+passkey and journal changes require restart. Update dashboards for endpoint
+labels on latency/clock metrics and the new revocation-pending lifecycle state.
+Live GitHub/Kubernetes, physical passkeys, exporter delivery, deployed network
+policy/RBAC, and external reusable workflow execution remain deployment checks.

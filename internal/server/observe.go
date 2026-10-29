@@ -40,6 +40,7 @@ func (s *Server) observeHTTP(next http.Handler) http.Handler {
 		ctx, span := tracer.Start(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)), "http.request", trace.WithSpanKind(trace.SpanKindServer))
 		defer span.End()
 		r = r.WithContext(ctx)
+		w.Header().Set("Cache-Control", "no-store")
 		started := time.Now()
 		wrapped := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		if s.metrics != nil {
@@ -47,6 +48,10 @@ func (s *Server) observeHTTP(next http.Handler) http.Handler {
 			defer s.metrics.HTTPInFlight.Dec()
 		}
 		defer func() {
+			recovered := recover()
+			if recovered != nil {
+				wrapped.status = http.StatusInternalServerError
+			}
 			route := r.Pattern
 			if route == "" {
 				route = "unmatched"
@@ -66,6 +71,9 @@ func (s *Server) observeHTTP(next http.Handler) http.Handler {
 			if s.metrics != nil {
 				s.metrics.HTTPRequests.WithLabelValues(route, method, strconv.Itoa(wrapped.status)).Inc()
 				s.metrics.HTTPDuration.WithLabelValues(route).Observe(time.Since(started).Seconds())
+			}
+			if recovered != nil {
+				panic(recovered)
 			}
 		}()
 		next.ServeHTTP(wrapped, r)

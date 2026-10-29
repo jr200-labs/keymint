@@ -46,7 +46,7 @@ func TestCleanupRecoversAfterCrashAndRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recovered.Close()
+	defer func() { _ = recovered.Close() }()
 	if calls != 1 {
 		t.Fatalf("recovery attempts=%d", calls)
 	}
@@ -85,7 +85,7 @@ func TestProfileRemovalRetainsFailedCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	service.sessions["session"] = &Session{ID: "session", Profile: "human", subject: "caller", State: Active, ExpiresAt: time.Now().Add(time.Hour), accessToken: "token"}
 	if err = service.rememberCredential(context.Background(), "session", profile, "token", "", time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestPartialIssuanceRetainsCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	session := &Session{ID: "session", subject: "caller", State: Active, ExpiresAt: time.Now().Add(time.Hour), profile: config.EmergencyProfile{Provider: "kubernetes", Namespace: "ops", ServiceAccount: "admin"}}
 	service.sessions[session.ID] = session
 	if _, err = service.Credential(context.Background(), "caller", session.ID); err == nil {
@@ -157,7 +157,7 @@ func TestCleanupFailureUsesConfiguredLogger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	service.sessions["session"] = &Session{ID: "session", Profile: "removed", subject: "caller", State: Active, profile: profile}
 	if err = service.rememberCredential(context.Background(), "session", profile, "token", "", time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)

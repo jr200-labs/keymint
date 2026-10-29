@@ -32,7 +32,7 @@ func TestIssuanceDoesNotBlockOtherSessionsAndRejectsReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	profile := config.EmergencyProfile{Provider: "kubernetes", Namespace: "ops", ServiceAccount: "limited"}
 	service.sessions["issuing"] = &Session{ID: "issuing", subject: "caller", profile: profile, State: Active, ExpiresAt: time.Now().Add(time.Minute)}
 	service.sessions["other"] = &Session{ID: "other", subject: "caller", profile: profile, State: Active, ExpiresAt: time.Now().Add(time.Minute)}

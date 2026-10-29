@@ -47,7 +47,7 @@ func TestOAuthPollSerializesWithRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	session, err := svc.Create(context.Background(), "allowed", "operator", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestReloadInvalidatesChangedProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	svc.now = func() time.Time { return time.Unix(59, 0) }
 	session, err := svc.Create(context.Background(), "allowed", "operator", time.Minute)
 	if err != nil {

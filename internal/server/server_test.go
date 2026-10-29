@@ -47,6 +47,7 @@ func newTestServer(t *testing.T, cfg *config.Config, mint MintFunc, reviewer Tok
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(srv.Stop)
 	return httptest.NewServer(srv.Routes())
 }
 

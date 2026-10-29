@@ -152,6 +152,9 @@ func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 	}
 	var result error
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(result, err)
+		}
 		service.mu.Lock()
 		session, live := service.sessions[record.ID]
 		busy := live && session.operation != idle

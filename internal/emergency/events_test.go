@@ -68,7 +68,7 @@ func TestFailedActivationEventDoesNotAuthorizeSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	session := &Session{ID: "session", subject: "caller", State: AwaitingTOTP, ExpiresAt: time.Now().Add(time.Minute)}
 	service.sessions[session.ID] = session
 	_, err = service.events.db.Exec(`CREATE TRIGGER reject_activation BEFORE INSERT ON emergency_events WHEN NEW.type='session.activated' BEGIN SELECT RAISE(ABORT,'injected journal failure'); END`)
@@ -91,7 +91,7 @@ func TestRevocationRecordsTerminalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	service.sessions["session"] = &Session{ID: "session", subject: "caller", State: Active, ExpiresAt: time.Now().Add(time.Minute)}
 	if err = service.Revoke(context.Background(), "caller", "session"); err != nil {
 		t.Fatal(err)
