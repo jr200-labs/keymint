@@ -1,4 +1,4 @@
-package main
+package broker
 
 import (
 	"github.com/jr200-labs/keymint/internal/config"

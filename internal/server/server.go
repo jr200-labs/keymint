@@ -39,7 +39,6 @@ import (
 	"os"
 	"reflect"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -65,37 +64,13 @@ import (
 // tracer is the OTel tracer used for spans emitted by this package.
 var tracer trace.Tracer = otel.Tracer("github.com/jr200-labs/keymint/internal/server")
 
-// TokenScope limits the repositories and permissions of an installation token.
-type TokenScope struct {
-	Repositories []string          `json:"repositories,omitempty"`
-	Permissions  map[string]string `json:"permissions,omitempty"`
-}
+// TokenScope is shared with the installation-token broker.
+type TokenScope = mint.Scope
 
-// MintFunc injects token issuance without coupling the server to private-key
-// loading. Permission rejections wrap mint.ErrPermissionsNotGranted.
-type MintFunc func(ctx context.Context, key config.Key, scope TokenScope) (token string, expiresAt time.Time, err error)
+// MintFunc injects installation issuance.
+type MintFunc func(context.Context, config.Key, mint.Scope) (string, time.Time, error)
 
 var repositoryName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
-
-func (scope TokenScope) Validate() error {
-	if len(scope.Repositories) > 100 {
-		return errors.New("token scope exceeds 100 repositories")
-	}
-	seen := map[string]bool{}
-	for _, repository := range scope.Repositories {
-		if !repositoryName.MatchString(repository) || seen[repository] {
-			return errors.New("token scope contains an invalid or duplicate repository")
-		}
-		seen[repository] = true
-	}
-	for permission, access := range scope.Permissions {
-		if !repositoryName.MatchString(permission) || !slices.Contains([]string{"read", "write", "admin", "triage", "maintain"}, access) {
-			return errors.New("token scope contains an invalid permission")
-		}
-	}
-	sort.Strings(scope.Repositories)
-	return nil
-}
 
 // configSnapshot is an immutable view of the config + the
 // pre-computed allowedSubject lookup, swapped atomically when

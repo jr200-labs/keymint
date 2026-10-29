@@ -24,7 +24,7 @@ findings, not a claim that deployment has been changed.
 - [x] 15 Use the configured zap logger consistently for emergency lifecycle failures.
 - [x] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
 - [x] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
-- [ ] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
+- [x] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
 - [ ] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
 - [ ] 20 Add regression coverage for emergency HTTP routes, passkey verification, startup/cache orchestration, and failure/interleaving cases; run final race tests, vet and vulnerability scan.
 
@@ -181,3 +181,12 @@ Tests cover terminal guards, concurrent OAuth/revocation serialization, unrelate
 session progress during blocked issuance, and invalidation of late issuance.
 Race-enabled emergency/server tests pass. Public session copies discard private
 profile and operation metadata.
+
+### 18 Installation-token broker module
+
+Moved caches, freshness states, singleflight, bounded cooldowns and reconciled
+PEM watchers into internal/broker with Mint/Reload/Close. Refreshes have at most
+one background worker per cache entry and shutdown cancels outstanding work.
+Clock and exchange seams support interface-level tests. Verified coalesced
+misses, scope separation, valid/expired fallback, refresh cooldown, rotation and
+shutdown cancellation under the race detector; the full suite passes.

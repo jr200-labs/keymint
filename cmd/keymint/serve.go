@@ -2,11 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,7 +12,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/jr200-labs/keymint/internal/broker"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
 	"github.com/jr200-labs/keymint/internal/logging"
@@ -28,50 +24,6 @@ import (
 	"github.com/sony/gobreaker/v2"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
-	"golang.org/x/sync/singleflight"
-)
-
-// keyCacheEntry remembers a parsed signing key (RSA or Ed25519)
-// plus the mtime/size of the file it came from so we can detect
-// operator-driven rotations of the underlying mounted Secret
-// without restarting the pod.
-type keyCacheEntry struct {
-	key   crypto.PrivateKey
-	mtime time.Time
-	size  int64
-}
-
-// cachedToken is the in-memory copy of an installation token + its
-// GitHub-reported expiry.
-type cachedToken struct {
-	Token     string
-	ExpiresAt time.Time
-}
-
-// Token freshness thresholds. The 5-min cutoff bounds the staleness
-// we will hand back; below that we kick off a background refresh.
-// Below 1 min we block until the refresh completes — at that point
-// the existing token is too close to expiry to risk handing out.
-const (
-	freshFor          = 5 * time.Minute
-	backgroundRefresh = 1 * time.Minute
-
-	// refreshFailureCooldown — after a background refresh fails
-	// (typically because GitHub is down or the breaker is open),
-	// suppress further background refreshes for this window so we
-	// don't spawn a goroutine + log a warning per inbound request.
-	// The next request after the cooldown re-attempts.
-	refreshFailureCooldown = 15 * time.Second
-
-	// Cache sizing. Both the parsed-key cache and the issued-token
-	// cache key entries by (AppID, InstallationID, APIBaseURL,
-	// PrivateKeyFile, fsnotify generation). PEM/secret rotations
-	// produce stale keys with new generations; the LRU+TTL bounds
-	// memory so accumulated stale entries never leak.
-	keyCacheSize   = 256
-	keyCacheTTL    = 24 * time.Hour
-	tokenCacheSize = 1024
-	tokenCacheTTL  = 70 * time.Minute // GitHub installation tokens live 1h
 )
 
 // newServeCmd implements `keymint serve` — the in-cluster HTTP service
@@ -147,209 +99,11 @@ SOPS files.`,
 				return err
 			}
 
-			// Bounded caches: TTL-based eviction so PEM rotations
-			// (each yields a new generation in cacheKey) don't
-			// accumulate stale entries forever, and a hard size
-			// cap as a defence-in-depth against unbounded key churn.
-			keyCache := expirable.NewLRU[string, keyCacheEntry](keyCacheSize, nil, keyCacheTTL)
-			tokenCache := expirable.NewLRU[string, cachedToken](tokenCacheSize, nil, tokenCacheTTL)
-			var sf singleflight.Group
-			// refreshCooldownUntil tracks the wall-clock time before
-			// which a background refresh for a given cacheKey should
-			// be skipped, after a previous refresh attempt failed.
-			// Prevents the goroutine + log stampede described in the
-			// "thundering herd against a closed circuit" failure mode.
-			var refreshCooldownUntil sync.Map // cacheKey -> time.Time
-
-			// pemGeneration is bumped whenever fsnotify reports a
-			// PEM directory has changed. The hot mintFn path folds
-			// the current value into its cache key so a rotation
-			// invalidates cached tokens for that PEM without the
-			// cost of an os.Stat on every inbound HTTP request.
-			pemGenerations := pemGenerationTracker{}
-			if err := pemGenerations.reload(cfg, log); err != nil {
+			tokens, err := broker.New(cfg, broker.Options{Timeout: mintTimeout, Metrics: m})
+			if err != nil {
 				return err
 			}
-			defer pemGenerations.close()
-
-			// loadKey reads the PEM file, parses it, and caches the
-			// result keyed by `cacheKey`. Honours operator-driven
-			// rotation by comparing the on-disk file's mtime+size
-			// against the cached version.
-			loadKey := func(ctx context.Context, cacheKey string, k config.Key) (crypto.PrivateKey, error) {
-				path := k.PrivateKeyFile
-				if path == "" {
-					return nil, fmt.Errorf("serve: key %q: private_key_file required in service mode", cacheKey)
-				}
-				st, err := os.Stat(path)
-				if err != nil {
-					return nil, fmt.Errorf("serve: stat key file %s: %w", path, err)
-				}
-
-				if cached, hit := keyCache.Get(cacheKey); hit && cached.mtime.Equal(st.ModTime()) && cached.size == st.Size() {
-					return cached.key, nil
-				}
-
-				pemBytes, err := readPEM(ctx, k)
-				if err != nil {
-					return nil, err
-				}
-				priv, err := mint.ParsePrivateKey(pemBytes)
-				if err != nil {
-					return nil, err
-				}
-				keyCache.Add(cacheKey, keyCacheEntry{key: priv, mtime: st.ModTime(), size: st.Size()})
-				return priv, nil
-			}
-
-			// doMint runs the full PEM-load + JWT + GitHub round-trip
-			// once and caches the result. Always called under
-			// singleflight so concurrent callers for the same key
-			// collapse into one outbound request.
-			doMint := func(ctx context.Context, cacheKey string, k config.Key, scope server.TokenScope) (result cachedToken, mintErr error) {
-				started := time.Now()
-				defer func() { m.ObserveOperation("token_refresh", started, mintErr) }()
-				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
-				defer cancel()
-
-				priv, err := loadKey(ctx, cacheKey, k)
-				if err != nil {
-					return cachedToken{}, err
-				}
-				tok, err := mint.Mint(ctx, mint.Request{
-					AppID:          k.AppID,
-					InstallationID: k.InstallationID,
-					Repositories:   scope.Repositories,
-					Permissions:    scope.Permissions,
-					PrivateKey:     priv,
-					APIBaseURL:     k.APIBaseURL,
-					OnExchange: func(apiBase, status string, duration time.Duration) {
-						m.GitHubAPILatency.WithLabelValues(status, apiBase).Observe(duration.Seconds())
-					},
-					OnClockOffset: func(apiBase string, offset time.Duration) {
-						m.JWTClockOffsetSeconds.WithLabelValues(apiBase).Set(offset.Seconds())
-					},
-					OnRateLimit: func(apiBase string, remaining int64, resetAt time.Time) {
-						m.GitHubRateLimitRemaining.WithLabelValues(apiBase).Set(float64(remaining))
-						if !resetAt.IsZero() {
-							m.GitHubRateLimitResetUnix.WithLabelValues(apiBase).Set(float64(resetAt.Unix()))
-						}
-					},
-				})
-				if err != nil {
-					return cachedToken{}, err
-				}
-				ct := cachedToken{Token: tok.Token, ExpiresAt: tok.ExpiresAt}
-				tokenCache.Add(cacheKey, ct)
-				return ct, nil
-			}
-
-			mintFn := func(ctx context.Context, k config.Key, scope server.TokenScope) (string, time.Time, error) {
-				// Cache key MUST disambiguate every dimension that
-				// could affect the minted token. AppID + InstallID
-				// alone collide if two configs reuse the same
-				// numeric IDs against different API endpoints or
-				// different PEM files. Include APIBaseURL, PEM path,
-				// and a generation counter that fsnotify increments
-				// on rotation so that operator-driven Secret swaps
-				// immediately invalidate cached tokens — without
-				// imposing an os.Stat syscall on every inbound HTTP
-				// request.
-				gen := pemGenerations.current(k.PrivateKeyFile)
-				encodedScope, err := json.Marshal(scope)
-				if err != nil {
-					return "", time.Time{}, fmt.Errorf("encode token scope: %w", err)
-				}
-				scopeDigest := sha256.Sum256(encodedScope)
-				cacheKey := fmt.Sprintf("%d|%d|%s|%s|%d|%x",
-					k.AppID, k.InstallationID, k.APIBaseURL,
-					k.PrivateKeyFile, gen, scopeDigest)
-
-				ct, hasToken := tokenCache.Get(cacheKey)
-
-				if hasToken {
-					timeLeft := time.Until(ct.ExpiresAt)
-					switch {
-					case timeLeft > freshFor:
-						m.OperationsTotal.WithLabelValues("token_cache", "fresh").Inc()
-						// Fast path — comfortably within validity.
-						return ct.Token, ct.ExpiresAt, nil
-
-					case timeLeft > backgroundRefresh:
-						m.OperationsTotal.WithLabelValues("token_cache", "refreshing").Inc()
-						// Background refresh: hand back the still-valid
-						// cached token and kick off an async refresh
-						// (singleflight collapses concurrent triggers).
-						//
-						// Skip the spawn entirely if a recent attempt
-						// failed and we're still inside its cooldown —
-						// otherwise an open-circuit GitHub outage
-						// produces one goroutine + warning log per
-						// inbound request.
-						if v, ok := refreshCooldownUntil.Load(cacheKey); ok {
-							if time.Now().Before(v.(time.Time)) {
-								return ct.Token, ct.ExpiresAt, nil
-							}
-						}
-						go func() {
-							ctx, cancel := context.WithTimeout(context.Background(), mintTimeout)
-							defer cancel()
-							_, err, _ := sf.Do(cacheKey, func() (any, error) {
-								return doMint(ctx, cacheKey, k, scope)
-							})
-							if err != nil {
-								refreshCooldownUntil.Store(cacheKey,
-									time.Now().Add(refreshFailureCooldown))
-								zap.L().Warn("background refresh failed",
-									zap.String("cache_key", cacheKey),
-									zap.Duration("cooldown", refreshFailureCooldown),
-									zap.Error(err))
-							} else {
-								refreshCooldownUntil.Delete(cacheKey)
-							}
-						}()
-						return ct.Token, ct.ExpiresAt, nil
-					}
-					// Otherwise fall through and synchronously refresh.
-				}
-
-				v, err, _ := sf.Do(cacheKey, func() (any, error) {
-					// Re-check cache under singleflight — a parallel
-					// caller may have just refreshed it.
-					if ct, ok := tokenCache.Get(cacheKey); ok && time.Until(ct.ExpiresAt) > backgroundRefresh {
-						return ct, nil
-					}
-
-					// Detach from the inbound HTTP context: singleflight
-					// shares the result with all coalesced waiters, so
-					// if the *first* caller disconnects, its
-					// context.Canceled would otherwise propagate to
-					// every other live waiter and fail their requests.
-					// context.WithoutCancel preserves trace/baggage
-					// values but drops Done/Err; doMint applies
-					// mintTimeout internally.
-					return doMint(context.WithoutCancel(ctx), cacheKey, k, scope)
-				})
-				if err != nil {
-					// Synchronous refresh failed (GitHub timeout, 5xx,
-					// etc.). If the previously cached token has any
-					// life left at all, prefer handing it back over
-					// failing the request — callers can use it now
-					// and the next call will retry the refresh.
-					stale, hasStale := tokenCache.Get(cacheKey)
-					if hasStale && time.Until(stale.ExpiresAt) > 0 {
-						m.OperationsTotal.WithLabelValues("token_cache", "fallback").Inc()
-						zap.L().Warn("synchronous refresh failed; serving previously-cached token",
-							zap.String("cache_key", cacheKey),
-							zap.Duration("remaining", time.Until(stale.ExpiresAt)),
-							zap.Error(err))
-						return stale.Token, stale.ExpiresAt, nil
-					}
-					return "", time.Time{}, err
-				}
-				ct = v.(cachedToken)
-				return ct.Token, ct.ExpiresAt, nil
-			}
+			defer tokens.Close()
 
 			issuer, err := emergency.NewKubernetesIssuer()
 			if err != nil {
@@ -365,7 +119,7 @@ SOPS files.`,
 					log.Error("close emergency event state", zap.Error(err))
 				}
 			}()
-			srv, err := server.New(cfg, mintFn, reviewer, m, emergencyService)
+			srv, err := server.New(cfg, tokens.Mint, reviewer, m, emergencyService)
 			if err != nil {
 				return err
 			}
@@ -417,7 +171,7 @@ SOPS files.`,
 					log.Error("config reload requires restart or correction", zap.Error(err))
 					return
 				}
-				if err := pemGenerations.reload(newCfg, log); err != nil {
+				if err := tokens.Reload(newCfg); err != nil {
 					log.Error("config reload watcher reconciliation failed", zap.Error(err))
 					return
 				}
