@@ -22,7 +22,7 @@ findings, not a claim that deployment has been changed.
 - [x] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
 - [x] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
 - [x] 15 Use the configured zap logger consistently for emergency lifecycle failures.
-- [ ] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
+- [x] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
 - [ ] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
 - [ ] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
 - [ ] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
@@ -161,3 +161,11 @@ Emergency lifecycle errors use the configured zap logger and handler logs carry
 trace correlation. Raw upstream error bodies are no longer exposed in responses
 or logs. A zap observer verifies cleanup errors use the configured logger;
 race-enabled emergency, server and mint tests pass.
+
+### 16 Internal failure and backlog signals
+
+Added bounded operation outcomes/durations for token refresh, fallback, config
+reload, durable journal writes and credential revocation. Cleanup gauges expose
+tracked, due and overdue work; breaker gauges identify each endpoint. Failure
+injection verifies journal/revocation error counters and due backlog. Full race
+suite and the focused observability regression pass.

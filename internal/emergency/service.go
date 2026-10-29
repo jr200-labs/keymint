@@ -27,6 +27,7 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
+	"github.com/jr200-labs/keymint/internal/metrics"
 	"go.uber.org/zap"
 )
 
@@ -109,6 +110,7 @@ type TokenIssuer interface {
 }
 
 type Service struct {
+	metrics                *metrics.Metrics
 	mu                     sync.Mutex
 	revision               uint64
 	profiles               map[string]config.EmergencyProfile
@@ -126,7 +128,7 @@ type Service struct {
 
 const maxSessions = 1024
 
-func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service, error) {
+func New(cfg *config.Config, client *http.Client, issuer TokenIssuer, instruments ...*metrics.Metrics) (*Service, error) {
 	manager, err := newPasskeys(cfg.Passkeys)
 	if err != nil {
 		return nil, err
@@ -141,6 +143,10 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 		return nil, err
 	}
 	service := &Service{cleanup: cleanup, http: tracing.HTTPClient(client), issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	if len(instruments) > 0 {
+		service.metrics = instruments[0]
+		events.metrics = instruments[0]
+	}
 	if cfg.Passkeys != nil {
 		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
 	}
@@ -770,8 +776,9 @@ func githubIdentity(profile config.EmergencyProfile) (string, string, []int64, e
 	return clientID, clientSecret, allowed, nil
 }
 
-func (service *Service) revokeCredential(ctx context.Context, credential revokedCredential) error {
-	var result error
+func (service *Service) revokeCredential(ctx context.Context, credential revokedCredential) (result error) {
+	started := time.Now()
+	defer func() { service.metrics.ObserveOperation("credential_revoke", started, result) }()
 	if credential.token != "" {
 		clientID, clientSecret, _, err := githubIdentity(credential.profile)
 		if err != nil {

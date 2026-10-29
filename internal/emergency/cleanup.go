@@ -145,6 +145,7 @@ func (service *Service) rememberCredential(ctx context.Context, id string, profi
 	return service.cleanup.put(ctx, cleanupRecord{ID: id, Profile: profile, Token: token, Secret: secret, Due: due})
 }
 func (service *Service) drainCleanup(ctx context.Context, all bool) error {
+	defer service.observeCleanup()
 	records, err := service.cleanup.list(ctx)
 	if err != nil {
 		return err
@@ -162,4 +163,29 @@ func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 		}
 	}
 	return result
+}
+
+func (service *Service) observeCleanup() {
+	if service.metrics == nil {
+		return
+	}
+	records, err := service.cleanup.list(context.Background())
+	if err != nil {
+		return
+	}
+	due, oldest := 0, 0.0
+	service.mu.Lock()
+	for _, record := range records {
+		session := service.sessions[record.ID]
+		if session == nil || !record.Due.After(service.now()) {
+			due++
+			if age := service.now().Sub(record.Due).Seconds(); age > oldest {
+				oldest = age
+			}
+		}
+	}
+	service.mu.Unlock()
+	service.metrics.CleanupRecords.Set(float64(len(records)))
+	service.metrics.CleanupDue.Set(float64(due))
+	service.metrics.CleanupOldestSeconds.Set(oldest)
 }

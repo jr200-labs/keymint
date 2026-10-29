@@ -456,3 +456,21 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 	}
 	return exchangeResult{token: tok}, nil
 }
+
+// GithubBreakerStates reports the bounded set of configured endpoints observed.
+func GithubBreakerStates() map[string]int {
+	result := map[string]int{}
+	githubBreakers.Range(func(key, value any) bool {
+		state := value.(*gobreaker.CircuitBreaker[exchangeResult]).State()
+		switch state {
+		case gobreaker.StateClosed:
+			result[key.(string)] = 0
+		case gobreaker.StateHalfOpen:
+			result[key.(string)] = 1
+		case gobreaker.StateOpen:
+			result[key.(string)] = 2
+		}
+		return true
+	})
+	return result
+}

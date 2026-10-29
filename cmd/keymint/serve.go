@@ -206,7 +206,9 @@ SOPS files.`,
 			// once and caches the result. Always called under
 			// singleflight so concurrent callers for the same key
 			// collapse into one outbound request.
-			doMint := func(ctx context.Context, cacheKey string, k config.Key, scope server.TokenScope) (cachedToken, error) {
+			doMint := func(ctx context.Context, cacheKey string, k config.Key, scope server.TokenScope) (result cachedToken, mintErr error) {
+				started := time.Now()
+				defer func() { m.ObserveOperation("token_refresh", started, mintErr) }()
 				ctx, cancel := context.WithTimeout(ctx, mintTimeout)
 				defer cancel()
 
@@ -269,10 +271,12 @@ SOPS files.`,
 					timeLeft := time.Until(ct.ExpiresAt)
 					switch {
 					case timeLeft > freshFor:
+						m.OperationsTotal.WithLabelValues("token_cache", "fresh").Inc()
 						// Fast path — comfortably within validity.
 						return ct.Token, ct.ExpiresAt, nil
 
 					case timeLeft > backgroundRefresh:
+						m.OperationsTotal.WithLabelValues("token_cache", "refreshing").Inc()
 						// Background refresh: hand back the still-valid
 						// cached token and kick off an async refresh
 						// (singleflight collapses concurrent triggers).
@@ -334,6 +338,7 @@ SOPS files.`,
 					// and the next call will retry the refresh.
 					stale, hasStale := tokenCache.Get(cacheKey)
 					if hasStale && time.Until(stale.ExpiresAt) > 0 {
+						m.OperationsTotal.WithLabelValues("token_cache", "fallback").Inc()
 						zap.L().Warn("synchronous refresh failed; serving previously-cached token",
 							zap.String("cache_key", cacheKey),
 							zap.Duration("remaining", time.Until(stale.ExpiresAt)),
@@ -351,7 +356,7 @@ SOPS files.`,
 				return err
 			}
 
-			emergencyService, err := emergency.New(cfg, &http.Client{Timeout: 15 * time.Second}, issuer)
+			emergencyService, err := emergency.New(cfg, &http.Client{Timeout: 15 * time.Second}, issuer, m)
 			if err != nil {
 				return err
 			}
@@ -397,6 +402,12 @@ SOPS files.`,
 			// that case.
 			watcherStop := make(chan struct{})
 			go watchConfigFile(configPath, watcherStop, func() {
+				started := time.Now()
+				outcome := "error"
+				defer func() {
+					m.OperationsTotal.WithLabelValues("config_reload", outcome).Inc()
+					m.OperationDuration.WithLabelValues("config_reload").Observe(time.Since(started).Seconds())
+				}()
 				newCfg, err := config.Load(configPath)
 				if err != nil {
 					log.Error("config reload failed; keeping previous config", zap.Error(err))
@@ -414,6 +425,7 @@ SOPS files.`,
 					log.Error("config reload validation failed; keeping previous config", zap.Error(err))
 					return
 				}
+				outcome = "success"
 				log.Info("config hot-reloaded",
 					zap.Int("keys", len(newCfg.Keys)),
 					zap.Int("allowlist_entries", len(newCfg.Allowlist)),
@@ -601,6 +613,9 @@ func pumpGitHubBreakerState(m *keymintMetrics.Metrics, stop <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	publish := func() {
+		for endpoint, state := range mint.GithubBreakerStates() {
+			m.GitHubEndpointBreakerState.WithLabelValues(endpoint).Set(float64(state))
+		}
 		switch mint.GithubBreakerState() {
 		case gobreaker.StateClosed:
 			m.GitHubBreakerState.Set(0)
