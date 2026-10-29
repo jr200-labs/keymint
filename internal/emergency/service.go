@@ -39,6 +39,7 @@ const (
 	Active          State = "active"
 	Expired         State = "expired"
 	Invalidated     State = "invalidated"
+	Revoked         State = "revoked"
 )
 
 type Profile struct {
@@ -305,11 +306,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		service.mu.Unlock()
 		return Session{}, errors.New("session capacity or authorization changed during creation")
 	}
-	service.sessions[session.ID] = session
-	service.mu.Unlock()
 	if err := service.record(ctx, "session.created", session); err != nil {
-		service.mu.Lock()
-		delete(service.sessions, session.ID)
 		for token, ceremony := range service.ceremonies {
 			if ceremony.sessionID == session.ID {
 				delete(service.ceremonies, token)
@@ -318,7 +315,10 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		service.mu.Unlock()
 		return Session{}, fmt.Errorf("record emergency session creation: %w", err)
 	}
-	return publicSession(session), nil
+	service.sessions[session.ID] = session
+	result := publicSession(session)
+	service.mu.Unlock()
+	return result, nil
 }
 
 func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (PasskeyEnrollment, error) {
@@ -381,10 +381,13 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 			service.mu.Unlock()
 			return errors.New("emergency session is unavailable")
 		}
-		session.State = Active
-		copy := *session
+		if !session.ExpiresAt.After(service.now()) {
+			service.mu.Unlock()
+			return errors.New("session expired during passkey verification")
+		}
+		err := service.transitionLocked(request.Context(), session, Active, "session.activated")
 		service.mu.Unlock()
-		return service.record(request.Context(), "session.activated", &copy)
+		return err
 	}
 	_, err := service.passkeys.finishRegistration(ceremony.data, request)
 	if err != nil {
@@ -400,13 +403,22 @@ func (service *Service) Prune(ctx context.Context) error {
 		credential revokedCredential
 	}
 	now := service.now()
+	var result error
 	service.mu.Lock()
 	var expired []expiredSession
 	for id, current := range service.sessions {
-		if current.ExpiresAt.After(now) {
+		if current.ExpiresAt.After(now) && current.State != Revoked {
 			continue
 		}
-		current.State = Expired
+		target, event := Expired, "session.expired"
+		if current.State == Revoked {
+			target, event = Revoked, "session.revoked"
+		}
+		if err := service.transitionLocked(ctx, current, target, event); err != nil {
+			current.State = target
+			result = errors.Join(result, err)
+			continue
+		}
 		profile := current.profile
 		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{id: current.ID, profile: profile, token: current.accessToken, secret: current.boundSecret}})
 		delete(service.sessions, id)
@@ -417,7 +429,6 @@ func (service *Service) Prune(ctx context.Context) error {
 		}
 	}
 	service.mu.Unlock()
-	var result error
 	for _, item := range expired {
 		if err := service.revokeCredential(ctx, item.credential); err != nil {
 			service.mu.Lock()
@@ -428,7 +439,7 @@ func (service *Service) Prune(ctx context.Context) error {
 			result = errors.Join(result, err)
 			continue
 		}
-		result = errors.Join(result, service.record(ctx, "session.expired", item.session))
+
 	}
 	return errors.Join(result, service.drainCleanup(ctx, false))
 }
@@ -514,13 +525,10 @@ func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 		return Session{}, err
 	}
 
-	session.State = Active
-	copy := *session
+	err = service.transitionLocked(context.Background(), session, Active, "session.activated")
+	result := publicSession(session)
 	service.mu.Unlock()
-	if err := service.record(context.Background(), "session.activated", &copy); err != nil {
-		return Session{}, err
-	}
-	return publicSession(&copy), nil
+	return result, err
 }
 
 func (service *Service) Credential(ctx context.Context, subject, id string) (Credential, error) {
@@ -605,9 +613,15 @@ func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 		service.mu.Unlock()
 		return err
 	}
+	if err := service.transitionLocked(ctx, session, Revoked, "session.revoked"); err != nil {
+		// Remote authority is gone; a failed journal must not reopen local access.
+		session.State = Revoked
+		service.mu.Unlock()
+		return err
+	}
 	delete(service.sessions, id)
 	service.mu.Unlock()
-	return service.record(ctx, "session.revoked", session)
+	return nil
 }
 
 func (service *Service) Events(ctx context.Context, subject, after string, wait time.Duration) (EventPage, error) {
@@ -879,4 +893,16 @@ func slicesSortProfiles(values []Profile) {
 			values[j], values[j-1] = values[j-1], values[j]
 		}
 	}
+}
+
+// transitionLocked commits the durable event before publishing new authority.
+// Callers hold mu, so activation cannot be journaled after a later revocation.
+func (service *Service) transitionLocked(ctx context.Context, session *Session, state State, event string) error {
+	next := *session
+	next.State = state
+	if err := service.record(ctx, event, &next); err != nil {
+		return err
+	}
+	session.State = state
+	return nil
 }

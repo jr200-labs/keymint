@@ -15,7 +15,7 @@ findings, not a claim that deployment has been changed.
 - [x] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
 - [x] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
 - [x] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
-- [ ] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
+- [x] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
 - [ ] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
 - [ ] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
 - [ ] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
@@ -109,3 +109,11 @@ Credential routing now compares parsed hostnames and ports to the configured
 GitHub endpoint, supports only HTTPS/SSH URL parsing, and the credential helper
 emits credentials only for HTTPS. Verified sibling-host, plaintext, public-host
 cross-routing and port mismatch rejection with race-enabled config/helper tests.
+
+### 09 Ordered durable lifecycle events
+
+Creation and activation journal before publishing authority while holding the
+session lock. Failed activation remains unauthorized. Explicit revocation emits
+a terminal Revoked state and retains a denied session if its event needs retry.
+Expiry journal failures remain denied and retryable. SQLite-trigger failure and
+revocation/restart regressions pass in race-enabled emergency/server tests.
