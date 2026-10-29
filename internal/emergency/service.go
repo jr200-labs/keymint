@@ -167,7 +167,6 @@ func (service *Service) Close() error {
 
 func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Lock()
-	oldProfiles := service.profiles
 	service.profiles = make(map[string]config.EmergencyProfile, len(cfg.EmergencyProfiles))
 	for name, profile := range cfg.EmergencyProfiles {
 		service.profiles[name] = profile
@@ -181,26 +180,24 @@ func (service *Service) Reload(cfg *config.Config) {
 			service.allowed[entry.Subject][name] = true
 		}
 	}
-	var revoked []revokedCredential
 	var invalidated []*Session
 	for id, session := range service.sessions {
 		if _, exists := service.profiles[session.Profile]; exists && service.allowed[session.subject][session.Profile] {
 			continue
 		}
-		if session.accessToken != "" || session.boundSecret != "" {
-			revoked = append(revoked, revokedCredential{id: session.ID, profile: oldProfiles[session.Profile], token: session.accessToken, secret: session.boundSecret})
-		}
+
 		copy := *session
 		copy.State = Invalidated
 		invalidated = append(invalidated, &copy)
 		delete(service.sessions, id)
 	}
 	service.mu.Unlock()
-	for _, credential := range revoked {
-		if err := service.revokeCredential(context.Background(), credential); err != nil {
-			slog.Error("revoke credential removed by config reload", "provider", credential.profile.Provider, "error", err)
+	if len(invalidated) > 0 {
+		if err := service.drainCleanup(context.Background(), false); err != nil {
+			slog.Error("retry credential cleanup after config reload", "error", err)
 		}
 	}
+
 	for _, session := range invalidated {
 		if err := service.record(context.Background(), "session.invalidated", session); err != nil {
 			slog.Error("record emergency session invalidated by config reload", "session", session.ID, "error", err)

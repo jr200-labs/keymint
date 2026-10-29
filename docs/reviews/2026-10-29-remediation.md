@@ -9,7 +9,7 @@ findings, not a claim that deployment has been changed.
 
 - [x] 01 P1 Bind release-key encryption to a broker-resolved GitHub repository public key; reject caller substitution.
 - [x] 02 P1 Recover remote credential cleanup after graceful shutdown and crash; metadata invalidation alone does not revoke OAuth credentials.
-- [ ] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
+- [x] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
 - [ ] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
 - [ ] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
 - [ ] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
@@ -66,3 +66,10 @@ simulate crash recovery, transient upstream failure, ciphertext storage, and
 shutdown with unexpired credentials (`go test -race ./internal/emergency
 ./internal/server`). External exchange and local persistence cannot be one
 transaction; failures before durable staging never deliver a credential.
+
+### 03 Retry profile-removal revocations
+
+Removed sessions no longer discard cleanup ownership. The cleanup worker retries
+records with no live session immediately, using their persisted original
+identity, regardless of original expiry. Verified profile removal during a 503
+followed by successful janitor retry (`go test -race ./internal/emergency`).
