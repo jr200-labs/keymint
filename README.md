@@ -301,3 +301,13 @@ grants are rejected and token revocation is attempted. This prevents prior OAuth
 authorizations from silently broadening a reduced request. OAuth `repo` remains
 a broad permission, not a per-repository restriction. Consumers must enforce
 their own operation and repository approvals and must not reuse a broader session.
+
+### Release-key destination lookup
+
+Each `release_keys` entry must set `github_key` to a configured installation
+key. That installation must be able to read Actions secrets metadata for every
+listed repository. The broker mints a repository-scoped token with `secrets:
+read` and obtains the encryption key directly from the configured HTTPS GitHub
+API. Caller-supplied destination fields are optional and, when present, must
+match the broker lookup. Existing deployments must add `github_key` before
+upgrading; unbound release-key configuration fails validation.

@@ -111,7 +111,7 @@ func TestValidateReleaseKeyBindingAndAllowlist(t *testing.T) {
 	cfg := Config{
 		Keys: map[string]Key{"routine": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/dev/null"}},
 		ReleaseKeys: map[string]ReleaseKey{"translatepane": {
-			Kind: "sparkle_ed25519", PrivateKeyFile: "/run/secrets/translatepane",
+			GitHubKey: "routine", Kind: "sparkle_ed25519", PrivateKeyFile: "/run/secrets/translatepane",
 			Repositories: []string{"janeway-labs/translatepane", "jr200-labs/example"}, SecretName: "SPARKLE_EDDSA_PRIVATE_KEY",
 		}},
 		Allowlist: []AllowEntry{{Subject: "allowed", ReleaseKeys: []string{"translatepane"}}},

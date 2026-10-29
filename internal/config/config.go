@@ -144,6 +144,7 @@ type Key struct {
 // GitHub repositories. A shared internal identity may be reused without making
 // it available to repositories that were not reviewed here.
 type ReleaseKey struct {
+	GitHubKey      string   `yaml:"github_key"` // configured installation used to resolve the repository encryption key
 	Kind           string   `yaml:"kind"`
 	PrivateKeyFile string   `yaml:"private_key_file"`
 	Repositories   []string `yaml:"repositories"`
@@ -243,6 +244,9 @@ func (c *Config) Validate() error {
 	for name, key := range c.ReleaseKeys {
 		if !identifier.MatchString(name) {
 			return fmt.Errorf("release key name %q is invalid", name)
+		}
+		if _, exists := c.Keys[key.GitHubKey]; !exists {
+			return fmt.Errorf("release key %q: github_key must reference a configured installation key", name)
 		}
 		if key.Kind != "sparkle_ed25519" {
 			return fmt.Errorf("release key %q: kind must be sparkle_ed25519", name)

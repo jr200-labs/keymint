@@ -7,7 +7,7 @@ findings, not a claim that deployment has been changed.
 
 ## Checklist
 
-- [ ] 01 P1 Bind release-key encryption to a broker-resolved GitHub repository public key; reject caller substitution.
+- [x] 01 P1 Bind release-key encryption to a broker-resolved GitHub repository public key; reject caller substitution.
 - [ ] 02 P1 Recover remote credential cleanup after graceful shutdown and crash; metadata invalidation alone does not revoke OAuth credentials.
 - [ ] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
 - [ ] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
@@ -45,3 +45,11 @@ findings, not a claim that deployment has been changed.
 ## Completed work and evidence
 
 Implementation notes and focused checks are added here as each item completes.
+
+### 01 Repository-bound release encryption
+
+Added required `release_keys.*.github_key`, authenticated repository-scoped
+public-key lookup over HTTPS with redirects disabled, and mismatch rejection
+before reading signing material. Legacy destination fields remain accepted only
+when they match the trusted lookup. Verification: race-enabled releasekey,
+config and server tests, including an HTTP-handler substitution regression.

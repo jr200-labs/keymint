@@ -713,9 +713,29 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "release signing key is unavailable")
 		return
 	}
-	sealed, err := releasekey.Seal(key, releasekey.Destination{
-		KeyID: input.DestinationKeyID, PublicKey: input.DestinationKey,
-	})
+	installation, exists := snapshot.cfg.Keys[key.GitHubKey]
+	if !exists {
+		writeJSONError(w, http.StatusServiceUnavailable, "release-key destination resolver is unavailable")
+		return
+	}
+	token, _, err := s.mint(r.Context(), installation, TokenScope{Repositories: []string{input.GitHubRepository}, Permissions: map[string]string{"secrets": "read"}})
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
+		return
+	}
+	destination, err := releasekey.GitHubDestination(r.Context(), nil, installation.APIBaseURL, token, input.GitHubOwner, input.GitHubRepository)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
+		return
+	}
+	// Retain compatibility with clients sending GitHub's key, but reject stale
+	// or substituted keys. Only the broker-resolved value reaches Seal.
+	if (input.DestinationKeyID != "" && input.DestinationKeyID != destination.KeyID) ||
+		(input.DestinationKey != "" && input.DestinationKey != destination.PublicKey) {
+		writeJSONError(w, http.StatusBadRequest, "destination does not match the repository encryption key")
+		return
+	}
+	sealed, err := releasekey.Seal(key, destination)
 	if err != nil {
 		zap.L().Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "release signing key could not be sealed")
