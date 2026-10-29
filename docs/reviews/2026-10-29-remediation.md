@@ -19,7 +19,7 @@ findings, not a claim that deployment has been changed.
 - [x] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
 - [x] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
 - [x] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
-- [ ] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
+- [x] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
 - [ ] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
 - [ ] 15 Use the configured zap logger consistently for emergency lifecycle failures.
 - [ ] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
@@ -139,3 +139,10 @@ Shared HTTP middleware now records bounded route/method/status counts, duration,
 in-flight work and spans for all routes, including denied and unmatched requests.
 Emergency authentication records actual TokenReview outcomes and cache lookups.
 Verified success/rejection counters and race-enabled server/metrics tests.
+
+### 13 Real exchange and drift observations
+
+GitHub exchanges report transport/HTTP outcomes and duration; parsed Date headers
+report actual clock offset. Both metrics identify the configured API endpoint.
+A 503 response regression verifies observation on failure as well as success;
+race-enabled mint, metrics and command tests pass.

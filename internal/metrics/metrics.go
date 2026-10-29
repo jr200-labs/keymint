@@ -66,7 +66,7 @@ type Metrics struct {
 
 	// JWTClockOffsetSeconds is the most recent observed clock drift between
 	// keymint and GitHub, in seconds. Negative means keymint is ahead.
-	JWTClockOffsetSeconds prometheus.Gauge
+	JWTClockOffsetSeconds *prometheus.GaugeVec
 
 	// TokenReviewCacheTotal counts TokenReview lookups by result
 	// ("hit" / "miss"). Operators graph hit ratio to see how
@@ -134,14 +134,14 @@ func New() *Metrics {
 				Help:      "Latency of POST /app/installations/<id>/access_tokens calls, by HTTP status.",
 				Buckets:   prometheus.DefBuckets,
 			},
-			[]string{"status"},
+			[]string{"status", "api_base_url"},
 		),
-		JWTClockOffsetSeconds: prometheus.NewGauge(
+		JWTClockOffsetSeconds: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Name:      "jwt_clock_offset_seconds",
 				Help:      "Most recent observed clock drift between this pod and GitHub (seconds).",
-			},
+			}, []string{"api_base_url"},
 		),
 		TokenReviewCacheTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{

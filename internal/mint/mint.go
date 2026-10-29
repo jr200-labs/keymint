@@ -180,7 +180,9 @@ type Request struct {
 	// the caller (typically the service-mode entrypoint) to push
 	// the values into Prometheus without coupling the mint package
 	// to the metrics package.
-	OnRateLimit func(apiBase string, remaining int64, resetAt time.Time)
+	OnRateLimit   func(apiBase string, remaining int64, resetAt time.Time)
+	OnExchange    func(apiBase, status string, duration time.Duration)
+	OnClockOffset func(apiBase string, offset time.Duration)
 }
 
 // Token is a minted installation access token.
@@ -382,15 +384,27 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 	}
 	defer release()
 
+	started := time.Now()
+	status := "transport_error"
+	defer func() {
+		if req.OnExchange != nil {
+			req.OnExchange(apiBase, status, time.Since(started))
+		}
+	}()
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: POST access_tokens: %w", err)
 	}
+	status = strconv.Itoa(resp.StatusCode)
 	defer func() { _ = resp.Body.Close() }()
 
 	if dateHdr := resp.Header.Get("Date"); dateHdr != "" {
-		if ghTime, err := time.Parse(time.RFC1123, dateHdr); err == nil {
-			storeClockOffset(apiBase, time.Until(ghTime))
+		if ghTime, err := http.ParseTime(dateHdr); err == nil {
+			offset := time.Until(ghTime)
+			storeClockOffset(apiBase, offset)
+			if req.OnClockOffset != nil {
+				req.OnClockOffset(apiBase, offset)
+			}
 		}
 	}
 

@@ -221,6 +221,12 @@ SOPS files.`,
 					Permissions:    scope.Permissions,
 					PrivateKey:     priv,
 					APIBaseURL:     k.APIBaseURL,
+					OnExchange: func(apiBase, status string, duration time.Duration) {
+						m.GitHubAPILatency.WithLabelValues(status, apiBase).Observe(duration.Seconds())
+					},
+					OnClockOffset: func(apiBase string, offset time.Duration) {
+						m.JWTClockOffsetSeconds.WithLabelValues(apiBase).Set(offset.Seconds())
+					},
 					OnRateLimit: func(apiBase string, remaining int64, resetAt time.Time) {
 						m.GitHubRateLimitRemaining.WithLabelValues(apiBase).Set(float64(remaining))
 						if !resetAt.IsZero() {

@@ -244,7 +244,7 @@ func TestClockOffset_PerEndpoint(t *testing.T) {
 	clockOffsets = sync.Map{} // reset
 
 	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Date", time.Now().Add(2*time.Hour).UTC().Format(time.RFC1123))
+		w.Header().Set("Date", time.Now().Add(2*time.Hour).UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(Token{Token: "t1", ExpiresAt: time.Now().Add(time.Hour)})
 	}))
@@ -252,7 +252,7 @@ func TestClockOffset_PerEndpoint(t *testing.T) {
 
 	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// "good" clock: matches local
-		w.Header().Set("Date", time.Now().UTC().Format(time.RFC1123))
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(Token{Token: "t2", ExpiresAt: time.Now().Add(time.Hour)})
 	}))
@@ -343,5 +343,27 @@ func TestMint_ValidatesRequiredFields(t *testing.T) {
 				t.Errorf("expected error")
 			}
 		})
+	}
+}
+
+func TestExchangeObservesStatusAndClockOffset(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", time.Now().Add(time.Minute).UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	status := ""
+	offset := time.Duration(0)
+	_, err := Mint(context.Background(), Request{AppID: 1, InstallationID: 1, PrivateKey: generateTestKey(t), APIBaseURL: server.URL,
+		OnExchange: func(base, got string, duration time.Duration) {
+			status = got
+			if base != server.URL || duration <= 0 {
+				t.Error("invalid exchange observation")
+			}
+		},
+		OnClockOffset: func(base string, got time.Duration) { offset = got },
+	})
+	if err == nil || status != "503" || offset < 50*time.Second {
+		t.Fatalf("status=%s offset=%v error=%v", status, offset, err)
 	}
 }
