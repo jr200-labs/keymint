@@ -201,7 +201,7 @@ the deploy accordingly:
 
 - **Cryptographic audit fingerprint.** Each minted installation token is hashed with SHA-256 and the hex digest is emitted as a `token_fingerprint` field on the structured log line and as a `keymint.token_fingerprint` OpenTelemetry span attribute. If a token ever leaks (in CI logs, a screenshot, etc.), security teams can hash it locally and grep audit logs to pinpoint the exact pod, ServiceAccount, and minute that issued it — without ever persisting the raw token.
 
-- **Ed25519 + RSA private keys.** `ParsePrivateKey` accepts both PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY") PEM blocks; PKCS#8 may be either RSA or Ed25519. The signing path picks `RS256` for RSA keys and `EdDSA` for Ed25519 automatically. GitHub Apps support both; Ed25519 keys are smaller and faster to sign with.
+- **RSA App private keys.** GitHub App JWTs require RS256. PKCS#1 and PKCS#8 RSA keys are accepted; other App key types are rejected. Sparkle release signing continues to use Ed25519.
 
 - **Trusted-proxy-aware client IP extraction.** Set
   `trusted_proxies:` in the config to a list of CIDR blocks for your

@@ -17,7 +17,7 @@ findings, not a claim that deployment has been changed.
 - [x] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
 - [x] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
 - [x] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
-- [ ] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
+- [x] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
 - [ ] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
 - [ ] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
 - [ ] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
@@ -126,3 +126,9 @@ when no Kubernetes profile exists yet. Changes to audience, passkey or journal
 settings explicitly require restart instead of silently retaining stale
 resources. Verified newly-added PEM rotation plus race-enabled command,
 server and emergency tests.
+
+### 11 Supported GitHub JWT algorithm
+
+App key parsing and signing reject Ed25519; RSA PKCS#1/PKCS#8 and RS256 remain
+supported. Sparkle Ed25519 sealing is unchanged. Verified rejection, RSA minting
+and release-key tests with the race detector.

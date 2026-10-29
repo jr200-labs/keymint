@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
@@ -162,10 +161,8 @@ type Request struct {
 	Permissions map[string]string
 
 	// PrivateKey is the App's signing key. Either *rsa.PrivateKey
-	// (signed with RS256) or ed25519.PrivateKey (signed with EdDSA)
-	// is accepted; ParsePrivateKey returns the right concrete type
-	// for whichever PEM the operator supplies. Both algorithms are
-	// supported by GitHub Apps.
+	// signed with RS256; other key types are rejected.
+	// ParsePrivateKey accepts RSA in PKCS#1 or PKCS#8 format.
 	PrivateKey crypto.PrivateKey
 
 	// APIBaseURL overrides the GitHub API base URL. Empty means use
@@ -203,10 +200,10 @@ type Token struct {
 // Accepts:
 //
 //   - "RSA PRIVATE KEY"  (PKCS#1)         — RSA only, the legacy GitHub default
-//   - "PRIVATE KEY"      (PKCS#8)         — RSA or Ed25519 (current GitHub default for Ed25519 Apps)
+//   - "PRIVATE KEY"      (PKCS#8)         — RSA only
 //   - "OPENSSH PRIVATE KEY" — explicitly rejected (unsupported by x509)
 //
-// Returned value is either *rsa.PrivateKey or ed25519.PrivateKey;
+// Returned value is *rsa.PrivateKey;
 // signAppJWT inspects the concrete type at signing time.
 func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	block, _ := pem.Decode(pemBytes)
@@ -229,10 +226,8 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		switch k := key.(type) {
 		case *rsa.PrivateKey:
 			return k, nil
-		case ed25519.PrivateKey:
-			return k, nil
 		default:
-			return nil, fmt.Errorf("mint: PKCS8 key is %T, want *rsa.PrivateKey or ed25519.PrivateKey", key)
+			return nil, fmt.Errorf("mint: PKCS8 key is %T, want *rsa.PrivateKey", key)
 		}
 	default:
 		return nil, fmt.Errorf("mint: unsupported PEM block type %q", block.Type)
@@ -286,7 +281,7 @@ func storeClockOffset(apiBase string, offset time.Duration) {
 // signAppJWT produces a JWT signed with the App's private key,
 // suitable for use as a Bearer token against the
 // /app/installations/... endpoints. RSA keys sign with RS256;
-// Ed25519 keys sign with EdDSA. GitHub accepts both.
+// GitHub requires RS256 for App authentication.
 func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, error) {
 	claims := jwt.MapClaims{
 		// "iat" — issued-at. Set 60s in the past to tolerate small
@@ -307,11 +302,8 @@ func signAppJWT(appID int64, key crypto.PrivateKey, now time.Time) (string, erro
 	case *rsa.PrivateKey:
 		method = jwt.SigningMethodRS256
 		signer = k
-	case ed25519.PrivateKey:
-		method = jwt.SigningMethodEdDSA
-		signer = k
 	default:
-		return "", fmt.Errorf("mint: unsupported key type %T (want *rsa.PrivateKey or ed25519.PrivateKey)", key)
+		return "", fmt.Errorf("mint: unsupported key type %T (want *rsa.PrivateKey)", key)
 	}
 
 	token := jwt.NewWithClaims(method, claims)
