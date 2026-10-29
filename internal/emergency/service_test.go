@@ -231,7 +231,7 @@ func TestSessionMutationsPublishResumableEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	revoked, err := service.Events(context.Background(), "allowed", created.NextCursor, 0)
-	if err != nil || len(revoked.Events) != 1 || revoked.Events[0].Type != "session.revoked" {
+	if err != nil || len(revoked.Events) != 2 || revoked.Events[1].Type != "session.revoked" {
 		t.Fatalf("revoked events = %+v, error = %v", revoked, err)
 	}
 }

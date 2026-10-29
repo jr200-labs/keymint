@@ -63,16 +63,15 @@ type Session struct {
 	UserCode        string    `json:"user_code,omitempty"`
 	ExpiresAt       time.Time `json:"expires_at"`
 
-	profile        config.EmergencyProfile
-	subject        string
-	deviceCode     string
-	accessToken    string
-	credentialAt   time.Time
-	nextPoll       time.Time
-	pollEvery      time.Duration
-	boundSecret    string
-	verifyAttempts int
-	polling        bool
+	profile     config.EmergencyProfile
+	subject     string
+	deviceCode  string
+	accessToken string
+	nextPoll    time.Time
+	pollEvery   time.Duration
+	boundSecret string
+	operation   operation
+	gate        chan struct{}
 }
 
 type PasskeyEnrollment struct {
@@ -113,6 +112,7 @@ type Service struct {
 	metrics                *metrics.Metrics
 	mu                     sync.Mutex
 	revision               uint64
+	closed                 bool
 	profiles               map[string]config.EmergencyProfile
 	allowed                map[string]map[string]bool
 	sessions               map[string]*Session
@@ -175,6 +175,27 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer, instrument
 func (service *Service) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	service.mu.Lock()
+	service.closed = true
+	service.revision++
+	var gates []chan struct{}
+	for _, session := range service.sessions {
+		if !terminal(session.State) {
+			_ = service.transitionLocked(ctx, session, Invalidated, eventFor(Invalidated))
+		}
+		if session.gate != nil {
+			gates = append(gates, session.gate)
+		}
+	}
+	service.mu.Unlock()
+	for _, gate := range gates {
+		select {
+		case gate <- struct{}{}:
+			<-gate
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), service.events.close())
+		}
+	}
 	return errors.Join(service.drainCleanup(ctx, true), service.events.close())
 }
 
@@ -200,10 +221,15 @@ func (service *Service) Reload(cfg *config.Config) {
 			continue
 		}
 
+		if err := service.transitionLocked(context.Background(), session, Invalidated, eventFor(Invalidated)); err != nil {
+			zap.L().Error("record emergency invalidation", zap.Error(err))
+			continue
+		}
 		copy := *session
-		copy.State = Invalidated
 		invalidated = append(invalidated, &copy)
-		delete(service.sessions, id)
+		if session.operation == idle {
+			delete(service.sessions, id)
+		}
 	}
 	service.mu.Unlock()
 	if len(invalidated) > 0 {
@@ -212,11 +238,6 @@ func (service *Service) Reload(cfg *config.Config) {
 		}
 	}
 
-	for _, session := range invalidated {
-		if err := service.record(context.Background(), "session.invalidated", session); err != nil {
-			zap.L().Error("record emergency session invalidated by config reload", zap.String("session", session.ID), zap.Error(err))
-		}
-	}
 }
 
 func (service *Service) Profiles(subject string) []Profile {
@@ -305,7 +326,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		logging.FromContext(ctx).Error("prune expired emergency credentials", zap.Error(err))
 	}
 	service.mu.Lock()
-	if service.revision != revision || !service.allowed[subject][profileName] || len(service.sessions) >= maxSessions {
+	if service.closed || service.revision != revision || !service.allowed[subject][profileName] || len(service.sessions) >= maxSessions {
 		for token, ceremony := range service.ceremonies {
 			if ceremony.sessionID == session.ID {
 				delete(service.ceremonies, token)
@@ -415,12 +436,17 @@ func (service *Service) Prune(ctx context.Context) error {
 	service.mu.Lock()
 	var expired []expiredSession
 	for id, current := range service.sessions {
-		if current.ExpiresAt.After(now) && current.State != Revoked {
+		if current.operation != idle {
+			continue
+		}
+		if current.ExpiresAt.After(now) && !terminal(current.State) && current.State != RevocationPending {
 			continue
 		}
 		target, event := Expired, "session.expired"
-		if current.State == Revoked {
-			target, event = Revoked, "session.revoked"
+		if current.State == RevocationPending {
+			target, event = Revoked, eventFor(Revoked)
+		} else if terminal(current.State) {
+			target, event = current.State, eventFor(current.State)
 		}
 		if err := service.transitionLocked(ctx, current, target, event); err != nil {
 			current.State = target
@@ -439,11 +465,7 @@ func (service *Service) Prune(ctx context.Context) error {
 	service.mu.Unlock()
 	for _, item := range expired {
 		if err := service.revokeCredential(ctx, item.credential); err != nil {
-			service.mu.Lock()
-			if service.sessions[item.id] == nil {
-				service.sessions[item.id] = item.session
-			}
-			service.mu.Unlock()
+
 			result = errors.Join(result, err)
 			continue
 		}
@@ -453,14 +475,17 @@ func (service *Service) Prune(ctx context.Context) error {
 }
 
 func (service *Service) Get(ctx context.Context, subject, id string) (Session, error) {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, polling)
 	if err != nil {
-		service.mu.Unlock()
 		return Session{}, err
 	}
-	if !session.ExpiresAt.After(service.now()) {
-		session.State = Expired
+	defer release()
+
+	if !session.ExpiresAt.After(service.now()) && !terminal(session.State) && session.State != RevocationPending {
+		if err = service.transitionLocked(ctx, session, Expired, eventFor(Expired)); err != nil {
+			service.mu.Unlock()
+			return Session{}, err
+		}
 	}
 	copy := *session
 	profile := session.profile
@@ -469,26 +494,24 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 		err = service.revokeCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
 		return publicSession(&copy), err
 	}
-	if session.State != AwaitingGitHub || session.polling || session.nextPoll.After(service.now()) {
+	if session.State != AwaitingGitHub || session.nextPoll.After(service.now()) {
 		service.mu.Unlock()
 		return publicSession(&copy), nil
 	}
 	// Reserve exactly one exchange for this session. No other poll can overwrite
 	// it; removal and expiry remain possible while network I/O is in progress.
-	session.polling = true
 	service.mu.Unlock()
 	err = service.pollGitHub(ctx, &copy, profile)
 	service.mu.Lock()
 	current := service.sessions[id]
 	valid := current == session && current.State == AwaitingGitHub && current.ExpiresAt.After(service.now())
-	if current == session {
-		current.polling = false
-	}
 	if err != nil {
 		if valid && errors.Is(err, errScopeMismatch) {
-			copy.State = Invalidated
-			delete(service.sessions, id)
-			err = errors.Join(err, service.record(ctx, "session.invalidated", &copy))
+			journalErr := service.transitionLocked(ctx, current, Invalidated, eventFor(Invalidated))
+			if journalErr == nil {
+				delete(service.sessions, id)
+			}
+			err = errors.Join(err, journalErr)
 		}
 		service.mu.Unlock()
 		return Session{}, err
@@ -498,9 +521,8 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
 		return Session{}, errors.Join(errors.New("session changed during authentication"), cleanupErr)
 	}
-	copy.polling = false
 	if copy.State == Active {
-		if err = service.record(ctx, "session.activated", &copy); err != nil {
+		if err = service.transitionLocked(ctx, current, Active, eventFor(Active)); err != nil {
 			service.mu.Unlock()
 			_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken})
 			return Session{}, err
@@ -540,12 +562,12 @@ func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 }
 
 func (service *Service) Credential(ctx context.Context, subject, id string) (Credential, error) {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, issuing)
 	if err != nil {
-		service.mu.Unlock()
 		return Credential{}, err
 	}
+	defer release()
+
 	if session.State != Active || !session.ExpiresAt.After(service.now()) {
 		service.mu.Unlock()
 		return Credential{}, errors.New("emergency session is not active")
@@ -562,8 +584,7 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		service.mu.Unlock()
 		return Credential{}, errors.New("Kubernetes emergency issuer is unavailable")
 	}
-	// ponytail: emergency issuance holds the global session lock; use per-session
-	// locks only if emergency-session concurrency becomes operationally relevant.
+	// Reserve cleanup before releasing the registry lock for external issuance.
 	if boundSecret == "" {
 		name, err := randomKubernetesName()
 		if err != nil {
@@ -577,7 +598,14 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		}
 		session.boundSecret = boundSecret
 	}
+	service.mu.Unlock()
 	token, secret, expiresAt, err := service.issuer.Issue(ctx, profile.Namespace, profile.ServiceAccount, ttl, boundSecret)
+	service.mu.Lock()
+	if service.sessions[id] != session || session.State != Active || !session.ExpiresAt.After(service.now()) || service.closed {
+		service.mu.Unlock()
+		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: session.accessToken, secret: boundSecret})
+		return Credential{}, errors.Join(errors.New("session changed during credential issuance"), cleanupErr)
+	}
 	if err != nil {
 		service.mu.Unlock()
 		return Credential{}, err
@@ -608,27 +636,35 @@ func (service *Service) Authorize(subject, id string) error {
 }
 
 func (service *Service) Revoke(ctx context.Context, subject, id string) error {
-	service.mu.Lock()
-	session, err := service.ownedSession(subject, id)
+	session, release, err := service.beginOperation(ctx, subject, id, revoking)
 	if err != nil {
+		return err
+	}
+	defer release()
+	if terminal(session.State) {
+		service.mu.Unlock()
+		return nil
+	}
+	if err = service.transitionLocked(ctx, session, RevocationPending, eventFor(RevocationPending)); err != nil {
 		service.mu.Unlock()
 		return err
 	}
-	revoked := revokedCredential{id: session.ID, profile: session.profile, token: session.accessToken, secret: session.boundSecret}
-	// ponytail: emergency revocation holds the global session lock so no
-	// credential can be issued concurrently; use per-session locks at scale.
-	if err := service.revokeCredential(ctx, revoked); err != nil {
-		service.mu.Unlock()
+	credential := revokedCredential{id: id, profile: session.profile, token: session.accessToken, secret: session.boundSecret}
+	service.mu.Unlock()
+	err = service.revokeCredential(ctx, credential)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	if err := service.transitionLocked(ctx, session, Revoked, "session.revoked"); err != nil {
-		// Remote authority is gone; a failed journal must not reopen local access.
-		session.State = Revoked
-		service.mu.Unlock()
+	if terminal(session.State) {
+		delete(service.sessions, id)
+		return nil
+	}
+	if err = service.transitionLocked(ctx, session, Revoked, eventFor(Revoked)); err != nil {
 		return err
 	}
 	delete(service.sessions, id)
-	service.mu.Unlock()
 	return nil
 }
 
@@ -881,7 +917,10 @@ func publicSession(session *Session) Session {
 	copy := *session
 	copy.Scopes = slices.Clone(session.Scopes)
 	copy.subject, copy.deviceCode, copy.accessToken, copy.boundSecret = "", "", "", ""
-	copy.credentialAt, copy.nextPoll, copy.pollEvery, copy.verifyAttempts = time.Time{}, time.Time{}, 0, 0
+	copy.nextPoll, copy.pollEvery = time.Time{}, 0
+	copy.profile = config.EmergencyProfile{}
+	copy.gate = nil
+	copy.operation = idle
 	return copy
 }
 
@@ -900,16 +939,4 @@ func slicesSortProfiles(values []Profile) {
 			values[j], values[j-1] = values[j-1], values[j]
 		}
 	}
-}
-
-// transitionLocked commits the durable event before publishing new authority.
-// Callers hold mu, so activation cannot be journaled after a later revocation.
-func (service *Service) transitionLocked(ctx context.Context, session *Session, state State, event string) error {
-	next := *session
-	next.State = state
-	if err := service.record(ctx, event, &next); err != nil {
-		return err
-	}
-	session.State = state
-	return nil
 }

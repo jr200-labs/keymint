@@ -23,7 +23,7 @@ findings, not a claim that deployment has been changed.
 - [x] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
 - [x] 15 Use the configured zap logger consistently for emergency lifecycle failures.
 - [x] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
-- [ ] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
+- [x] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
 - [ ] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
 - [ ] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
 - [ ] 20 Add regression coverage for emergency HTTP routes, passkey verification, startup/cache orchestration, and failure/interleaving cases; run final race tests, vet and vulnerability scan.
@@ -169,3 +169,15 @@ reload, durable journal writes and credential revocation. Cleanup gauges expose
 tracked, due and overdue work; breaker gauges identify each endpoint. Failure
 injection verifies journal/revocation error counters and due backlog. Full race
 suite and the focused observability regression pass.
+
+### 17 Explicit lifecycle and operation states
+
+Central transition guards prevent terminal-state reactivation and pair event
+names with states. Revocation first denies local access through
+revocation_pending. Context-aware per-session gates serialize polling, issuance
+and revocation; network work releases the global registry lock. Reload and
+shutdown invalidate in-flight work, whose results cannot restore authority.
+Tests cover terminal guards, concurrent OAuth/revocation serialization, unrelated
+session progress during blocked issuance, and invalidation of late issuance.
+Race-enabled emergency/server tests pass. Public session copies discard private
+profile and operation metadata.

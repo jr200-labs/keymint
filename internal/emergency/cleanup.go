@@ -153,9 +153,13 @@ func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 	var result error
 	for _, record := range records {
 		service.mu.Lock()
-		_, live := service.sessions[record.ID]
+		session, live := service.sessions[record.ID]
+		busy := live && session.operation != idle
 		service.mu.Unlock()
-		if !all && live && record.Due.After(service.now()) {
+		if busy {
+			continue
+		}
+		if !all && live && !terminal(session.State) && session.State != RevocationPending && record.Due.After(service.now()) {
 			continue
 		}
 		if err := service.revokeCredential(ctx, revokedCredential{id: record.ID, profile: record.Profile, token: record.Token, secret: record.Secret}); err != nil {

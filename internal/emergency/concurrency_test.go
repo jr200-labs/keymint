@@ -14,7 +14,7 @@ import (
 	"github.com/jr200-labs/keymint/internal/config"
 )
 
-func TestOAuthPollRejectsCompletionAfterRevoke(t *testing.T) {
+func TestOAuthPollSerializesWithRevoke(t *testing.T) {
 	started, finish := make(chan struct{}), make(chan struct{})
 	var revocations atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,17 +59,23 @@ func TestOAuthPollRejectsCompletionAfterRevoke(t *testing.T) {
 	done := make(chan result, 1)
 	go func() { got, err := svc.Get(context.Background(), "allowed", session.ID); done <- result{got, err} }()
 	<-started
-	if err := svc.Revoke(context.Background(), "allowed", session.ID); err != nil {
-		t.Fatal(err)
-	}
+	revokeDone := make(chan error, 1)
+	go func() { revokeDone <- svc.Revoke(context.Background(), "allowed", session.ID) }()
 	close(finish)
 	got := <-done
-	if got.err == nil {
-		t.Fatal("late OAuth completion accepted")
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if err := <-revokeDone; err != nil {
+		t.Fatal(err)
 	}
 	if revocations.Load() != 1 {
-		t.Fatalf("late token revocations=%d", revocations.Load())
+		t.Fatalf("token revocations=%d", revocations.Load())
 	}
+	if err := svc.Authorize("allowed", session.ID); err == nil {
+		t.Fatal("revoked session authorized")
+	}
+
 	if err := svc.Prune(context.Background()); err != nil {
 		t.Fatal(err)
 	}

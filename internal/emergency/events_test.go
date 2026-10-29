@@ -100,7 +100,7 @@ func TestRevocationRecordsTerminalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 1 || page.Events[0].State != Revoked {
+	if len(page.Events) != 2 || page.Events[0].State != RevocationPending || page.Events[1].State != Revoked {
 		t.Fatalf("events=%+v", page.Events)
 	}
 	if err = service.events.invalidateOpenSessions(context.Background()); err != nil {
