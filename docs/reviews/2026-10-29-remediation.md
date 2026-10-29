@@ -12,7 +12,7 @@ findings, not a claim that deployment has been changed.
 - [x] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
 - [x] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
 - [x] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
-- [ ] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
+- [x] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
 - [ ] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
 - [ ] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
 - [ ] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
@@ -87,3 +87,10 @@ Sessions capture the original profile. Reload invalidates sessions whose profile
 changes, and session creation checks the configuration revision and allowlist
 again before publication. The profile-retarget reproduction now asserts denial
 without invoking the new issuer. Race-enabled emergency/server tests pass.
+
+### 06 TOTP identity protection
+
+A durable secret-identity budget allows five verification attempts per 30-second
+window across all sessions/profiles. A persisted accepted-step watermark rejects
+replay, including after restart. Empty/short secrets are rejected. Verified
+replay and budget regressions plus race-enabled emergency/server tests.

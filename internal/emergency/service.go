@@ -504,21 +504,16 @@ func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 		return Session{}, errors.New("session is not awaiting TOTP")
 	}
 	profile := session.profile
-	if session.verifyAttempts >= 5 {
-		session.State = Expired
-		service.mu.Unlock()
-		return Session{}, errors.New("too many invalid TOTP attempts")
-	}
 	secret, err := os.ReadFile(profile.TOTPSecretFile)
 	if err != nil {
 		service.mu.Unlock()
 		return Session{}, fmt.Errorf("read TOTP secret: %w", err)
 	}
-	if !validTOTP(strings.TrimSpace(string(secret)), code, service.now()) {
-		session.verifyAttempts++
+	if err := service.verifyTOTPCode(strings.TrimSpace(string(secret)), code); err != nil {
 		service.mu.Unlock()
-		return Session{}, errors.New("invalid TOTP code")
+		return Session{}, err
 	}
+
 	session.State = Active
 	copy := *session
 	service.mu.Unlock()
@@ -814,9 +809,14 @@ func (service *Service) doJSON(request *http.Request, target any) error {
 }
 
 func validTOTP(secret, code string, now time.Time) bool {
+	_, ok := totpStep(secret, code, now)
+	return ok
+}
+
+func totpStep(secret, code string, now time.Time) (int64, bool) {
 	decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.ReplaceAll(secret, " ", "")))
-	if err != nil || len(code) != 6 {
-		return false
+	if err != nil || len(decoded) < 16 || len(code) != 6 {
+		return 0, false
 	}
 	for offset := int64(-1); offset <= 1; offset++ {
 		counter := uint64(now.Unix()/30 + offset)
@@ -829,10 +829,10 @@ func validTOTP(secret, code string, now time.Time) bool {
 		value := (uint32(sum[index])&0x7f)<<24 | uint32(sum[index+1])<<16 | uint32(sum[index+2])<<8 | uint32(sum[index+3])
 		want := fmt.Sprintf("%06d", value%1_000_000)
 		if hmac.Equal([]byte(want), []byte(code)) {
-			return true
+			return int64(counter), true
 		}
 	}
-	return false
+	return 0, false
 }
 
 func randomID() (string, error) {

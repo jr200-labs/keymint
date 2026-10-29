@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS emergency_events (
 id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, type TEXT NOT NULL,
 session_id TEXT NOT NULL, profile TEXT NOT NULL, provider TEXT NOT NULL,
 state TEXT NOT NULL, expires_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS emergency_totp (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, attempts INTEGER NOT NULL, last_step INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);`); err != nil {
 		_ = db.Close()
