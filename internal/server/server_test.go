@@ -375,7 +375,7 @@ func TestPerSubjectRateLimit(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	// Override per-subject limit to a tiny bucket so the test fits.
-	srv.subjectLimit = newLimiterMap(rate.Every(time.Hour), 2)
+	srv.auth.subjectLimit = newLimiterMap(rate.Every(time.Hour), 2)
 
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
@@ -662,7 +662,7 @@ func TestReload_AtomicallySwapsConfig(t *testing.T) {
 	if _, ok := srv.currentConfig().Keys["new-key"]; !ok {
 		t.Errorf("new-key missing after reload")
 	}
-	if !srv.currentAllowed()["system:serviceaccount:agents:agent-runner"]["new-key"] {
+	if !srv.snapshot.Load().allowedSubject["system:serviceaccount:agents:agent-runner"]["new-key"] {
 		t.Errorf("allowlist not rebuilt for new-key")
 	}
 }

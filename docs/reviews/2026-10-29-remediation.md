@@ -25,7 +25,7 @@ findings, not a claim that deployment has been changed.
 - [x] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
 - [x] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
 - [x] 18 Extract mint caching, refresh/cooldown, and PEM-watch lifecycle from Cobra into a testable module with Mint/Reload/Close.
-- [ ] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
+- [x] 19 Unify request authentication, TokenReview caching, rate limiting, and telemetry behind one module.
 - [ ] 20 Add regression coverage for emergency HTTP routes, passkey verification, startup/cache orchestration, and failure/interleaving cases; run final race tests, vet and vulnerability scan.
 
 ## Baseline verification
@@ -190,3 +190,11 @@ one background worker per cache entry and shutdown cancels outstanding work.
 Clock and exchange seams support interface-level tests. Verified coalesced
 misses, scope separation, valid/expired fallback, refresh cooldown, rotation and
 shutdown cancellation under the race detector; the full suite passes.
+
+### 19 Shared authentication module
+
+Mint and emergency handlers use one authenticator for bearer parsing, trusted
+proxy handling, two-tier limits, coalesced TokenReview/cache access, error
+classification, tracing and metrics. Mint authorization uses one immutable
+configuration snapshot. Verified one TokenReview across both route families,
+existing auth failure/cache/rate-limit regressions, and race-enabled tests.
