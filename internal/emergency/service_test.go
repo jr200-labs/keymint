@@ -20,7 +20,7 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
-type fakeIssuer struct{ revoked string }
+type fakeIssuer struct{ revoked, issued string }
 
 func (issuer *fakeIssuer) Issue(_ context.Context, namespace, serviceAccount string, ttl time.Duration, existing string) (string, string, time.Time, error) {
 	if namespace != "operators" || serviceAccount != "breakglass-admin" || ttl <= 0 {
@@ -29,6 +29,7 @@ func (issuer *fakeIssuer) Issue(_ context.Context, namespace, serviceAccount str
 	if existing == "" {
 		existing = "bound-secret"
 	}
+	issuer.issued = existing
 	return "kubernetes-token", existing, time.Unix(900, 0), nil
 }
 
@@ -81,7 +82,7 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 	if err := service.Revoke(context.Background(), "system:serviceaccount:agents:relay", session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if issuer.revoked != "bound-secret" {
+	if issuer.revoked != issuer.issued {
 		t.Fatalf("revoked %q", issuer.revoked)
 	}
 }
@@ -183,7 +184,7 @@ func TestKubernetesSessionCanUseGitHubDeviceAuthentication(t *testing.T) {
 	if err := service.Revoke(context.Background(), "allowed", session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if !githubRevoked || issuer.revoked != "bound-secret" {
+	if !githubRevoked || issuer.revoked != issuer.issued {
 		t.Fatalf("revoked GitHub=%v Kubernetes=%q", githubRevoked, issuer.revoked)
 	}
 }

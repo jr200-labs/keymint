@@ -13,7 +13,7 @@ findings, not a claim that deployment has been changed.
 - [x] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
 - [x] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
 - [x] 06 P2 Enforce TOTP attempt limits and successful-timestep replay prevention across sessions.
-- [ ] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
+- [x] 07 P2 Retain cleanup ownership of partially-created Kubernetes binding Secrets.
 - [ ] 08 P2 Match credential-helper destinations by exact hostname and permitted scheme, not substring.
 - [ ] 09 P2 Commit lifecycle events consistently with state; fail activation closed and record terminal revocation state.
 - [ ] 10 P2 Reconcile PEM watchers and Kubernetes issuer availability on configuration reload.
@@ -94,3 +94,11 @@ A durable secret-identity budget allows five verification attempts per 30-second
 window across all sessions/profiles. A persisted accepted-step watermark rejects
 replay, including after restart. Empty/short secrets are rejected. Verified
 replay and budget regressions plus race-enabled emergency/server tests.
+
+### 07 Partial Kubernetes issuance cleanup
+
+Reserve and persist the binding Secret identity before creating it. Retries reuse
+that identity, partial failures retain it, and deleting an absent Secret is
+idempotent. Device-authenticated Kubernetes sessions retain both OAuth and Secret
+cleanup. Verified failed issuance, repeated retry, and explicit cleanup under
+race-enabled emergency/server tests.

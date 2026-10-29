@@ -104,3 +104,43 @@ func TestProfileRemovalRetainsFailedCleanup(t *testing.T) {
 		t.Fatalf("records=%v calls=%d error=%v", records, calls, err)
 	}
 }
+
+type failingIssuer struct{ secret, revoked string }
+
+func (i *failingIssuer) Issue(_ context.Context, _, _ string, _ time.Duration, secret string) (string, string, time.Time, error) {
+	i.secret = secret
+	return "", secret, time.Time{}, io.ErrUnexpectedEOF
+}
+func (i *failingIssuer) Revoke(_ context.Context, _ string, secret string) error {
+	i.revoked = secret
+	return nil
+}
+func TestPartialIssuanceRetainsCleanup(t *testing.T) {
+	issuer := &failingIssuer{}
+	service, err := New(&config.Config{}, http.DefaultClient, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	session := &Session{ID: "session", subject: "caller", State: Active, ExpiresAt: time.Now().Add(time.Hour), profile: config.EmergencyProfile{Provider: "kubernetes", Namespace: "ops", ServiceAccount: "admin"}}
+	service.sessions[session.ID] = session
+	if _, err = service.Credential(context.Background(), "caller", session.ID); err == nil {
+		t.Fatal("failed issuance accepted")
+	}
+	first := issuer.secret
+	if first == "" || session.boundSecret != first {
+		t.Fatal("cleanup identity not reserved before issuance")
+	}
+	if _, err = service.Credential(context.Background(), "caller", session.ID); err == nil {
+		t.Fatal("failed retry accepted")
+	}
+	if issuer.secret != first {
+		t.Fatal("retry leaked another Secret")
+	}
+	if err = service.Revoke(context.Background(), "caller", session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if issuer.revoked != first {
+		t.Fatal("partial Secret was not revoked")
+	}
+}

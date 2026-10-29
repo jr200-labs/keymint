@@ -548,12 +548,25 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 	}
 	// ponytail: emergency issuance holds the global session lock; use per-session
 	// locks only if emergency-session concurrency becomes operationally relevant.
+	if boundSecret == "" {
+		name, err := randomKubernetesName()
+		if err != nil {
+			service.mu.Unlock()
+			return Credential{}, err
+		}
+		boundSecret = "keymint-emergency-" + name
+		if err = service.rememberCredential(ctx, session.ID, profile, session.accessToken, boundSecret, session.ExpiresAt); err != nil {
+			service.mu.Unlock()
+			return Credential{}, err
+		}
+		session.boundSecret = boundSecret
+	}
 	token, secret, expiresAt, err := service.issuer.Issue(ctx, profile.Namespace, profile.ServiceAccount, ttl, boundSecret)
 	if err != nil {
 		service.mu.Unlock()
 		return Credential{}, err
 	}
-	if err := service.rememberCredential(ctx, session.ID, profile, "", secret, session.ExpiresAt); err != nil {
+	if err := service.rememberCredential(ctx, session.ID, profile, session.accessToken, secret, session.ExpiresAt); err != nil {
 		_ = service.issuer.Revoke(context.WithoutCancel(ctx), profile.Namespace, secret)
 		service.mu.Unlock()
 		return Credential{}, err
