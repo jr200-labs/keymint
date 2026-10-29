@@ -8,7 +8,7 @@ findings, not a claim that deployment has been changed.
 ## Checklist
 
 - [x] 01 P1 Bind release-key encryption to a broker-resolved GitHub repository public key; reject caller substitution.
-- [ ] 02 P1 Recover remote credential cleanup after graceful shutdown and crash; metadata invalidation alone does not revoke OAuth credentials.
+- [x] 02 P1 Recover remote credential cleanup after graceful shutdown and crash; metadata invalidation alone does not revoke OAuth credentials.
 - [ ] 03 P1 Retain failed profile-removal revocations for retry with their original profile.
 - [ ] 04 P1 Serialize OAuth polling transitions and reject/revoke late results after revocation or expiry.
 - [ ] 05 P1 Bind sessions to immutable profile revisions; invalidate changed authority and revalidate creation across reload.
@@ -53,3 +53,16 @@ public-key lookup over HTTPS with redirects disabled, and mismatch rejection
 before reading signing material. Legacy destination fields remain accepted only
 when they match the trusted lookup. Verification: race-enabled releasekey,
 config and server tests, including an HTTP-handler substitution regression.
+
+### 02 Restart-safe credential cleanup
+
+Added an AES-GCM encrypted cleanup table alongside the credential-free event
+journal. Credentials are tracked before delivery; OAuth cleanup captures its
+original application identity. A mode-0600 key next to the state database must
+persist with that database. Startup retries restored cleanup, and graceful
+shutdown attempts every outstanding revocation. Service mode now requires a
+persistent emergency_state_file when emergency profiles are enabled. Tests
+simulate crash recovery, transient upstream failure, ciphertext storage, and
+shutdown with unexpired credentials (`go test -race ./internal/emergency
+./internal/server`). External exchange and local persistence cannot be one
+transaction; failures before durable staging never deliver a credential.

@@ -139,6 +139,10 @@ SOPS files.`,
 				return err
 			}
 
+			if len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
+				return errors.New("serve: emergency_state_file is required for recoverable credential revocation")
+			}
+
 			reviewer, err := server.NewK8sTokenReviewer(cfg.ExpectedAudiences)
 			if err != nil {
 				return err

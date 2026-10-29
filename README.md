@@ -311,3 +311,13 @@ read` and obtains the encryption key directly from the configured HTTPS GitHub
 API. Caller-supplied destination fields are optional and, when present, must
 match the broker lookup. Existing deployments must add `github_key` before
 upgrading; unbound release-key configuration fails validation.
+
+### Emergency cleanup storage
+
+Service deployments with emergency profiles must configure
+`emergency_state_file` on persistent storage. Keep its adjacent `.cleanup-key`
+file with the database, restrict both to the broker identity, and run one
+replica. Live authorization remains memory-only, but encrypted revocation
+records survive restart until remote cleanup succeeds. The event stream never
+contains tokens or revocation secrets. Losing either persistent file prevents
+reliable cleanup; retain both during upgrades and recovery.

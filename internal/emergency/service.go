@@ -91,6 +91,7 @@ type Credential struct {
 }
 
 type revokedCredential struct {
+	id      string
 	profile config.EmergencyProfile
 	token   string
 	secret  string
@@ -112,6 +113,7 @@ type Service struct {
 	passkeyVerificationURL string
 	ceremonies             map[string]passkeyCeremony
 	events                 *eventStore
+	cleanup                *cleanupStore
 	now                    func() time.Time
 }
 
@@ -126,15 +128,42 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	cleanup, err := openCleanupStore(events.db, cfg.EmergencyStateFile)
+	if err != nil {
+		_ = events.close()
+		return nil, err
+	}
+	service := &Service{cleanup: cleanup, http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
 	if cfg.Passkeys != nil {
 		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
 	}
 	service.Reload(cfg)
+	restored, err := cleanup.list(context.Background())
+	if err != nil {
+		_ = events.close()
+		return nil, err
+	}
+	for _, record := range restored {
+		record.Due = service.now()
+		if err = cleanup.put(context.Background(), record); err != nil {
+			_ = events.close()
+			return nil, err
+		}
+	}
+	// Every restored cleanup belongs to a previous process, never a live session.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := service.drainCleanup(ctx, true); err != nil {
+		slog.Error("recover emergency credential cleanup", "error", err)
+	}
 	return service, nil
 }
 
-func (service *Service) Close() error { return service.events.close() }
+func (service *Service) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return errors.Join(service.drainCleanup(ctx, true), service.events.close())
+}
 
 func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Lock()
@@ -159,7 +188,7 @@ func (service *Service) Reload(cfg *config.Config) {
 			continue
 		}
 		if session.accessToken != "" || session.boundSecret != "" {
-			revoked = append(revoked, revokedCredential{profile: oldProfiles[session.Profile], token: session.accessToken, secret: session.boundSecret})
+			revoked = append(revoked, revokedCredential{id: session.ID, profile: oldProfiles[session.Profile], token: session.accessToken, secret: session.boundSecret})
 		}
 		copy := *session
 		copy.State = Invalidated
@@ -375,7 +404,7 @@ func (service *Service) Prune(ctx context.Context) error {
 		}
 		current.State = Expired
 		profile := service.profiles[current.Profile]
-		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{profile: profile, token: current.accessToken, secret: current.boundSecret}})
+		expired = append(expired, expiredSession{id: id, session: current, credential: revokedCredential{id: current.ID, profile: profile, token: current.accessToken, secret: current.boundSecret}})
 		delete(service.sessions, id)
 	}
 	for token, ceremony := range service.ceremonies {
@@ -397,7 +426,7 @@ func (service *Service) Prune(ctx context.Context) error {
 		}
 		result = errors.Join(result, service.record(ctx, "session.expired", item.session))
 	}
-	return result
+	return errors.Join(result, service.drainCleanup(ctx, false))
 }
 
 func (service *Service) Get(ctx context.Context, subject, id string) (Session, error) {
@@ -412,7 +441,7 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	}
 	copy := *session
 	profile := service.profiles[session.Profile]
-	revoked := revokedCredential{profile: profile, token: session.accessToken, secret: session.boundSecret}
+	revoked := revokedCredential{id: session.ID, profile: profile, token: session.accessToken, secret: session.boundSecret}
 	service.mu.Unlock()
 	if copy.State == Expired {
 		if err := service.revokeCredential(ctx, revoked); err != nil {
@@ -520,6 +549,11 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		service.mu.Unlock()
 		return Credential{}, err
 	}
+	if err := service.rememberCredential(ctx, session.ID, profile, "", secret, session.ExpiresAt); err != nil {
+		_ = service.issuer.Revoke(context.WithoutCancel(ctx), profile.Namespace, secret)
+		service.mu.Unlock()
+		return Credential{}, err
+	}
 	session.boundSecret = secret
 	service.mu.Unlock()
 	return Credential{Provider: profile.Provider, Token: token, ExpiresAt: expiresAt}, nil
@@ -547,7 +581,7 @@ func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 		service.mu.Unlock()
 		return err
 	}
-	revoked := revokedCredential{profile: service.profiles[session.Profile], token: session.accessToken, secret: session.boundSecret}
+	revoked := revokedCredential{id: session.ID, profile: service.profiles[session.Profile], token: session.accessToken, secret: session.boundSecret}
 	// ponytail: emergency revocation holds the global session lock so no
 	// credential can be issued concurrently; use per-session locks at scale.
 	if err := service.revokeCredential(ctx, revoked); err != nil {
@@ -635,23 +669,31 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		session.nextPoll = service.now().Add(session.pollEvery)
 		return nil
 	}
+	// Stage cleanup immediately after exchange, before identity/scope validation.
+	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", service.now()); err != nil {
+		_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{profile: profile, token: token.AccessToken})
+		return fmt.Errorf("persist credential cleanup: %w", err)
+	}
 	if len(session.Scopes) > 0 {
 		granted := strings.FieldsFunc(token.Scope, func(r rune) bool { return r == ',' || r == ' ' })
 		slices.Sort(granted)
 		granted = slices.Compact(granted)
 		if !slices.Equal(granted, session.Scopes) {
-			_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+			_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 			return errScopeMismatch
 		}
 	}
 	userID, err := service.githubUserID(ctx, profile, token.AccessToken)
 	if err != nil {
-		_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return err
 	}
 	if !containsID(allowedUserIDs, userID) {
-		_ = service.revokeCredential(ctx, revokedCredential{profile: profile, token: token.AccessToken})
+		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return errors.New("authenticated GitHub user is not allowed for this profile")
+	}
+	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", session.ExpiresAt); err != nil {
+		return err
 	}
 	session.accessToken, session.State = token.AccessToken, Active
 	return nil
@@ -725,6 +767,9 @@ func (service *Service) revokeCredential(ctx context.Context, credential revoked
 	}
 	if credential.secret != "" && service.issuer != nil {
 		result = errors.Join(result, service.issuer.Revoke(ctx, credential.profile.Namespace, credential.secret))
+	}
+	if result == nil && credential.id != "" {
+		result = service.cleanup.remove(ctx, credential.id)
 	}
 	return result
 }
