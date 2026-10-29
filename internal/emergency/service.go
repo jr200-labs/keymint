@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"log/slog"
 	"net/http"
@@ -138,7 +139,7 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer) (*Service,
 		_ = events.close()
 		return nil, err
 	}
-	service := &Service{cleanup: cleanup, http: client, issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	service := &Service{cleanup: cleanup, http: tracing.HTTPClient(client), issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
 	if cfg.Passkeys != nil {
 		service.passkeyVerificationURL = strings.TrimRight(cfg.Passkeys.VerificationURL, "/")
 	}

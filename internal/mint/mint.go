@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"strconv"
@@ -391,7 +392,7 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 			req.OnExchange(apiBase, status, time.Since(started))
 		}
 	}()
-	resp, err := client.Do(httpReq)
+	resp, err := tracing.HTTPClient(client).Do(httpReq)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: POST access_tokens: %w", err)
 	}

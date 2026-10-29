@@ -1,6 +1,8 @@
 package logging
 
 import (
+	"context"
+	"go.opentelemetry.io/otel/trace"
 	"strings"
 
 	"go.uber.org/zap"
@@ -52,4 +54,14 @@ func parseLevel(level string) zapcore.Level {
 	default:
 		return zapcore.InfoLevel
 	}
+}
+
+// FromContext attaches trace correlation without inspecting request payloads.
+func FromContext(ctx context.Context) *zap.Logger {
+	logger := zap.L()
+	span := trace.SpanContextFromContext(ctx)
+	if span.IsValid() {
+		logger = logger.With(zap.String("trace_id", span.TraceID().String()), zap.String("span_id", span.SpanID().String()))
+	}
+	return logger
 }

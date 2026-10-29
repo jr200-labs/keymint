@@ -20,7 +20,7 @@ findings, not a claim that deployment has been changed.
 - [x] 11 P2 Restrict GitHub App JWT signing to supported RS256; retain Ed25519 only for release signing.
 - [x] 12 Instrument every emergency route and its authentication, including denied/error outcomes.
 - [x] 13 Record GitHub exchange latency and clock-offset metrics at their actual observation sites.
-- [ ] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
+- [x] 14 Extract inbound trace context, trace outbound dependencies, and correlate logs with traces.
 - [ ] 15 Use the configured zap logger consistently for emergency lifecycle failures.
 - [ ] 16 Measure refresh/fallback, revocation backlog, journal failure, and configuration reload outcomes with bounded labels.
 - [ ] 17 Centralize emergency lifecycle transitions, pending external operations, profile revisions, and terminal-state guards in an explicit state model.
@@ -146,3 +146,11 @@ GitHub exchanges report transport/HTTP outcomes and duration; parsed Date header
 report actual clock offset. Both metrics identify the configured API endpoint.
 A 503 response regression verifies observation on failure as well as success;
 race-enabled mint, metrics and command tests pass.
+
+### 14 Distributed trace continuity
+
+Inbound middleware extracts trace context. GitHub, Kubernetes, OAuth and release
+key lookups use client spans and propagate context; response-body closure ends
+the client span. Attributes omit URLs, headers and bodies. Completion logs carry
+trace/span IDs and bounded routes. Incoming/outgoing propagation regressions and
+all internal race-enabled tests pass.

@@ -1,9 +1,13 @@
 package server
 
 import (
+	"github.com/jr200-labs/keymint/internal/logging"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 	"net/http"
 	"strconv"
 	"time"
@@ -33,7 +37,7 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (s *Server) observeHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, span := tracer.Start(r.Context(), "http.request", trace.WithSpanKind(trace.SpanKindServer))
+		ctx, span := tracer.Start(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)), "http.request", trace.WithSpanKind(trace.SpanKindServer))
 		defer span.End()
 		r = r.WithContext(ctx)
 		started := time.Now()
@@ -53,6 +57,7 @@ func (s *Server) observeHTTP(next http.Handler) http.Handler {
 			default:
 				method = "other"
 			}
+			logging.FromContext(ctx).Info("HTTP request completed", zap.String("route", route), zap.String("method", method), zap.Int("status", wrapped.status), zap.Duration("duration", time.Since(started)))
 			span.SetName(route)
 			span.SetAttributes(attribute.String("http.route", route), attribute.String("http.request.method", method), attribute.Int("http.response.status_code", wrapped.status))
 			if wrapped.status >= 500 {

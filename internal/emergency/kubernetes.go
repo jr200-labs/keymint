@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"os"
@@ -142,7 +143,7 @@ func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(bearer)))
 	request.Header.Set("Content-Type", "application/json")
-	response, err := issuer.http.Do(request)
+	response, err := tracing.HTTPClient(issuer.http).Do(request)
 	if err != nil {
 		return err
 	}

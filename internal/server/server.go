@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net"
 	"net/http"
@@ -48,6 +49,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
+	"github.com/jr200-labs/keymint/internal/logging"
 	"github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/jr200-labs/keymint/internal/mint"
 	"github.com/jr200-labs/keymint/internal/releasekey"
@@ -825,7 +827,7 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	log := zap.L().With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
+	log := logging.FromContext(ctx).With(zap.String("key", keyName), zap.String("remote", r.RemoteAddr))
 
 	// Pre-auth rate limit: per-remote-IP. Cheap, scoped to attacker so
 	// flooders cannot exhaust authenticated callers' budget.
@@ -1306,7 +1308,7 @@ func (r *K8sTokenReviewer) reviewLocked(ctx context.Context, token string) (revi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := tracing.HTTPClient(r.httpClient).Do(req)
 	if err != nil {
 		return reviewResult{}, fmt.Errorf("server: tokenreview POST: %w", err)
 	}

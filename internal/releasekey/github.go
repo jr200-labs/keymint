@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"net/url"
@@ -36,7 +37,7 @@ func GitHubDestination(ctx context.Context, client *http.Client, base, token, ow
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Accept", "application/vnd.github+json")
-	response, err := bounded.Do(request)
+	response, err := tracing.HTTPClient(&bounded).Do(request)
 	if err != nil {
 		return Destination{}, fmt.Errorf("resolve repository encryption key: %w", err)
 	}
