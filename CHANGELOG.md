@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.1](https://github.com/jr200-labs/keymint/compare/v1.8.0...v1.8.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **deps:** update actions/create-github-app-token action to v3.3.0 ([#117](https://github.com/jr200-labs/keymint/issues/117)) ([f9dfe99](https://github.com/jr200-labs/keymint/commit/f9dfe99ca9d43430b9e1cad4c4598dd56078b2d3))
+* harden credential lifecycle and complete broker observability ([#118](https://github.com/jr200-labs/keymint/issues/118)) ([754599d](https://github.com/jr200-labs/keymint/commit/754599d071a83e4e0a4239edb6b56abde75efd93))
+
 ## [1.8.0](https://github.com/jr200-labs/keymint/compare/v1.7.2...v1.8.0) (2026-10-25)
 
 
