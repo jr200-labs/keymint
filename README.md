@@ -16,10 +16,12 @@ ciphertext for CLI and in-cluster callers.
 - **Emergency sessions**: re-authenticate a human with a WebAuthn passkey,
   GitHub OAuth App device flow, or TOTP, then issue a session-scoped GitHub user or Secret-bound
   Kubernetes token to the authenticated workload. The credential stays in
-  trusted process memory; expiry remotely revokes the OAuth token or deletes
-  the Kubernetes binding Secret. Kubernetes profiles may use either method;
-  Direct passkeys work with the browser's configured provider; TOTP remains the
-  external-service-independent enrollment and recovery method.
+  trusted workload memory; the broker persists encrypted cleanup material before
+  delivery. Expiry revokes the OAuth token or deletes the Kubernetes binding
+  Secret, with failed cleanup retained for retry. Kubernetes profiles support
+  TOTP, GitHub device authentication, or direct passkeys. Passkeys work with the
+  browser's configured provider; TOTP remains the external-service-independent
+  enrollment and recovery method.
 - **Release-key sealing**: after an active emergency session, read an
   allowlisted Sparkle Ed25519 private-key export from a Secret-mounted file and seal it
   directly to GitHub's repository Actions public key. The API returns the
@@ -34,17 +36,15 @@ anything.
 
 ## Status
 
-Early scaffold. Implementation lands in a sequence of small PRs:
+CLI minting, the Git credential helper, service authentication, emergency
+sessions, passkeys and release-key sealing are implemented. The security review
+shipped in [v1.8.1](CHANGELOG.md#181-2026-10-29). See the
+[remediation record](docs/reviews/2026-10-29-remediation.md) for verification and
+remaining integration checks. Releases are published as a container image;
+GitHub release and packaging automation live under `.github/workflows`.
 
-| PR | Scope |
-|----|-------|
-| 1  | Repo scaffold (you are here) |
-| 2  | `internal/mint` — JWT signing + `/access_tokens` |
-| 3  | `internal/sops` + `internal/config` — config + SOPS decrypt |
-| 4  | `internal/credhelper` — git credential helper protocol |
-| 5  | `internal/server` — HTTP serve mode + TokenReview |
-| 6  | Container image release wiring |
-| 7  | Homebrew formula |
+The [domain vocabulary](CONTEXT.md) and [architecture decisions](docs/adr/)
+describe module boundaries, authentication and durable lifecycle storage.
 
 ## Contributing
 
@@ -158,7 +158,7 @@ the deploy accordingly:
   fails fast instead of stalling the request handler pool.
 
 - **Bounded GitHub egress concurrency.** A semaphore caps in-flight
-  POSTs to GitHub at 50 across all keys; bursts queue rather than
+  POSTs to each GitHub API endpoint at 50 across its keys; bursts queue rather than
   fan out without limit and trigger secondary rate limits.
 
 - **Background token refresh.** Tokens are returned from cache while
@@ -297,10 +297,6 @@ which dispatches the container build to ghcr.io.
 
 Never bump versions by hand.
 
-## License
-
-MIT — see [LICENSE](LICENSE).
-
 ### Restricted OAuth emergency sessions
 
 `POST /emergency/sessions` accepts an optional `scopes` array. Nonempty scopes
@@ -325,7 +321,12 @@ key. That installation must be able to read Actions secrets metadata for every
 listed repository. The broker mints a repository-scoped token with `secrets:
 read` and obtains the encryption key directly from the configured HTTPS GitHub
 API. Caller-supplied destination fields are optional and, when present, must
-match the broker lookup. Existing deployments must add `github_key` before
+match the broker lookup. The destination is a **repository Actions secret**;
+organization Actions secrets have a different public key and are not supported
+by this API. Clients selecting an organization key receive HTTP 400 before any
+signing material is read. GitHub App permission changes must be saved on the App
+registration and accepted by its installation; editing desired-state config alone
+does not change a live grant. Existing deployments must add `github_key` before
 upgrading; unbound release-key configuration fails validation.
 
 ### Emergency cleanup storage
@@ -337,3 +338,37 @@ replica. Live authorization remains memory-only, but encrypted revocation
 records survive restart until remote cleanup succeeds. The event stream never
 contains tokens or revocation secrets. Losing either persistent file prevents
 reliable cleanup; retain both during upgrades and recovery.
+
+For Kubernetes upgrades, keep one process owning this volume, including while
+old and new pods transition. A `Recreate` Deployment strategy avoids overlapping
+replicas. When migrating an existing `RollingUpdate` Deployment, clear
+`spec.strategy.rollingUpdate` in the same atomic patch that selects `Recreate`;
+omitting it from a server-side apply can retain the old field and reject the
+upgrade. Verify file permissions after remounting the volume: the generated
+cleanup key must remain owner-only.
+
+### Emergency lifecycle and consumer compatibility
+
+A session begins in `awaiting_github`, `awaiting_totp` or `awaiting_passkey` and
+becomes `active` only after verification and durable activation audit succeed.
+Explicit revocation first enters `revocation_pending`, which immediately denies
+credential access while external cleanup runs. `revoked`, `expired` and
+`invalidated` are terminal states and cannot reactivate. Profile revisions are
+immutable within a session; removal or changed authority invalidates it.
+
+Lifecycle events include `session.revocation_pending` and `session.revoked`.
+Consumers must treat pending revocation as loss of authority and reconcile stale
+bindings after restart or journal replacement. See
+[ADR 0003](docs/adr/0003-publish-durable-emergency-session-events.md). Enrolling a
+passkey requires a still-active TOTP proof when enrollment finishes, not just
+when its ceremony starts.
+
+The current Padd signing client has an organization-secret branch alongside its
+repository-secret branch. The organization branch needs a compatible consumer
+and broker destination contract before it can use this API. The review record
+tracks that open integration follow-up; successful service startup does not
+verify signing bootstrap, remote cleanup recovery, or observability delivery.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

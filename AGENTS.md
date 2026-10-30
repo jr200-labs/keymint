@@ -17,7 +17,10 @@ Two modes:
 
 - **Language**: Go 1.26+
 - **Module**: `github.com/jr200-labs/keymint`
-- **Layout**: cmd/keymint + internal/{version,logging,mint,sops,config,server,credhelper}
+- **Layout**: Cobra wiring in cmd/keymint; installation-token cache/refresh/watchers
+  in internal/broker; shared request authentication in internal/server; emergency
+  state transitions, cleanup and passkeys in internal/emergency. Other modules
+  cover minting, configuration, release-key sealing, logging, metrics and tracing.
 - **CLI framework**: cobra root + per-subcommand `new<Name>Cmd()` constructors
 - **Logging**: zap; `internal/logging.Setup(level, humanReadable)` at startup
 - **Version**: `internal/version.Version` injected via ldflags from
@@ -42,4 +45,5 @@ Two modes:
 
 - Helm chart — consumers deploy via stakater/application or their own chart
 - Project-specific config — keymint is generic, no caller-specific data
-- Webhook server — token mint only
+- Webhook receiver — HTTP endpoints serve minting, emergency sessions and
+  release-key sealing
