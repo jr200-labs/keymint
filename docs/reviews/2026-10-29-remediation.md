@@ -234,3 +234,42 @@ passkey and journal changes require restart. Update dashboards for endpoint
 labels on latency/clock metrics and the new revocation-pending lifecycle state.
 Live GitHub/Kubernetes, physical passkeys, exporter delivery, deployed network
 policy/RBAC, and external reusable workflow execution remain deployment checks.
+
+
+## Deployment evidence and closeout (2026-10-30)
+
+The original 20 review items above are implemented and released in v1.8.1
+(Keymint PRs #118 and #119). IaC PR #2387 supplied the installation binding,
+Secrets-read desired grant, persistent-store guidance and Recreate strategy;
+Janeway audit PR #3 is merged. IaC PR #2388 selected v1.8.1.
+
+An existing RollingUpdate Deployment retained its defaulted rollingUpdate field
+under server-side apply. A local Kubernetes API reproduction rejected both an
+omitted field and an SSA null with the exact production validation error. An
+atomic merge patch setting Recreate and clearing rollingUpdate succeeded; later
+SSA reconciles succeeded. The same UID- and resource-version-guarded patch was
+dry-run validated, applied through Padd breakglass, and verified on the cluster.
+
+Delivery C-01M651FJ072BXDJ6Y21GG72RGM succeeded on 2026-10-29 at 23:56 UTC.
+Helm release revision 157 is deployed. Deployment generation 39 is observed,
+with one updated/available/Ready replica of ghcr.io/jr200-labs/keymint:v1.8.1
+(image digest sha256:4703e4b76807ebd28bf617e8f23e17365d1bca217035689aea0e9694ba1617f2).
+The pod had zero restarts at rollout verification and remained Ready at this
+closeout check. These are dated rollout observations, not proof of all external
+operations.
+
+### Open integration follow-up
+
+- [ ] 21 Reconcile the Padd organization-secret signing branch with Keymint's
+  repository-only destination contract. Padd's internal/scotty/client.go selects
+  an organization key unless the target is a private repository in a Free-plan
+  organization; Keymint rejects any destination other than its fetched repository
+  key. The existing destination-substitution regression proves rejection. This
+  is a source-confirmed compatibility gap, not a captured live signing failure.
+  Preserve broker-resolved destinations when fixing the consumer/API contract.
+
+Live owner acceptance of GitHub App grants, end-to-end signing bootstrap,
+restart cleanup recovery, physical-passkey acceptance, exporter delivery and
+alert routing were not independently verified by the rollout. The HTTP/race
+regressions cover those application boundaries locally. This record does not
+claim operational acceptance for those external checks.

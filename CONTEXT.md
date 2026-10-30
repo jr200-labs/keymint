@@ -37,9 +37,21 @@ _Avoid_: GitHub App installation token
 
 **Emergency event journal**:
 The embedded SQLite log of credential-free Emergency session lifecycle changes.
-It supports replay and bounded HTTP long polling; it is not the store for live
-credentials or authentication ceremony material.
+It supports replay and bounded HTTP long polling. Its event rows contain no
+credentials or authentication ceremony material. The same SQLite database also
+contains the separately encrypted cleanup records.
 
 **Emergency event cursor**:
 An opaque consumer position containing the journal stream generation and event
 position. Consumers persist and return it unchanged.
+
+**Cleanup record**:
+Encrypted revocation material for an issued OAuth token or a reserved Kubernetes
+binding Secret. Stored before credential delivery and removed only after remote
+revocation succeeds. The original provider identity travels with the record;
+restart retries cleanup without restoring session authority.
+
+**Release-key destination**:
+The allowlisted repository Actions encryption key fetched by the broker using
+the configured GitHub App installation. It is distinct from the mounted release
+signing key and from an organization Actions encryption key.
