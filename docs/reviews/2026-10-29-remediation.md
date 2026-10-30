@@ -258,15 +258,31 @@ The pod had zero restarts at rollout verification and remained Ready at this
 closeout check. These are dated rollout observations, not proof of all external
 operations.
 
-### Open integration follow-up
+### Organization-secret integration follow-up
 
-- [ ] 21 Reconcile the Padd organization-secret signing branch with Keymint's
-  repository-only destination contract. Padd's internal/scotty/client.go selects
-  an organization key unless the target is a private repository in a Free-plan
-  organization; Keymint rejects any destination other than its fetched repository
-  key. The existing destination-substitution regression proves rejection. This
-  is a source-confirmed compatibility gap, not a captured live signing failure.
-  Preserve broker-resolved destinations when fixing the consumer/API contract.
+- [x] 21 Support both organization and repository Actions secret destinations
+  through a broker-verified target. Implementation and verification are recorded
+  below; deployment of this follow-up is separate from the v1.8.1 rollout above.
+
+The follow-up adds an explicit secret scope, repository-default policy with
+organization opt-in, and a trusted resolver for both GitHub endpoints. Repository
+lookups retain scoped App authority; organization lookups reuse the active GitHub
+user session with matching API authority. Padd no longer fetches encryption keys
+or supplies recipients; it verifies the broker's scope/owner/project binding
+before writing ciphertext. Configuration, rollout order and the decision are
+recorded in ADR 0004. Verification: full Keymint race suite, full Padd suite, targeted Padd race
+tests for keymint/emergency/scotty/tools, vet, lint (0 issues for both binaries)
+and production builds pass. Crypto tests decrypt only with the intended
+repository/organization key. Regressions reject substituted recipients,
+unapproved scopes/projects, revoked sessions, changed config, different API
+authorities, redirects, invalid public-key metadata and old unbound responses.
+Lookup and sealing outcomes are observed, including denied/error cases.
+The production configuration passes Keymint validation; four invalid policy
+fixtures are rejected, and organization-only policy does not require App
+Secrets permission. Production Kustomize rendering, relative documentation
+links and diff checks pass. Root preview checkpoint manifests are absent in all
+three changed repositories. The implementation is ready for review; it is not
+included in the v1.8.1 rollout recorded above.
 
 Live owner acceptance of GitHub App grants, end-to-end signing bootstrap,
 restart cleanup recovery, physical-passkey acceptance, exporter delivery and

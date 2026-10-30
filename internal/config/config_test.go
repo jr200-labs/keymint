@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/jr200-labs/keymint/internal/githubsecret"
 	"os"
 	"path/filepath"
 	"strings"
@@ -214,5 +215,25 @@ func TestEnterpriseHostIsExact(t *testing.T) {
 	}
 	if _, _, ok := cfg.FindByGitHubURL("https://github.corp.example/org/repo"); !ok {
 		t.Fatal("configured host rejected")
+	}
+}
+
+func TestReleaseSecretScopesAreExplicitAndValidated(t *testing.T) {
+	for _, tc := range []struct {
+		scopes              []githubsecret.Scope
+		valid, organization bool
+	}{
+		{nil, true, false}, {[]githubsecret.Scope{}, false, false}, {[]githubsecret.Scope{githubsecret.Repository, githubsecret.Organization}, true, true},
+		{[]githubsecret.Scope{githubsecret.Organization}, true, true}, {[]githubsecret.Scope{"unknown"}, false, false},
+		{[]githubsecret.Scope{githubsecret.Organization, githubsecret.Organization}, false, false},
+	} {
+		key := ReleaseKey{GitHubKey: "app", Kind: "sparkle_ed25519", PrivateKeyFile: "/unused", Repositories: []string{"example-org/example-app"}, SecretName: "SPARKLE_EDDSA_PRIVATE_KEY", SecretScopes: tc.scopes}
+		cfg := Config{Keys: map[string]Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}}, ReleaseKeys: map[string]ReleaseKey{"signing": key}}
+		if err := cfg.Validate(); (err == nil) != tc.valid {
+			t.Errorf("scopes=%v valid=%v error=%v", tc.scopes, tc.valid, err)
+		}
+		if tc.valid && key.AllowsSecretScope(githubsecret.Organization) != tc.organization {
+			t.Errorf("organization policy=%v", tc.scopes)
+		}
 	}
 }

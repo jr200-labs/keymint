@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -18,16 +19,21 @@ type emergencyTransport func(*http.Request) (*http.Response, error)
 
 func (f emergencyTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func activeEmergency(t *testing.T, cfg *config.Config) (*emergency.Service, string) {
+func activeEmergency(t *testing.T, cfg *config.Config, apiBase ...string) (*emergency.Service, string) {
 	t.Helper()
 	cfg.EmergencyProfiles = map[string]config.EmergencyProfile{"human": {Provider: "github_user", ClientID: "test", ClientSecret: "test", AllowedUserIDs: []int64{1}, Scopes: []string{"repo"}}}
+	if len(apiBase) > 0 {
+		p := cfg.EmergencyProfiles["human"]
+		p.APIBaseURL = apiBase[0]
+		cfg.EmergencyProfiles["human"] = p
+	}
 	cfg.Allowlist[0].EmergencyProfiles = []string{"human"}
 	client := &http.Client{Transport: emergencyTransport(func(r *http.Request) (*http.Response, error) {
 		body := `{"device_code":"test","user_code":"test","interval":5}`
 		if strings.HasSuffix(r.URL.Path, "access_token") {
 			body = `{"access_token":"synthetic"}`
 		}
-		if r.URL.Path == "/user" {
+		if strings.HasSuffix(r.URL.Path, "/user") {
 			body = `{"id":1}`
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -54,7 +60,7 @@ func TestReleaseDestinationRejectsCallerSubstitution(t *testing.T) {
 			t.Errorf("unexpected repository lookup: %s", r.URL.Path)
 		}
 		resolved = true
-		_ = json.NewEncoder(w).Encode(map[string]string{"key_id": "trusted-id", "key": "trusted-key"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"key_id": "trusted-id", "key": base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	}))
 	defer upstream.Close()
 	old := http.DefaultTransport

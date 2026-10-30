@@ -1,11 +1,12 @@
 // Package server implements keymint's in-cluster HTTP service mode.
 //
-// The server exposes one endpoint:
+// The server handles installation tokens, emergency sessions and release-key
+// sealing. Its installation-token endpoint is:
 //
 //	POST /token/<key>
 //	Authorization: Bearer <kubernetes-sa-projected-token>
 //
-// The handler:
+// The installation-token handler:
 //
 //  1. Verifies the inbound bearer token by calling the cluster's
 //     TokenReview API; this returns the resolved ServiceAccount
@@ -38,7 +39,6 @@ import (
 	"net/http"
 	"os"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -48,6 +48,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
+	"github.com/jr200-labs/keymint/internal/githubsecret"
 	"github.com/jr200-labs/keymint/internal/logging"
 	"github.com/jr200-labs/keymint/internal/metrics"
 	"github.com/jr200-labs/keymint/internal/mint"
@@ -69,8 +70,6 @@ type TokenScope = mint.Scope
 
 // MintFunc injects installation issuance.
 type MintFunc func(context.Context, config.Key, mint.Scope) (string, time.Time, error)
-
-var repositoryName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
 
 // configSnapshot is an immutable view of the config + the
 // pre-computed allowedSubject lookup, swapped atomically when
@@ -631,6 +630,20 @@ func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
+	ctx, span := tracer.Start(r.Context(), "release_key.seal")
+	defer span.End()
+	r = r.WithContext(ctx)
+	started, success := time.Now(), false
+	defer func() {
+		var result error
+		if !success {
+			result = errors.New("release-key sealing failed")
+		}
+		s.metrics.ObserveOperation("release_seal", started, result)
+		if result != nil {
+			span.SetStatus(codes.Error, "release-key sealing failed")
+		}
+	}()
 	subject, ok := s.emergencySubject(w, r)
 	if !ok {
 		return
@@ -640,21 +653,25 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		GitHubOwner      string `json:"github_owner"`
-		GitHubRepository string `json:"github_repository"`
+		githubsecret.Target
 		DestinationKeyID string `json:"destination_key_id"`
 		DestinationKey   string `json:"destination_public_key"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil ||
-		!repositoryName.MatchString(input.GitHubOwner) || !repositoryName.MatchString(input.GitHubRepository) {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid release-key sealing request")
 		return
 	}
+	target, err := input.Target.Canonical()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid release-key sealing target")
+		return
+	}
+	span.SetAttributes(attribute.String("keymint.secret.scope", string(target.Scope)))
 	snapshot := s.snapshot.Load()
 	var name string
 	var key config.ReleaseKey
 	for candidate, configured := range snapshot.cfg.ReleaseKeys {
-		if configured.AllowsRepository(input.GitHubOwner, input.GitHubRepository) &&
+		if configured.AllowsRepository(target.Owner, target.Repository) && configured.AllowsSecretScope(target.Scope) &&
 			snapshot.allowedRelease[subject][candidate] {
 			name, key = candidate, configured
 			break
@@ -664,37 +681,63 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "release signing key is unavailable")
 		return
 	}
+	auditLog := logging.FromContext(r.Context()).With(zap.String("subject", subject), zap.String("release_key", name), zap.String("secret_scope", string(target.Scope)), zap.String("session", r.PathValue("id")), zap.String("repository", target.Owner+"/"+target.Repository))
 	installation, exists := snapshot.cfg.Keys[key.GitHubKey]
 	if !exists {
 		writeJSONError(w, http.StatusServiceUnavailable, "release-key destination resolver is unavailable")
 		return
 	}
-	token, _, err := s.mint(r.Context(), installation, TokenScope{Repositories: []string{input.GitHubRepository}, Permissions: map[string]string{"secrets": "read"}})
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
-		return
+	var token string
+	if target.Scope == githubsecret.Organization {
+		authority, authErr := s.emergency.AuthorizeGitHub(subject, r.PathValue("id"))
+		if authErr != nil {
+			writeJSONError(w, http.StatusForbidden, authErr.Error())
+			return
+		}
+		sessionBase, sessionErr := githubsecret.APIBase(authority.APIBaseURL)
+		installationBase, installationErr := githubsecret.APIBase(installation.APIBaseURL)
+		if sessionErr != nil || installationErr != nil || sessionBase != installationBase {
+			writeJSONError(w, http.StatusForbidden, "GitHub session belongs to a different API endpoint")
+			return
+		}
+		token = authority.Token
+	} else {
+		token, _, err = s.mint(r.Context(), installation, TokenScope{Repositories: []string{target.Repository}, Permissions: map[string]string{"secrets": "read"}})
+		if err != nil {
+			auditLog.Error("mint release lookup authority", zap.Error(err))
+			writeJSONError(w, http.StatusBadGateway, "Actions encryption key could not be resolved")
+			return
+		}
 	}
-	destination, err := releasekey.GitHubDestination(r.Context(), nil, installation.APIBaseURL, token, input.GitHubOwner, input.GitHubRepository)
+	lookupStarted := time.Now()
+	destination, err := githubsecret.Resolve(r.Context(), nil, installation.APIBaseURL, token, target)
+	s.metrics.ObserveOperation("release_lookup", lookupStarted, err)
 	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "repository encryption key could not be resolved")
+		auditLog.Error("resolve release destination", zap.Error(err))
+		writeJSONError(w, http.StatusBadGateway, "Actions encryption key could not be resolved")
 		return
 	}
 	// Retain compatibility with clients sending GitHub's key, but reject stale
 	// or substituted keys. Only the broker-resolved value reaches Seal.
 	if (input.DestinationKeyID != "" && input.DestinationKeyID != destination.KeyID) ||
 		(input.DestinationKey != "" && input.DestinationKey != destination.PublicKey) {
-		writeJSONError(w, http.StatusBadRequest, "destination does not match the repository encryption key")
+		writeJSONError(w, http.StatusBadRequest, "destination does not match the selected Actions encryption key")
+		return
+	}
+	if s.snapshot.Load() != snapshot || s.emergency.Authorize(subject, r.PathValue("id")) != nil {
+		writeJSONError(w, http.StatusConflict, "release-key authorization changed during lookup; retry")
 		return
 	}
 	sealed, err := releasekey.Seal(key, destination)
 	if err != nil {
-		logging.FromContext(r.Context()).Error("seal release signing key", zap.String("subject", subject), zap.String("release_key", name), zap.Error(err))
+		auditLog.Error("seal release signing key", zap.Error(err))
 		writeJSONError(w, http.StatusInternalServerError, "release signing key could not be sealed")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	logging.FromContext(r.Context()).Info("release signing key sealed", zap.String("subject", subject), zap.String("release_key", name),
-		zap.String("destination_key_id", destination.KeyID), zap.String("repository", input.GitHubOwner+"/"+input.GitHubRepository), zap.String("session", r.PathValue("id")))
+	auditLog.Info("release signing key sealed", zap.String("destination_key_id", destination.KeyID))
+	success = true
+	span.SetStatus(codes.Ok, "")
 	writeJSON(w, sealed)
 }
 

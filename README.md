@@ -316,18 +316,54 @@ their own operation and repository approvals and must not reuse a broader sessio
 
 ### Release-key destination lookup
 
-Each `release_keys` entry must set `github_key` to a configured installation
-key. That installation must be able to read Actions secrets metadata for every
-listed repository. The broker mints a repository-scoped token with `secrets:
-read` and obtains the encryption key directly from the configured HTTPS GitHub
-API. Caller-supplied destination fields are optional and, when present, must
-match the broker lookup. The destination is a **repository Actions secret**;
-organization Actions secrets have a different public key and are not supported
-by this API. Clients selecting an organization key receive HTTP 400 before any
-signing material is read. GitHub App permission changes must be saved on the App
-registration and accepted by its installation; editing desired-state config alone
-does not change a live grant. Existing deployments must add `github_key` before
-upgrading; unbound release-key configuration fails validation.
+Release-key policy binds an exact repository allowlist, a trusted GitHub API
+installation (`github_key`), and permitted `secret_scopes`. Omitted scopes default
+to `[repository]`; organization storage requires explicit opt-in:
+
+```yaml
+release_keys:
+  internal-signing:
+    kind: sparkle_ed25519
+    github_key: release-lookup
+    secret_scopes: [repository, organization]
+    private_key_file: /run/release-keys/internal-signing
+    repositories: [example-org/example-app]
+    secret_name: SPARKLE_EDDSA_PRIVATE_KEY
+```
+
+`release-lookup` must reference a configured `keys` entry. For repository secrets,
+the broker mints a repository-scoped installation token with `secrets: read` and
+fetches `/repos/{owner}/{repository}/actions/secrets/public-key`. For organization
+secrets, it uses the active GitHub-user emergency session to fetch
+`/orgs/{owner}/actions/secrets/public-key`. The session must have the GitHub grants
+needed for that operation (`admin:org`, plus `repo` for private repositories).
+Kubernetes-backed sessions cannot authorize organization lookups. The OAuth API
+and configured installation API must match, including an Enterprise base path.
+
+Clients submit `github_owner`, `github_repository` and `secret_scope` to
+`POST /emergency/sessions/{id}/seal-release-key`. Scope is `repository` or
+`organization`; omission retains repository behavior for existing clients. The
+repository remains mandatory for organization secrets because release policy
+authorizes an individual project. Unknown scopes, disabled destinations and
+unlisted projects fail closed. The broker fetches the encryption key over HTTPS,
+rejects redirects, and rechecks authorization after lookup before reading signing
+material. Optional legacy `destination_key_id` and `destination_public_key`
+fields must match the broker lookup; callers cannot choose an arbitrary key.
+
+The response binds `secret_scope`, `github_owner` and `github_repository` to the
+`destination_key_id` and `encrypted_value`. Consumers must verify that complete
+binding before writing the ciphertext to the matching GitHub endpoint. Padd
+performs this check and maintains selected-repository access for organization
+secrets. The broker's project allowlist does not itself change GitHub's secret
+access policy.
+
+Deploy the updated Keymint before the updated Padd client. Enable organization
+scope in deployment config before using the new organization branch. Older
+Padd repository requests remain supported; the new client rejects old unbound
+broker responses. Organization lookup reuses the existing GitHub break-glass
+session and does not require an additional organization permission on the App.
+Repository lookup still needs the existing App Secrets-read grant. Configure and
+approve any missing GitHub grants before operational acceptance.
 
 ### Emergency cleanup storage
 
@@ -363,11 +399,11 @@ bindings after restart or journal replacement. See
 passkey requires a still-active TOTP proof when enrollment finishes, not just
 when its ceremony starts.
 
-The current Padd signing client has an organization-secret branch alongside its
-repository-secret branch. The organization branch needs a compatible consumer
-and broker destination contract before it can use this API. The review record
-tracks that open integration follow-up; successful service startup does not
-verify signing bootstrap, remote cleanup recovery, or observability delivery.
+Padd chooses organization storage for its shared-secret path and repository
+storage for private repositories in Free-plan organizations. Both use the same
+explicit target contract and broker-resolved encryption keys. Successful startup
+is separate from live signing bootstrap, remote cleanup recovery and
+observability delivery; verify those operations after the coordinated rollout.
 
 ## License
 
