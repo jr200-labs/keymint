@@ -52,6 +52,9 @@ revocation succeeds. The original provider identity travels with the record;
 restart retries cleanup without restoring session authority.
 
 **Release-key destination**:
-The allowlisted repository Actions encryption key fetched by the broker using
-the configured GitHub App installation. It is distinct from the mounted release
-signing key and from an organization Actions encryption key.
+The explicitly selected repository or organization Actions secret location for
+an allowlisted project. The broker fetches its encryption key using installation
+authority for repository scope or the active GitHub-user emergency session for
+organization scope. The result binds scope, owner and project to ciphertext;
+consumers verify that binding before writing the Actions secret. It is distinct
+from the mounted release signing key and from the secret's GitHub access policy.

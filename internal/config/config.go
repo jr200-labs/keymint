@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jr200-labs/keymint/internal/githubsecret"
 	"gopkg.in/yaml.v3"
 )
 
@@ -144,11 +145,25 @@ type Key struct {
 // GitHub repositories. A shared internal identity may be reused without making
 // it available to repositories that were not reviewed here.
 type ReleaseKey struct {
-	GitHubKey      string   `yaml:"github_key"` // configured installation used to resolve the repository encryption key
-	Kind           string   `yaml:"kind"`
-	PrivateKeyFile string   `yaml:"private_key_file"`
-	Repositories   []string `yaml:"repositories"`
-	SecretName     string   `yaml:"secret_name"`
+	SecretScopes   []githubsecret.Scope `yaml:"secret_scopes,omitempty"`
+	GitHubKey      string               `yaml:"github_key"` // trusted GitHub API identity and repository lookup authority
+	Kind           string               `yaml:"kind"`
+	PrivateKeyFile string               `yaml:"private_key_file"`
+	Repositories   []string             `yaml:"repositories"`
+	SecretName     string               `yaml:"secret_name"`
+}
+
+// AllowsSecretScope defaults existing configurations to repository destinations.
+func (k ReleaseKey) AllowsSecretScope(scope githubsecret.Scope) bool {
+	if len(k.SecretScopes) == 0 {
+		return scope == githubsecret.Repository
+	}
+	for _, allowed := range k.SecretScopes {
+		if scope == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowsRepository reports whether this release key may be provisioned for the
@@ -242,6 +257,16 @@ func (c *Config) Validate() error {
 	}
 	identifier := regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
 	for name, key := range c.ReleaseKeys {
+		if key.SecretScopes != nil && len(key.SecretScopes) == 0 {
+			return fmt.Errorf("release key %q: secret_scopes must not be empty", name)
+		}
+		seenScopes := map[githubsecret.Scope]bool{}
+		for _, scope := range key.SecretScopes {
+			if !scope.Valid() || seenScopes[scope] {
+				return fmt.Errorf("release key %q: secret_scopes must contain unique repository or organization values", name)
+			}
+			seenScopes[scope] = true
+		}
 		if !identifier.MatchString(name) {
 			return fmt.Errorf("release key name %q is invalid", name)
 		}

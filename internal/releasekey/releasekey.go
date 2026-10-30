@@ -13,17 +13,16 @@ import (
 	"strings"
 
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/githubsecret"
 	"golang.org/x/crypto/nacl/box"
 )
 
 const maxPrivateKeyFile = 4096
 
-type Destination struct {
-	KeyID     string
-	PublicKey string
-}
+type Destination = githubsecret.Destination
 
 type Sealed struct {
+	githubsecret.Target
 	PublicKey      string `json:"public_key"`
 	SecretName     string `json:"secret_name"`
 	DestinationKey string `json:"destination_key_id"`
@@ -68,6 +67,7 @@ func Seal(key config.ReleaseKey, destination Destination) (Sealed, error) {
 		return Sealed{}, fmt.Errorf("seal release signing key: %w", err)
 	}
 	return Sealed{
+		Target:         destination.Target,
 		PublicKey:      base64.StdEncoding.EncodeToString(public),
 		SecretName:     key.SecretName,
 		DestinationKey: destination.KeyID,

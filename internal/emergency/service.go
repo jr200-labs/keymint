@@ -649,6 +649,33 @@ func (service *Service) Authorize(subject, id string) error {
 	return nil
 }
 
+// GitHubAuthorization keeps an OAuth credential bound to its original API.
+// It is internal broker authority, never serialized in a sealing response.
+type GitHubAuthorization struct {
+	Token      string
+	APIBaseURL string
+}
+
+// AuthorizeOrganizationSecret requires an active GitHub user session whose
+// effective requested scopes permit organization secrets. It never issues a
+// Kubernetes credential or broadens a restricted emergency session.
+func (service *Service) AuthorizeOrganizationSecret(subject, id string) (GitHubAuthorization, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	session, err := service.ownedSession(subject, id)
+	if err != nil || service.closed || session.State != Active || !session.ExpiresAt.After(service.now()) || session.profile.Provider != "github_user" || session.accessToken == "" {
+		return GitHubAuthorization{}, errors.New("an active GitHub user session is required for organization secrets")
+	}
+	scopes := session.Scopes
+	if len(scopes) == 0 {
+		scopes = session.profile.Scopes
+	}
+	if !slices.Contains(scopes, "admin:org") {
+		return GitHubAuthorization{}, errors.New("GitHub session must allow admin:org for organization secrets")
+	}
+	return GitHubAuthorization{Token: session.accessToken, APIBaseURL: session.profile.APIBaseURL}, nil
+}
+
 func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 	session, release, err := service.beginOperation(ctx, subject, id, revoking)
 	if err != nil {
