@@ -337,7 +337,8 @@ fetches `/repos/{owner}/{repository}/actions/secrets/public-key`. For organizati
 secrets, it uses the active GitHub-user emergency session to fetch
 `/orgs/{owner}/actions/secrets/public-key`. The session must have the GitHub grants
 needed for that operation (`admin:org`, plus `repo` for private repositories).
-Kubernetes-backed sessions cannot authorize organization lookups. The OAuth API
+Kubernetes-backed sessions cannot authorize organization lookups. A restricted
+session cannot inherit broader organization permissions from its profile. The OAuth API
 and configured installation API must match, including an Enterprise base path.
 
 Clients submit `github_owner`, `github_repository` and `secret_scope` to

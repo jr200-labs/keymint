@@ -22,7 +22,9 @@ rejects redirects and never derives an authority from caller-supplied URLs.
 Repository lookup uses a scoped installation token. Organization lookup uses the
 active GitHub-user emergency session, with its original API authority checked
 against the configured installation API, so OAuth credentials cannot cross hosts
-or Enterprise API paths. No new organization-wide App permission is necessary.
+or Enterprise API paths. The effective requested session scopes must include admin:org; a restricted
+session cannot inherit broader profile authority. No new organization-wide App
+permission is necessary.
 
 The response echoes scope, owner and project alongside the encryption-key ID and
 ciphertext. Padd uses a typed target and rejects missing or mismatched bindings

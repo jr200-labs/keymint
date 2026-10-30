@@ -21,7 +21,7 @@ func (f emergencyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func activeEmergency(t *testing.T, cfg *config.Config, apiBase ...string) (*emergency.Service, string) {
 	t.Helper()
-	cfg.EmergencyProfiles = map[string]config.EmergencyProfile{"human": {Provider: "github_user", ClientID: "test", ClientSecret: "test", AllowedUserIDs: []int64{1}, Scopes: []string{"repo"}}}
+	cfg.EmergencyProfiles = map[string]config.EmergencyProfile{"human": {Provider: "github_user", ClientID: "test", ClientSecret: "test", AllowedUserIDs: []int64{1}, Scopes: []string{"repo", "admin:org"}}}
 	if len(apiBase) > 0 {
 		p := cfg.EmergencyProfiles["human"]
 		p.APIBaseURL = apiBase[0]

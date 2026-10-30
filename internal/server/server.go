@@ -689,7 +689,7 @@ func (s *Server) handleSealReleaseKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var token string
 	if target.Scope == githubsecret.Organization {
-		authority, authErr := s.emergency.AuthorizeGitHub(subject, r.PathValue("id"))
+		authority, authErr := s.emergency.AuthorizeOrganizationSecret(subject, r.PathValue("id"))
 		if authErr != nil {
 			writeJSONError(w, http.StatusForbidden, authErr.Error())
 			return

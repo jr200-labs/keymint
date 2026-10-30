@@ -275,7 +275,7 @@ tests for keymint/emergency/scotty/tools, vet, lint (0 issues for both binaries)
 and production builds pass. Crypto tests decrypt only with the intended
 repository/organization key. Regressions reject substituted recipients,
 unapproved scopes/projects, revoked sessions, changed config, different API
-authorities, redirects, invalid public-key metadata and old unbound responses.
+authorities, scope-restricted sessions, redirects, invalid public-key metadata and old unbound responses.
 Lookup and sealing outcomes are observed, including denied/error cases.
 The production configuration passes Keymint validation; four invalid policy
 fixtures are rejected, and organization-only policy does not require App
