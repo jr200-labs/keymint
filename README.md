@@ -38,7 +38,8 @@ anything.
 
 CLI minting, the Git credential helper, service authentication, emergency
 sessions, passkeys and release-key sealing are implemented. The security review
-shipped in [v1.8.1](CHANGELOG.md#181-2026-10-29). See the
+shipped in [v1.8.1](CHANGELOG.md#181-2026-10-29); verified organization-secret
+destinations followed in [v1.9.0](CHANGELOG.md#190-2026-10-30). See the
 [remediation record](docs/reviews/2026-10-29-remediation.md) for verification and
 remaining integration checks. Releases are published as a container image;
 GitHub release and packaging automation live under `.github/workflows`.
