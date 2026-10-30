@@ -251,7 +251,7 @@ SSA reconciles succeeded. The same UID- and resource-version-guarded patch was
 dry-run validated, applied through Padd breakglass, and verified on the cluster.
 
 Delivery C-01M651FJ072BXDJ6Y21GG72RGM succeeded on 2026-10-29 at 23:56 UTC.
-Helm release revision 157 is deployed. Deployment generation 39 is observed,
+Helm release revision 157 was deployed. Deployment generation 39 was observed,
 with one updated/available/Ready replica of ghcr.io/jr200-labs/keymint:v1.8.1
 (image digest sha256:4703e4b76807ebd28bf617e8f23e17365d1bca217035689aea0e9694ba1617f2).
 The pod had zero restarts at rollout verification and remained Ready at this
@@ -281,11 +281,34 @@ The production configuration passes Keymint validation; four invalid policy
 fixtures are rejected, and organization-only policy does not require App
 Secrets permission. Production Kustomize rendering, relative documentation
 links and diff checks pass. Root preview checkpoint manifests are absent in all
-three changed repositories. The implementation is ready for review; it is not
-included in the v1.8.1 rollout recorded above.
+three changed repositories. The implementation was released in v1.9.0 and
+deployed with the matching consumer as recorded below.
 
 Live owner acceptance of GitHub App grants, end-to-end signing bootstrap,
 restart cleanup recovery, physical-passkey acceptance, exporter delivery and
 alert routing were not independently verified by the rollout. The HTTP/race
 regressions cover those application boundaries locally. This record does not
 claim operational acceptance for those external checks.
+
+
+### Organization-secret rollout completion
+
+Keymint PR #122 and release PR #123 published v1.9.0. The matching consumer
+release is Padd v0.2.176. IaC PR #2393 enabled the reviewed organization policy,
+and IaC PR #2397 selected Keymint v1.9.0. The live release-key configuration
+permits both repository and organization secret destinations.
+
+Delivery C-01M65CTABFTEA243N7SA1KRNHD succeeded on 2026-10-30 at 03:16 UTC.
+Helm release revision 158 is deployed. Keymint Deployment generation 40 is
+observed with one updated/Ready v1.9.0 replica, Recreate strategy and zero pod
+restarts. The running image digest is
+sha256:3b75277bba2a1bc7566bde67fe4c33cf7f1de5f5d14945c9a044409ae9280fe8.
+The consumer Deployment generation 367 is observed with one updated/Ready
+v0.2.176 replica.
+
+An earlier successful reconciliation still had v1.8.1 running; completion was
+accepted only after checking the actual image against the authoritative IaC pin
+and live Helm values. All 21 implementation items are checked off and the
+matching versions are now deployed. No live GitHub secret was rewritten for
+verification; end-to-end bootstrap and other external acceptance limits above
+remain distinct from the verified rollout.
