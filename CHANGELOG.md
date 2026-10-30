@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/jr200-labs/keymint/compare/v1.8.1...v1.9.0) (2026-10-30)
+
+
+### Features
+
+* support broker-verified organization secret destinations ([#122](https://github.com/jr200-labs/keymint/issues/122)) ([09a7bdb](https://github.com/jr200-labs/keymint/commit/09a7bdb300e9a9ef213818406753e82e2e19e46f))
+
 ## [1.8.1](https://github.com/jr200-labs/keymint/compare/v1.8.0...v1.8.1) (2026-10-29)
 
 
