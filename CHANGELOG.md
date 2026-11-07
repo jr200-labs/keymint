@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.1](https://github.com/jr200-labs/keymint/compare/v1.9.0...v1.9.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* **deps:** update actions/create-github-app-token action to v3.3.0 ([#125](https://github.com/jr200-labs/keymint/issues/125)) ([f72b4bd](https://github.com/jr200-labs/keymint/commit/f72b4bddcf51018ccd4b2e7ecb71cb59f8a188f2))
+* **deps:** update module modernc.org/sqlite to v1.61.1 ([#126](https://github.com/jr200-labs/keymint/issues/126)) ([4d0b013](https://github.com/jr200-labs/keymint/commit/4d0b013792303edd151e2386ece7fb7edacca14d))
+
 ## [1.9.0](https://github.com/jr200-labs/keymint/compare/v1.8.1...v1.9.0) (2026-10-30)
 
 
