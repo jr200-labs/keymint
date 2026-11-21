@@ -339,6 +339,10 @@ func (c *Config) Validate() error {
 			if profile.AuthenticationMethod() != "github_device" {
 				return fmt.Errorf("emergency profile %q: GitHub user credentials require github_device authentication", name)
 			}
+		case "approval":
+			if profile.AuthenticationMethod() != "webauthn" || profile.Namespace != "" || profile.ServiceAccount != "" {
+				return fmt.Errorf("emergency profile %q: approval requires WebAuthn and cannot issue Kubernetes credentials", name)
+			}
 		case "kubernetes":
 			if profile.Namespace == "" || profile.ServiceAccount == "" {
 				return fmt.Errorf("emergency profile %q: namespace and service_account are required", name)
@@ -375,14 +379,25 @@ func (p EmergencyProfile) AuthenticationMethod() string {
 	return "totp"
 }
 
-// TTL returns the configured maximum session duration, defaulting to 15 minutes.
+const (
+	MinApprovalTTL = 5 * time.Minute
+	MaxApprovalTTL = time.Hour
+)
+
+// TTL returns the configured maximum session duration.
 func (p EmergencyProfile) TTL() (time.Duration, error) {
 	if p.MaxTTL == "" {
+		if p.Provider == "approval" {
+			return MaxApprovalTTL, nil
+		}
 		return 15 * time.Minute, nil
 	}
 	ttl, err := time.ParseDuration(p.MaxTTL)
 	if err != nil || ttl <= 0 || ttl > time.Hour {
 		return 0, errors.New("max_ttl must be between 1ns and 1h")
+	}
+	if p.Provider == "approval" && ttl < MinApprovalTTL {
+		return 0, errors.New("approval max_ttl must be between 5m and 1h")
 	}
 	return ttl, nil
 }

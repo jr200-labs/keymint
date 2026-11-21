@@ -9,6 +9,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +54,9 @@ type Profile struct {
 }
 
 type Session struct {
+	ApprovalLabel   string    `json:"approval_label,omitempty"`
+	ApprovalDigest  string    `json:"approval_digest,omitempty"`
+	ApprovalUsed    bool      `json:"approval_used,omitempty"`
 	Scopes          []string  `json:"scopes,omitempty"`
 	ID              string    `json:"id"`
 	Profile         string    `json:"profile"`
@@ -262,6 +266,24 @@ func (service *Service) Create(ctx context.Context, subject, profileName string,
 
 // CreateWithScopes only permits a subset of the configured OAuth profile.
 func (service *Service) CreateWithScopes(ctx context.Context, subject, profileName string, requestedTTL time.Duration, scopes []string) (Session, error) {
+	return service.create(ctx, subject, profileName, requestedTTL, scopes, "", "")
+}
+
+func (service *Service) CreateApproval(ctx context.Context, subject, profileName string, ttl time.Duration, digest, label string) (Session, error) {
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 200 || strings.ContainsAny(label, "\r\n") {
+		return Session{}, errors.New("approval requires a SHA-256 digest and a review label")
+	}
+	if ttl == 0 {
+		ttl = config.MinApprovalTTL
+	}
+	if ttl < config.MinApprovalTTL || ttl > config.MaxApprovalTTL {
+		return Session{}, errors.New("approval TTL must be between five minutes and one hour")
+	}
+	return service.create(ctx, subject, profileName, ttl, nil, digest, label)
+}
+
+func (service *Service) create(ctx context.Context, subject, profileName string, requestedTTL time.Duration, scopes []string, digest, label string) (Session, error) {
 	service.mu.Lock()
 	profile, exists := service.profiles[profileName]
 	allowed := service.allowed[subject][profileName]
@@ -270,6 +292,9 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 	service.mu.Unlock()
 	if !exists || !allowed {
 		return Session{}, errors.New("emergency profile is unavailable")
+	}
+	if (profile.Provider == "approval") != (digest != "") {
+		return Session{}, errors.New("approval profile and bound request are required together")
 	}
 	if len(scopes) > 0 {
 		if profile.Provider != "github_user" {
@@ -285,7 +310,13 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		scopes = slices.Compact(scopes)
 		profile.Scopes = scopes
 	}
-	maxTTL, _ := profile.TTL()
+	maxTTL, err := profile.TTL()
+	if err != nil {
+		return Session{}, err
+	}
+	if digest != "" && requestedTTL > maxTTL {
+		return Session{}, errors.New("approval TTL exceeds the profile maximum")
+	}
 	if requestedTTL <= 0 || requestedTTL > maxTTL {
 		requestedTTL = maxTTL
 	}
@@ -294,7 +325,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 	if err != nil {
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
-	session := &Session{profile: originalProfile, Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
+	session := &Session{profile: originalProfile, ApprovalDigest: digest, ApprovalLabel: label, Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
 	switch profile.AuthenticationMethod() {
 	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
@@ -319,8 +350,12 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 		}
 		session.State = AwaitingPasskey
 		session.VerificationURI = service.passkeyVerificationURL + "/#" + token
+		ceremonyExpiry := now.Add(5 * time.Minute)
+		if digest != "" {
+			ceremonyExpiry = session.ExpiresAt
+		}
 		service.mu.Lock()
-		service.ceremonies[token] = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: now.Add(5 * time.Minute)}
+		service.ceremonies[token] = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: ceremonyExpiry}
 		service.mu.Unlock()
 	default:
 		return Session{}, errors.New("unsupported emergency authentication")
@@ -391,7 +426,15 @@ func (service *Service) PasskeyOptions(subject, token string) (map[string]any, e
 	if !ok || ceremony.subject != subject || !ceremony.expiresAt.After(service.now()) {
 		return nil, errors.New("passkey ceremony not found or expired")
 	}
-	return map[string]any{"kind": ceremony.kind, "public_key": ceremony.options}, nil
+	options := map[string]any{"kind": ceremony.kind, "public_key": ceremony.options}
+	if session := service.sessions[ceremony.sessionID]; session != nil && session.Provider == "approval" {
+		if session.State != AwaitingPasskey || !session.ExpiresAt.After(service.now()) {
+			return nil, errors.New("approval is unavailable")
+		}
+		options["approval_label"] = session.ApprovalLabel
+		options["expires_at"] = session.ExpiresAt
+	}
+	return options, nil
 }
 
 func (service *Service) VerifyPasskey(subject, token string, request *http.Request) error {
@@ -575,6 +618,22 @@ func (service *Service) VerifyTOTP(subject, id, code string) (Session, error) {
 	return result, err
 }
 
+// RedeemApproval consumes an exact, active approval before the caller dispatches.
+func (service *Service) RedeemApproval(ctx context.Context, subject, id, digest string) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	session, err := service.ownedSession(subject, id)
+	if err != nil || service.closed || session.Provider != "approval" || session.State != Active ||
+		!session.ExpiresAt.After(service.now()) || session.ApprovalDigest != digest || session.ApprovalUsed {
+		return errors.New("approval is unavailable")
+	}
+	if err := service.record(ctx, "approval.redeemed", session); err != nil {
+		return err
+	}
+	session.ApprovalUsed = true
+	return nil
+}
+
 func (service *Service) Credential(ctx context.Context, subject, id string) (Credential, error) {
 	session, release, err := service.beginOperation(ctx, subject, id, issuing)
 	if err != nil {
@@ -591,6 +650,10 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		credential := Credential{Provider: profile.Provider, Token: session.accessToken, ExpiresAt: session.ExpiresAt}
 		service.mu.Unlock()
 		return credential, nil
+	}
+	if profile.Provider != "kubernetes" {
+		service.mu.Unlock()
+		return Credential{}, errors.New("session cannot issue credentials")
 	}
 	boundSecret := session.boundSecret
 	ttl := session.ExpiresAt.Sub(service.now())
@@ -643,7 +706,7 @@ func (service *Service) Authorize(subject, id string) error {
 	if err != nil {
 		return err
 	}
-	if session.State != Active || !session.ExpiresAt.After(service.now()) {
+	if service.closed || session.Provider == "approval" || session.State != Active || !session.ExpiresAt.After(service.now()) {
 		return errors.New("emergency session is not active")
 	}
 	return nil
@@ -717,7 +780,7 @@ func (service *Service) record(ctx context.Context, eventType string, session *S
 	return service.events.append(ctx, Event{
 		Type: eventType, SessionID: session.ID, Subject: session.subject,
 		Profile: session.Profile, Provider: session.Provider, State: session.State,
-		ExpiresAt: session.ExpiresAt, OccurredAt: service.now().UTC(),
+		ApprovalDigest: session.ApprovalDigest, ExpiresAt: session.ExpiresAt, OccurredAt: service.now().UTC(),
 	})
 }
 

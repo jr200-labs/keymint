@@ -82,7 +82,8 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	}
 	cfg := &config.Config{Passkeys: &config.PasskeyConfig{RPID: "keys.example", RPDisplayName: "Keymint", RPOrigins: []string{"https://keys.example"}, VerificationURL: "https://keys.example", StateFile: filepath.Join(dir, "passkeys.json")}, EmergencyProfiles: map[string]config.EmergencyProfile{
 		"totp": {Provider: "kubernetes", TOTPSecretFile: secret}, "passkey": {Provider: "kubernetes", Authentication: "webauthn"},
-	}, Allowlist: []config.AllowEntry{{Subject: "caller", EmergencyProfiles: []string{"totp", "passkey"}}}}
+		"approval": {Provider: "approval", Authentication: "webauthn"},
+	}, Allowlist: []config.AllowEntry{{Subject: "caller", EmergencyProfiles: []string{"totp", "passkey", "approval"}}}}
 	service, err := New(cfg, http.DefaultClient, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -125,6 +126,32 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 			}
 		} else if err == nil {
 			t.Fatal("wrong origin accepted")
+		}
+	}
+	ctx := context.Background()
+	digest := strings.Repeat("a", 64)
+	for _, invalidTTL := range []time.Duration{5*time.Minute - time.Second, time.Hour + time.Second} {
+		if _, err := service.CreateApproval(ctx, "caller", "approval", invalidTTL, digest, "Read count"); err == nil {
+			t.Fatalf("accepted out-of-range TTL %s", invalidTTL)
+		}
+	}
+	for _, tt := range []struct{ requested, expected time.Duration }{{0, 5 * time.Minute}, {time.Hour, time.Hour}} {
+		approval, err := service.CreateApproval(ctx, "caller", "approval", tt.requested, digest, "Read count")
+		if err != nil || approval.ExpiresAt.Sub(service.now()) != tt.expected {
+			t.Fatalf("approval for %s = expiry %v, err %v", tt.requested, approval.ExpiresAt, err)
+		}
+		if tt.requested == time.Hour {
+			_, token, _ := strings.Cut(approval.VerificationURI, "#")
+			created := service.now()
+			service.now = func() time.Time { return created.Add(10 * time.Minute) }
+			if _, err := service.PasskeyOptions("caller", token); err != nil {
+				t.Fatalf("one-hour approval ceremony expired early: %v", err)
+			}
+			service.now = func() time.Time { return approval.ExpiresAt }
+			if _, err := service.PasskeyOptions("caller", token); err == nil {
+				t.Fatal("expired approval ceremony was still available")
+			}
+			service.now = func() time.Time { return created }
 		}
 	}
 	enrollment, err = service.BeginPasskeyEnrollment("caller", proof.ID)

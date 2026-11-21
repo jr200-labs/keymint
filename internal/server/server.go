@@ -405,6 +405,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /emergency/sessions/{id}", s.handleEmergencyGet)
 	mux.HandleFunc("POST /emergency/sessions/{id}/verify", s.handleEmergencyVerify)
 	mux.HandleFunc("POST /emergency/sessions/{id}/credential", s.handleEmergencyCredential)
+	mux.HandleFunc("POST /emergency/sessions/{id}/redeem-approval", s.handleRedeemApproval)
 	mux.HandleFunc("POST /emergency/sessions/{id}/seal-release-key", s.handleSealReleaseKey)
 	mux.HandleFunc("DELETE /emergency/sessions/{id}", s.handleEmergencyRevoke)
 	mux.HandleFunc("GET /emergency/passkeys/ceremonies/{token}", s.handlePasskeyOptions)
@@ -562,15 +563,31 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Profile    string   `json:"profile"`
-		TTLSeconds int64    `json:"ttl_seconds"`
-		Scopes     []string `json:"scopes"`
+		Profile        string   `json:"profile"`
+		TTLSeconds     *int64   `json:"ttl_seconds"`
+		Scopes         []string `json:"scopes"`
+		ApprovalDigest string   `json:"approval_digest"`
+		ApprovalLabel  string   `json:"approval_label"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	session, err := s.emergency.CreateWithScopes(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second, input.Scopes)
+	var session emergency.Session
+	var err error
+	var ttlSeconds int64
+	if input.TTLSeconds != nil {
+		ttlSeconds = *input.TTLSeconds
+	}
+	if input.ApprovalDigest != "" {
+		if (input.TTLSeconds != nil && (ttlSeconds < 300 || ttlSeconds > 3600)) || len(input.Scopes) != 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid approval TTL or scopes")
+			return
+		}
+		session, err = s.emergency.CreateApproval(r.Context(), subject, input.Profile, time.Duration(ttlSeconds)*time.Second, input.ApprovalDigest, input.ApprovalLabel)
+	} else {
+		session, err = s.emergency.CreateWithScopes(r.Context(), subject, input.Profile, time.Duration(ttlSeconds)*time.Second, input.Scopes)
+	}
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -612,6 +629,25 @@ func (s *Server) handleEmergencyVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	logging.FromContext(r.Context()).Info("emergency session verified", zap.String("subject", subject), zap.String("profile", session.Profile), zap.String("session", session.ID))
 	writeJSON(w, session)
+}
+
+func (s *Server) handleRedeemApproval(w http.ResponseWriter, r *http.Request) {
+	subject, ok := s.emergencySubject(w, r)
+	if !ok {
+		return
+	}
+	var input struct {
+		Digest string `json:"approval_digest"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid approval request")
+		return
+	}
+	if err := s.emergency.RedeemApproval(r.Context(), subject, r.PathValue("id"), input.Digest); err != nil {
+		writeJSONError(w, http.StatusConflict, "approval is unavailable")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleEmergencyCredential(w http.ResponseWriter, r *http.Request) {

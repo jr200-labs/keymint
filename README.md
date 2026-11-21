@@ -410,3 +410,23 @@ observability delivery; verify those operations after the coordinated rollout.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Approval-only emergency sessions
+
+An `approval` emergency profile uses `authentication: webauthn` and grants one
+redemption of a caller-bound request without issuing a platform credential.
+Allowlist the profile for the trusted workload that creates and redeems
+requests. Send the SHA-256 `approval_digest`, an owner-facing `approval_label`
+and optional `ttl_seconds` from 300 to 3600 to `POST /emergency/sessions`.
+Omit the TTL for five minutes. Approval profiles allow up to one hour by
+default, and `max_ttl` can set a lower ceiling. Include the
+task identity, request ID and operation policy in the digest. The passkey
+ceremony returns the review label and expiry so the user can review the
+action before authenticating.
+
+After verification, send the same digest to
+`POST /emergency/sessions/{id}/redeem-approval` as the same workload.
+A successful redemption returns HTTP 204 and records consumption in the
+durable emergency journal. Expiry, revocation and restart invalidate live
+grants. The calling workload owns task authentication, upstream dispatch
+and receipt recovery.
