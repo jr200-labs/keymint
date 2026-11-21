@@ -130,13 +130,16 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	}
 	ctx := context.Background()
 	digest := strings.Repeat("a", 64)
+	if _, err := service.CreateApproval(ctx, "caller", "approval", 5*time.Minute, digest, strings.Repeat("a", 3001)); err == nil {
+		t.Fatal("accepted unreviewable request")
+	}
 	for _, invalidTTL := range []time.Duration{5*time.Minute - time.Second, time.Hour + time.Second} {
 		if _, err := service.CreateApproval(ctx, "caller", "approval", invalidTTL, digest, "Read count"); err == nil {
 			t.Fatalf("accepted out-of-range TTL %s", invalidTTL)
 		}
 	}
 	for _, tt := range []struct{ requested, expected time.Duration }{{0, 5 * time.Minute}, {time.Hour, time.Hour}} {
-		approval, err := service.CreateApproval(ctx, "caller", "approval", tt.requested, digest, "Read count")
+		approval, err := service.CreateApproval(ctx, "caller", "approval", tt.requested, digest, strings.Repeat("a", 3000))
 		if err != nil || approval.ExpiresAt.Sub(service.now()) != tt.expected {
 			t.Fatalf("approval for %s = expiry %v, err %v", tt.requested, approval.ExpiresAt, err)
 		}

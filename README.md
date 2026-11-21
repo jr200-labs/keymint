@@ -416,7 +416,7 @@ MIT — see [LICENSE](LICENSE).
 An `approval` emergency profile uses `authentication: webauthn` and grants one
 redemption of a caller-bound request without issuing a platform credential.
 Allowlist the profile for the trusted workload that creates and redeems
-requests. Send the SHA-256 `approval_digest`, an owner-facing `approval_label`
+requests. Send the SHA-256 `approval_digest`, an owner-facing single-line `approval_label` of up to 3000 bytes
 and optional `ttl_seconds` from 300 to 3600 to `POST /emergency/sessions`.
 Omit the TTL for five minutes. Approval profiles allow up to one hour by
 default, and `max_ttl` can set a lower ceiling. Include the
