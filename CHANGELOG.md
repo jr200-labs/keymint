@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/jr200-labs/keymint/compare/v1.10.1...v1.11.0) (2026-11-21)
+
+
+### Features
+
+* **approval:** display bounded runtime request reviews ([#134](https://github.com/jr200-labs/keymint/issues/134)) ([e12d8ea](https://github.com/jr200-labs/keymint/commit/e12d8ea55a82c4fda4fae833a465b7a0552bfe09))
+
 ## [1.10.1](https://github.com/jr200-labs/keymint/compare/v1.10.0...v1.10.1) (2026-11-21)
 
 
