@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.10.0](https://github.com/jr200-labs/keymint/compare/v1.9.0...v1.10.0) (2026-11-21)
+
+
+### Features
+
+* add one-use emergency approvals ([#130](https://github.com/jr200-labs/keymint/issues/130)) ([509682b](https://github.com/jr200-labs/keymint/commit/509682bb630c92e9eaf29c88817be6e8c52a69ca))
+
+
+### Bug Fixes
+
+* **deps:** update actions/create-github-app-token action to v3.3.0 ([#125](https://github.com/jr200-labs/keymint/issues/125)) ([f72b4bd](https://github.com/jr200-labs/keymint/commit/f72b4bddcf51018ccd4b2e7ecb71cb59f8a188f2))
+* **deps:** update actions/create-github-app-token action to v3.3.0 ([#128](https://github.com/jr200-labs/keymint/issues/128)) ([f05c107](https://github.com/jr200-labs/keymint/commit/f05c107510c3e858595afa7ca684e7776a956635))
+* **deps:** update all non-major dependencies ([#129](https://github.com/jr200-labs/keymint/issues/129)) ([106195f](https://github.com/jr200-labs/keymint/commit/106195f5c391bc15f547856c3bd20788b52b5829))
+* **deps:** update github-actions ([#131](https://github.com/jr200-labs/keymint/issues/131)) ([87b2ce7](https://github.com/jr200-labs/keymint/commit/87b2ce7d1ce2348d522fc1ea88ad4b67001c3028))
+* **deps:** update module modernc.org/sqlite to v1.61.1 ([#126](https://github.com/jr200-labs/keymint/issues/126)) ([4d0b013](https://github.com/jr200-labs/keymint/commit/4d0b013792303edd151e2386ece7fb7edacca14d))
+
 ## [1.9.0](https://github.com/jr200-labs/keymint/compare/v1.8.1...v1.9.0) (2026-10-30)
 
 
