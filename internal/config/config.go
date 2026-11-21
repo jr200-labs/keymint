@@ -386,18 +386,21 @@ const (
 
 // TTL returns the configured maximum session duration.
 func (p EmergencyProfile) TTL() (time.Duration, error) {
+	defaultTTL := 15 * time.Minute
+	minTTL, maxTTL := time.Nanosecond, time.Hour
+	switch p.Provider {
+	case "github_user":
+		maxTTL = 90 * time.Minute
+	case "approval":
+		defaultTTL = MaxApprovalTTL
+		minTTL, maxTTL = MinApprovalTTL, MaxApprovalTTL
+	}
 	if p.MaxTTL == "" {
-		if p.Provider == "approval" {
-			return MaxApprovalTTL, nil
-		}
-		return 15 * time.Minute, nil
+		return defaultTTL, nil
 	}
 	ttl, err := time.ParseDuration(p.MaxTTL)
-	if err != nil || ttl <= 0 || ttl > time.Hour {
-		return 0, errors.New("max_ttl must be between 1ns and 1h")
-	}
-	if p.Provider == "approval" && ttl < MinApprovalTTL {
-		return 0, errors.New("approval max_ttl must be between 5m and 1h")
+	if err != nil || ttl < minTTL || ttl > maxTTL {
+		return 0, fmt.Errorf("max_ttl must be between %s and %s", minTTL, maxTTL)
 	}
 	return ttl, nil
 }
