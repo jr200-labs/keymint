@@ -339,6 +339,10 @@ func (c *Config) Validate() error {
 			if profile.AuthenticationMethod() != "github_device" {
 				return fmt.Errorf("emergency profile %q: GitHub user credentials require github_device authentication", name)
 			}
+		case "approval":
+			if profile.AuthenticationMethod() != "webauthn" || profile.Namespace != "" || profile.ServiceAccount != "" {
+				return fmt.Errorf("emergency profile %q: approval requires WebAuthn and cannot issue Kubernetes credentials", name)
+			}
 		case "kubernetes":
 			if profile.Namespace == "" || profile.ServiceAccount == "" {
 				return fmt.Errorf("emergency profile %q: namespace and service_account are required", name)

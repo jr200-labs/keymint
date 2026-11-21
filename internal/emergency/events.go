@@ -21,15 +21,16 @@ import (
 const maxEventPage = 100
 
 type Event struct {
-	ID         int64     `json:"id"`
-	Type       string    `json:"type"`
-	SessionID  string    `json:"session_id"`
-	Profile    string    `json:"profile"`
-	Provider   string    `json:"provider"`
-	State      State     `json:"state"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	OccurredAt time.Time `json:"occurred_at"`
-	Subject    string    `json:"-"`
+	ApprovalDigest string    `json:"-"`
+	ID             int64     `json:"id"`
+	Type           string    `json:"type"`
+	SessionID      string    `json:"session_id"`
+	Profile        string    `json:"profile"`
+	Provider       string    `json:"provider"`
+	State          State     `json:"state"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	OccurredAt     time.Time `json:"occurred_at"`
+	Subject        string    `json:"-"`
 }
 
 type EventPage struct {
@@ -67,6 +68,8 @@ CREATE TABLE IF NOT EXISTS emergency_events (
 id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, type TEXT NOT NULL,
 session_id TEXT NOT NULL, profile TEXT NOT NULL, provider TEXT NOT NULL,
 state TEXT NOT NULL, expires_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS emergency_approvals (
+session_id TEXT PRIMARY KEY, digest TEXT NOT NULL, redeemed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS emergency_totp (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, attempts INTEGER NOT NULL, last_step INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);`); err != nil {
@@ -121,6 +124,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, event.Subject, event.Type, event.SessionID, ev
 ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, expires_at = excluded.expires_at`,
 		event.SessionID, event.Subject, event.Profile, event.Provider, event.State, event.ExpiresAt.UnixMilli()); err != nil {
 		return err
+	}
+	if event.ApprovalDigest != "" && event.Type == "session.created" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO emergency_approvals (session_id, digest) VALUES (?, ?)`, event.SessionID, event.ApprovalDigest); err != nil {
+			return err
+		}
+	}
+	if event.Type == "approval.redeemed" {
+		result, err := tx.ExecContext(ctx, `UPDATE emergency_approvals SET redeemed = 1 WHERE session_id = ? AND digest = ? AND redeemed = 0`, event.SessionID, event.ApprovalDigest)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return fmt.Errorf("approval redemption was not recorded")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
