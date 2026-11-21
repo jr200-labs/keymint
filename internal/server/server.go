@@ -569,7 +569,7 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 		ApprovalDigest string   `json:"approval_digest"`
 		ApprovalLabel  string   `json:"approval_label"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request")
 		return
 	}

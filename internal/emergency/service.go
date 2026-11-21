@@ -271,7 +271,7 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 
 func (service *Service) CreateApproval(ctx context.Context, subject, profileName string, ttl time.Duration, digest, label string) (Session, error) {
 	decoded, err := hex.DecodeString(digest)
-	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 200 || strings.ContainsAny(label, "\r\n") {
+	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 3000 || strings.ContainsAny(label, "\r\n") {
 		return Session{}, errors.New("approval requires a SHA-256 digest and a review label")
 	}
 	if ttl == 0 {
