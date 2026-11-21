@@ -63,7 +63,11 @@ func TestApprovalRedemptionIsBoundAndOneUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restarted.events.close()
+	t.Cleanup(func() {
+		if err := restarted.events.close(); err != nil {
+			t.Errorf("close restarted emergency journal: %v", err)
+		}
+	})
 	var redeemed int
 	if err := restarted.events.db.QueryRow(`SELECT redeemed FROM emergency_approvals WHERE session_id = ?`, session.ID).Scan(&redeemed); err != nil || redeemed != 1 {
 		t.Fatalf("durable redemption = %d, %v", redeemed, err)
