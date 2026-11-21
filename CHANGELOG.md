@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/jr200-labs/keymint/compare/v1.10.0...v1.10.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* accept 90-minute GitHub emergency profiles ([#132](https://github.com/jr200-labs/keymint/issues/132)) ([5ba73ca](https://github.com/jr200-labs/keymint/commit/5ba73caad7afd1f868be0221f4a226c23cf5b972))
+
 ## [1.10.0](https://github.com/jr200-labs/keymint/compare/v1.9.0...v1.10.0) (2026-11-21)
 
 
