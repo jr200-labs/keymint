@@ -271,8 +271,14 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 
 func (service *Service) CreateApproval(ctx context.Context, subject, profileName string, ttl time.Duration, digest, label string) (Session, error) {
 	decoded, err := hex.DecodeString(digest)
-	if err != nil || len(decoded) != 32 || ttl <= 0 || ttl > 5*time.Minute || strings.TrimSpace(label) == "" || len(label) > 200 || strings.ContainsAny(label, "\r\n") {
-		return Session{}, errors.New("approval requires a SHA-256 digest a review label and a TTL of at most five minutes")
+	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 200 || strings.ContainsAny(label, "\r\n") {
+		return Session{}, errors.New("approval requires a SHA-256 digest and a review label")
+	}
+	if ttl == 0 {
+		ttl = config.MinApprovalTTL
+	}
+	if ttl < config.MinApprovalTTL || ttl > config.MaxApprovalTTL {
+		return Session{}, errors.New("approval TTL must be between five minutes and one hour")
 	}
 	return service.create(ctx, subject, profileName, ttl, nil, digest, label)
 }
@@ -304,7 +310,13 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 		scopes = slices.Compact(scopes)
 		profile.Scopes = scopes
 	}
-	maxTTL, _ := profile.TTL()
+	maxTTL, err := profile.TTL()
+	if err != nil {
+		return Session{}, err
+	}
+	if digest != "" && requestedTTL > maxTTL {
+		return Session{}, errors.New("approval TTL exceeds the profile maximum")
+	}
 	if requestedTTL <= 0 || requestedTTL > maxTTL {
 		requestedTTL = maxTTL
 	}
@@ -338,8 +350,12 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 		}
 		session.State = AwaitingPasskey
 		session.VerificationURI = service.passkeyVerificationURL + "/#" + token
+		ceremonyExpiry := now.Add(5 * time.Minute)
+		if digest != "" {
+			ceremonyExpiry = session.ExpiresAt
+		}
 		service.mu.Lock()
-		service.ceremonies[token] = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: now.Add(5 * time.Minute)}
+		service.ceremonies[token] = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: ceremonyExpiry}
 		service.mu.Unlock()
 	default:
 		return Session{}, errors.New("unsupported emergency authentication")

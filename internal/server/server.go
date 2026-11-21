@@ -564,7 +564,7 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var input struct {
 		Profile        string   `json:"profile"`
-		TTLSeconds     int64    `json:"ttl_seconds"`
+		TTLSeconds     *int64   `json:"ttl_seconds"`
 		Scopes         []string `json:"scopes"`
 		ApprovalDigest string   `json:"approval_digest"`
 		ApprovalLabel  string   `json:"approval_label"`
@@ -575,14 +575,18 @@ func (s *Server) handleEmergencyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var session emergency.Session
 	var err error
+	var ttlSeconds int64
+	if input.TTLSeconds != nil {
+		ttlSeconds = *input.TTLSeconds
+	}
 	if input.ApprovalDigest != "" {
-		if input.TTLSeconds < 1 || input.TTLSeconds > 300 || len(input.Scopes) != 0 {
+		if (input.TTLSeconds != nil && (ttlSeconds < 300 || ttlSeconds > 3600)) || len(input.Scopes) != 0 {
 			writeJSONError(w, http.StatusBadRequest, "invalid approval TTL or scopes")
 			return
 		}
-		session, err = s.emergency.CreateApproval(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second, input.ApprovalDigest, input.ApprovalLabel)
+		session, err = s.emergency.CreateApproval(r.Context(), subject, input.Profile, time.Duration(ttlSeconds)*time.Second, input.ApprovalDigest, input.ApprovalLabel)
 	} else {
-		session, err = s.emergency.CreateWithScopes(r.Context(), subject, input.Profile, time.Duration(input.TTLSeconds)*time.Second, input.Scopes)
+		session, err = s.emergency.CreateWithScopes(r.Context(), subject, input.Profile, time.Duration(ttlSeconds)*time.Second, input.Scopes)
 	}
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
