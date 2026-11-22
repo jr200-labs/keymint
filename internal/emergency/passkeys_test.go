@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,28 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 			}
 			service.now = func() time.Time { return created }
 		}
+	}
+	approval, err := service.CreateApproval(ctx, "caller", "approval", 5*time.Minute, digest, "Review request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, approvalToken, _ := strings.Cut(approval.VerificationURI, "#")
+	options, err := service.PasskeyOptions("caller", approvalToken)
+	if err != nil || !reflect.DeepEqual(options["approval_duration_minutes"], []int{5, 15, 30, 60}) || options["default_approval_duration_minutes"] != 5 {
+		t.Fatalf("approval duration options = %v, error = %v", options["approval_duration_minutes"], err)
+	}
+	approvalRequest := passkeyResponse(t, service, approvalToken, key, false, "https://keys.example")
+	approvalRequest.Header.Set(ApprovalDurationHeader, "90")
+	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err == nil {
+		t.Fatal("accepted a duration above the profile maximum")
+	}
+	approvalRequest.Header.Set(ApprovalDurationHeader, "30")
+	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err != nil {
+		t.Fatal(err)
+	}
+	active, err := service.Get(ctx, "caller", approval.ID)
+	if err != nil || active.State != Active || !active.ExpiresAt.Equal(service.now().Add(30*time.Minute)) || active.ApprovalDigest != digest {
+		t.Fatalf("owner-selected approval = %v, error = %v", active, err)
 	}
 	enrollment, err = service.BeginPasskeyEnrollment("caller", proof.ID)
 	if err != nil {
