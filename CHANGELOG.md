@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.12.0](https://github.com/jr200-labs/keymint/compare/v1.11.0...v1.12.0) (2026-11-22)
+
+
+### Features
+
+* **approval:** honor owner-selected REST duration ([#137](https://github.com/jr200-labs/keymint/issues/137)) ([c76a1be](https://github.com/jr200-labs/keymint/commit/c76a1be8fabb54f644ab5b2b67e063dfc989529b))
+
+
+### Bug Fixes
+
+* **deps:** update github-actions ([#136](https://github.com/jr200-labs/keymint/issues/136)) ([868f57e](https://github.com/jr200-labs/keymint/commit/868f57eed500cdc86094659c4cf30113e71dd578))
+
 ## [1.11.0](https://github.com/jr200-labs/keymint/compare/v1.10.1...v1.11.0) (2026-11-21)
 
 
