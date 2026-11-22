@@ -67,6 +67,7 @@ type Session struct {
 	UserCode        string    `json:"user_code,omitempty"`
 	ExpiresAt       time.Time `json:"expires_at"`
 
+	approvalTTL time.Duration
 	profile     config.EmergencyProfile
 	subject     string
 	deviceCode  string
@@ -325,7 +326,7 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 	if err != nil {
 		return Session{}, fmt.Errorf("create emergency session ID: %w", err)
 	}
-	session := &Session{profile: originalProfile, ApprovalDigest: digest, ApprovalLabel: label, Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
+	session := &Session{approvalTTL: requestedTTL, profile: originalProfile, ApprovalDigest: digest, ApprovalLabel: label, Scopes: scopes, ID: id, Profile: profileName, Provider: profile.Provider, Authentication: profile.AuthenticationMethod(), subject: subject, ExpiresAt: now.Add(requestedTTL)}
 	switch profile.AuthenticationMethod() {
 	case "github_device":
 		device, err := service.startGitHubDevice(ctx, profile)
@@ -419,6 +420,23 @@ func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (
 	return enrollment, nil
 }
 
+// ApprovalDurationHeader carries the owner's selection on the passkey submission.
+const ApprovalDurationHeader = "X-Padd-Approval-Duration"
+
+func approvalDurations(profile config.EmergencyProfile) []int {
+	maxTTL, err := profile.TTL()
+	if err != nil {
+		return nil
+	}
+	var choices []int
+	for _, minutes := range []int{5, 15, 30, 60} {
+		if time.Duration(minutes)*time.Minute <= maxTTL {
+			choices = append(choices, minutes)
+		}
+	}
+	return choices
+}
+
 func (service *Service) PasskeyOptions(subject, token string) (map[string]any, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -433,6 +451,15 @@ func (service *Service) PasskeyOptions(subject, token string) (map[string]any, e
 		}
 		options["approval_label"] = session.ApprovalLabel
 		options["expires_at"] = session.ExpiresAt
+		choices := approvalDurations(session.profile)
+		if len(choices) > 0 {
+			options["approval_duration_minutes"] = choices
+			preferred := int(session.approvalTTL / time.Minute)
+			if !slices.Contains(choices, preferred) {
+				preferred = choices[0]
+			}
+			options["default_approval_duration_minutes"] = preferred
+		}
 	}
 	return options, nil
 }
@@ -443,6 +470,18 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 	if !ok || ceremony.subject != subject || !ceremony.expiresAt.After(service.now()) {
 		service.mu.Unlock()
 		return errors.New("passkey ceremony not found or expired")
+	}
+	var duration time.Duration
+	if values := request.Header.Values(ApprovalDurationHeader); len(values) > 0 {
+		session := service.sessions[ceremony.sessionID]
+		minutes, err := strconv.Atoi(values[0])
+		if len(values) != 1 || err != nil || session == nil || session.Provider != "approval" ||
+			session.State != AwaitingPasskey || !session.ExpiresAt.After(service.now()) ||
+			!slices.Contains(approvalDurations(session.profile), minutes) {
+			service.mu.Unlock()
+			return errors.New("invalid REST approval duration")
+		}
+		duration = time.Duration(minutes) * time.Minute
 	}
 	delete(service.ceremonies, token)
 	service.mu.Unlock()
@@ -460,7 +499,14 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 			service.mu.Unlock()
 			return errors.New("session expired during passkey verification")
 		}
+		previousExpiry := session.ExpiresAt
+		if duration > 0 {
+			session.ExpiresAt = service.now().UTC().Add(duration)
+		}
 		err := service.transitionLocked(request.Context(), session, Active, "session.activated")
+		if err != nil {
+			session.ExpiresAt = previousExpiry
+		}
 		service.mu.Unlock()
 		return err
 	}
