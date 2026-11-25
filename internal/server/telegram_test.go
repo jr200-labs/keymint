@@ -225,6 +225,12 @@ func TestTelegramQRRenderedOnlyForLiveTelegramLogin(t *testing.T) {
 	if _, err := png.DecodeConfig(resp.Body); err != nil {
 		t.Fatal(err)
 	}
+	terminal := httptest.NewRecorder()
+	writeTelegramQR(terminal, status, true)
+	if terminal.Code != http.StatusOK || !strings.HasPrefix(terminal.Header().Get("Content-Type"), "text/plain") ||
+		!strings.Contains(terminal.Body.String(), "█") || strings.Contains(terminal.Body.String(), status.LoginURL) {
+		t.Fatal("terminal QR should contain a scannable grid and omit the login URL")
+	}
 	for _, url := range []string{"https://login?token=YWJj", "tg://login?token=YWJj&token=YWJj", "tg://login?token="} {
 		resp := httptest.NewRecorder()
 		status.LoginURL = url
