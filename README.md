@@ -29,6 +29,11 @@ ciphertext for CLI and in-cluster callers.
   key may serve multiple internal projects, but every repository must be listed
   explicitly in its release-key configuration.
 
+- **Telegram owner enrollment**: use passkey approval to authorize QR enrollment
+  for a configured account and isolated relay. Keymint renders the QR and
+  releases the session wrapping key only to the dedicated relay identity.
+  See the [operator interface](docs/adr/0005-control-telegram-owner-enrollment.md).
+
 The two modes share the same Go binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo
 dev and bolt on the service later (or vice versa) without rewriting

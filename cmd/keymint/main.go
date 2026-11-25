@@ -40,6 +40,7 @@ mounted Secret in-cluster).`,
 	root.AddCommand(newServeCmd())
 	root.AddCommand(newHelperCmd())
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newTelegramEnrollCmd())
 
 	return root
 }
