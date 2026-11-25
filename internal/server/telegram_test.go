@@ -34,9 +34,9 @@ func TestTelegramWrappingKeyRestrictedToRelayIdentity(t *testing.T) {
 	cfg := &config.Config{TelegramRelays: map[string]config.TelegramRelay{
 		"owner": {RelaySubject: "system:serviceaccount:relays:owner", OperatorSubject: "operator", WrappingKeyFile: file},
 	}}
-	reviewer := &fakeReviewer{subjectByToken: map[string]string{"relay": "system:serviceaccount:relays:owner", "padd": "padd", "operator": "operator"}}
+	reviewer := &fakeReviewer{subjectByToken: map[string]string{"relay": "system:serviceaccount:relays:owner", "other-workload": "system:serviceaccount:apps:other", "operator": "operator"}}
 	srv := newTelegramTestServer(t, cfg, reviewer)
-	for token, want := range map[string]int{"relay": http.StatusOK, "padd": http.StatusForbidden, "operator": http.StatusForbidden} {
+	for token, want := range map[string]int{"relay": http.StatusOK, "other-workload": http.StatusForbidden, "operator": http.StatusForbidden} {
 		req := httptest.NewRequest(http.MethodGet, "/telegram-relays/owner/wrapping-key", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp := httptest.NewRecorder()
