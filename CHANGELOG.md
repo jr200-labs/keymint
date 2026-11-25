@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.13.0](https://github.com/jr200-labs/keymint/compare/v1.12.0...v1.13.0) (2026-11-25)
+
+
+### Features
+
+* **telegram:** broker owner enrollment and relay key custody ([#141](https://github.com/jr200-labs/keymint/issues/141)) ([acc3322](https://github.com/jr200-labs/keymint/commit/acc332203ca397e6fb9c0b45d7e421a871806b11))
+
+
+### Bug Fixes
+
+* **deps:** update github-actions ([#139](https://github.com/jr200-labs/keymint/issues/139)) ([0b4d358](https://github.com/jr200-labs/keymint/commit/0b4d3589b1a10e58c8c06f96f792121144d16b94))
+* **deps:** update module modernc.org/sqlite to v1.63.0 ([#140](https://github.com/jr200-labs/keymint/issues/140)) ([f7ede48](https://github.com/jr200-labs/keymint/commit/f7ede4803e2620aa6ec77a819daba89fed60766d))
+
 ## [1.12.0](https://github.com/jr200-labs/keymint/compare/v1.11.0...v1.12.0) (2026-11-22)
 
 
