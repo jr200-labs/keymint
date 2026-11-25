@@ -142,11 +142,12 @@ func (c *reviewCache) putNegative(token string) {
 
 // Server holds wired-up HTTP server state.
 type Server struct {
-	snapshot  atomic.Pointer[configSnapshot]
-	mint      MintFunc
-	auth      *authenticator
-	metrics   *metrics.Metrics
-	emergency *emergency.Service
+	snapshot            atomic.Pointer[configSnapshot]
+	mint                MintFunc
+	auth                *authenticator
+	metrics             *metrics.Metrics
+	emergency           *emergency.Service
+	telegramRelayClient *http.Client
 
 	workers     sync.WaitGroup
 	stopOnce    sync.Once
@@ -278,10 +279,11 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 	}
 
 	s := &Server{
-		mint:        mint,
-		auth:        newAuthenticator(reviewer, m),
-		metrics:     m,
-		janitorStop: make(chan struct{}),
+		mint:                mint,
+		auth:                newAuthenticator(reviewer, m),
+		metrics:             m,
+		telegramRelayClient: defaultTelegramRelayClient,
+		janitorStop:         make(chan struct{}),
 	}
 	s.snapshot.Store(buildSnapshot(cfg))
 	if len(emergencyServices) != 0 {
@@ -411,6 +413,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /emergency/passkeys/ceremonies/{token}", s.handlePasskeyOptions)
 	mux.HandleFunc("POST /emergency/passkeys/ceremonies/{token}", s.handlePasskeyVerify)
 	mux.HandleFunc("POST /emergency/passkeys/enrollments", s.handlePasskeyEnrollmentCreate)
+	mux.HandleFunc("POST /telegram-enrollments/{relay}", s.handleTelegramApproval)
+	mux.HandleFunc("GET /telegram-enrollments/{relay}/{id}/{action}", s.handleTelegramEnrollment)
+	mux.HandleFunc("POST /telegram-enrollments/{relay}/{id}/{action}", s.handleTelegramEnrollment)
+	mux.HandleFunc("GET /telegram-relays/{relay}/wrapping-key", s.handleTelegramWrappingKey)
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /healthz", s.handleReady) // back-compat alias

@@ -41,6 +41,8 @@ type Config struct {
 	// plaintext key material.
 	ReleaseKeys map[string]ReleaseKey `yaml:"release_keys,omitempty"`
 
+	TelegramRelays map[string]TelegramRelay `yaml:"telegram_relays,omitempty"`
+
 	// Allowlist is consulted only in Service mode. Each entry maps a
 	// Kubernetes ServiceAccount subject (`system:serviceaccount:NS:NAME`)
 	// to the keys it is allowed to mint for.
@@ -238,6 +240,9 @@ func DefaultPath() (string, error) {
 
 // Validate checks that the config is internally consistent.
 func (c *Config) Validate() error {
+	if err := c.validateTelegramRelays(); err != nil {
+		return err
+	}
 	if len(c.Keys) == 0 {
 		return errors.New("no keys defined")
 	}
