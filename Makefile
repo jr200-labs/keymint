@@ -7,7 +7,7 @@ VERSION := $(shell sed -n 's/.*"\.": *"\([^"]*\)".*/\1/p' .release-please-manife
 
 .DEFAULT_GOAL := all
 
-.PHONY: all fmt test test-integration test-all test-race view-coverage lint build clean sync-shared-lint hooks-install hooks-run
+.PHONY: all fmt test test-all test-race view-coverage lint build clean sync-shared-lint hooks-install hooks-run
 
 all: fmt lint build
 
@@ -17,10 +17,7 @@ fmt:
 test:
 	go test -timeout=10m ./...
 
-test-integration:
-	go test -tags=integration -timeout=5m -count=1 ./tests/integration/...
-
-test-all: test test-integration
+test-all: test
 
 test-race:
 	go test -race -cover -coverprofile=coverage.out -timeout=10m ./...

@@ -3,6 +3,8 @@ package emergency
 import (
 	"github.com/jr200-labs/keymint/internal/config"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,5 +33,40 @@ func TestTOTPRejectsReplayAndSharesAttemptBudget(t *testing.T) {
 	}
 	if validTOTP("", "000000", service.now()) {
 		t.Fatal("empty secret accepted")
+	}
+}
+
+func TestTOTPFailureLimitSurvivesShortWindowsAndRestart(t *testing.T) {
+	cfg := &config.Config{EmergencyStateFile: filepath.Join(t.TempDir(), "events.db")}
+	service, err := New(cfg, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Unix(59-24*60*60, 0)
+	now := first
+	service.now = func() time.Time { return now }
+	secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	for range maxTOTPFailures {
+		if err = service.verifyTOTPCode(secret, "invalid"); err == nil || err.Error() != "invalid or already used TOTP code" {
+			t.Fatalf("unexpected verification result: %v", err)
+		}
+		now = now.Add(30 * time.Second)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service, err = New(cfg, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	now = first.Add(totpFailureWindow - time.Second)
+	service.now = func() time.Time { return now }
+	if err := service.verifyTOTPCode(strings.ToLower(secret), "287082"); err == nil || err.Error() != "TOTP authentication failure limit reached" {
+		t.Fatalf("persisted limit missing: %v", err)
+	}
+	now = first.Add(totpFailureWindow)
+	if err := service.verifyTOTPCode(secret, "287082"); err != nil {
+		t.Fatalf("valid code blocked after the window: %v", err)
 	}
 }

@@ -60,6 +60,7 @@ func (service *Service) transitionLocked(ctx context.Context, session *Session, 
 	err := service.record(ctx, event, &copy)
 	if err == nil || state != Active {
 		session.State = state
+		session.terminalEventPending = terminal(state) && err != nil
 	}
 	return err
 }

@@ -344,15 +344,17 @@ secrets, it uses the active GitHub-user emergency session to fetch
 `/orgs/{owner}/actions/secrets/public-key`. The session must have the GitHub grants
 needed for that operation (`admin:org`, plus `repo` for private repositories).
 Kubernetes-backed sessions cannot authorize organization lookups. A restricted
-session cannot inherit broader organization permissions from its profile. The OAuth API
-and configured installation API must match, including an Enterprise base path.
+session cannot inherit broader organization permissions from its profile. GitHub device authentication uses github.com. Organization lookups require a
+github.com installation API, while repository lookups can use an Enterprise
+installation API.
 
 Clients submit `github_owner`, `github_repository` and `secret_scope` to
 `POST /emergency/sessions/{id}/seal-release-key`. Scope is `repository` or
 `organization`; omission retains repository behavior for existing clients. The
 repository remains mandatory for organization secrets because release policy
 authorizes an individual project. Unknown scopes, disabled destinations and
-unlisted projects fail closed. The broker fetches the encryption key over HTTPS,
+unlisted projects fail closed. Each repository and scope pair can bind to one
+release key. The broker fetches the encryption key over HTTPS,
 rejects redirects, and rechecks authorization after lookup before reading signing
 material. Optional legacy `destination_key_id` and `destination_public_key`
 fields must match the broker lookup; callers cannot choose an arbitrary key.
@@ -390,6 +392,25 @@ omitting it from a server-side apply can retain the old field and reject the
 upgrade. Verify file permissions after remounting the volume: the generated
 cleanup key must remain owner-only.
 
+If a cleanup record cannot be decrypted or repeatedly fails remote revocation,
+use the session ID in the cleanup error to identify it. Restore the original
+cleanup key when available. To recover service while preserving the encrypted
+records for investigation, stop Keymint, back up the state database and its key,
+and run one of the following on the mounted state volume.
+
+```sh
+keymint cleanup-quarantine --state-file /path/to/state.db --session-id SESSION_ID
+keymint cleanup-quarantine --state-file /path/to/state.db --all
+```
+
+Use `--all` only when all outstanding records need quarantine, for example
+after losing the cleanup key. If an unusable key file remains, archive it
+before restarting so Keymint can generate a new one. Quarantine preserves the
+event journal and removes the selected records from automatic revocation and
+its pending-cleanup metrics. Any credential left active can still be used
+until it expires or is revoked. Revoke affected OAuth grants or delete affected
+Kubernetes bound Secrets separately.
+
 ### Emergency lifecycle and consumer compatibility
 
 A session begins in `awaiting_github`, `awaiting_totp` or `awaiting_passkey` and
@@ -397,7 +418,17 @@ becomes `active` only after verification and durable activation audit succeed.
 Explicit revocation first enters `revocation_pending`, which immediately denies
 credential access while external cleanup runs. `revoked`, `expired` and
 `invalidated` are terminal states and cannot reactivate. Profile revisions are
-immutable within a session; removal or changed authority invalidates it.
+immutable within a session. Removal or changed authority invalidates it.
+The broker allows up to 16 sessions per workload identity and 1024 overall,
+including creations in progress. A Kubernetes credential reports the earlier
+of the token and session expirations.
+
+TOTP allows five attempts per 30 seconds and up to ten failures per secret
+over a 24-hour window starting with its first failure. The budget survives
+broker restarts and is shared by every profile using that secret. After the
+limit is reached, authentication resumes when the window ends or an operator
+rotates the secret. Monitor `keymint_operations_total{operation="totp_verify",outcome="error"}`
+for rejected verifications.
 
 Lifecycle events include `session.revocation_pending` and `session.revoked`.
 Consumers must treat pending revocation as loss of authority and reconcile stale

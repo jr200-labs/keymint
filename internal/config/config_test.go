@@ -237,3 +237,37 @@ func TestReleaseSecretScopesAreExplicitAndValidated(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseKeyBindingsMustBeUniquePerScope(t *testing.T) {
+	repositoryKey := ReleaseKey{GitHubKey: "app", Kind: "sparkle_ed25519", PrivateKeyFile: "/unused", Repositories: []string{"org/repo"}, SecretName: "SPARKLE_EDDSA_PRIVATE_KEY"}
+	otherKey := repositoryKey
+	otherKey.SecretScopes = []githubsecret.Scope{githubsecret.Organization}
+	cfg := &Config{
+		Keys:        map[string]Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}},
+		ReleaseKeys: map[string]ReleaseKey{"repository": repositoryKey, "other": otherKey},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("distinct scopes rejected: %v", err)
+	}
+	otherKey.SecretScopes = append(otherKey.SecretScopes, githubsecret.Repository)
+	cfg.ReleaseKeys["other"] = otherKey
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "share repository") {
+		t.Fatalf("overlapping bindings accepted: %v", err)
+	}
+}
+
+func TestGitHubDeviceRequiresPublicGitHubAPI(t *testing.T) {
+	profile := EmergencyProfile{Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}, Scopes: []string{"repo"}}
+	cfg := &Config{
+		Keys:              map[string]Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}},
+		EmergencyProfiles: map[string]EmergencyProfile{"human": profile},
+	}
+	for _, base := range []string{"", "https://api.github.com/", "https://github.example/api/v3"} {
+		profile.APIBaseURL = base
+		cfg.EmergencyProfiles["human"] = profile
+		wantError := strings.Contains(base, "github.example")
+		if err := cfg.Validate(); (err != nil) != wantError {
+			t.Errorf("base %q: %v", base, err)
+		}
+	}
+}

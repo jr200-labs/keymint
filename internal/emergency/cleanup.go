@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
@@ -85,6 +87,56 @@ func openCleanupStore(db *sql.DB, statePath string) (*cleanupStore, error) {
 	return &cleanupStore{db: db, cipher: aead}, nil
 }
 
+// QuarantineCleanup moves encrypted cleanup records out of the retry queue.
+// The service must be stopped so it cannot repopulate records from memory.
+// An empty session ID selects every outstanding record.
+func QuarantineCleanup(ctx context.Context, statePath, sessionID string) (int64, error) {
+	if statePath == "" {
+		return 0, errors.New("an existing emergency state file is required")
+	}
+	path, err := filepath.Abs(statePath)
+	if err != nil {
+		return 0, err
+	}
+	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "mode=rw&_pragma=busy_timeout(5000)"}
+	db, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS emergency_cleanup_quarantine (
+		id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, sealed BLOB NOT NULL, quarantined_at INTEGER NOT NULL
+	)`); err != nil {
+		return 0, err
+	}
+	filter := " WHERE session_id = ?"
+	args := []any{sessionID}
+	if sessionID == "" {
+		filter, args = "", nil
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO emergency_cleanup_quarantine(session_id,sealed,quarantined_at)
+		SELECT session_id,sealed,unixepoch() FROM emergency_cleanup`+filter, args...)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 && sessionID != "" {
+		return 0, fmt.Errorf("no pending cleanup record for session %q", sessionID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM emergency_cleanup`+filter, args...); err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
+}
+
 func (store *cleanupStore) put(ctx context.Context, record cleanupRecord) error {
 	value, err := json.Marshal(record)
 	if err != nil {
@@ -117,11 +169,11 @@ func (store *cleanupStore) list(ctx context.Context) ([]cleanupRecord, error) {
 		}
 		n := store.cipher.NonceSize()
 		if len(sealed) < n {
-			return nil, errors.New("invalid encrypted cleanup record")
+			return nil, fmt.Errorf("invalid encrypted cleanup record for session %q", id)
 		}
 		value, err := store.cipher.Open(nil, sealed[:n], sealed[n:], []byte(id))
 		if err != nil {
-			return nil, fmt.Errorf("decrypt cleanup record: %w", err)
+			return nil, fmt.Errorf("decrypt cleanup record for session %q: %w", id, err)
 		}
 		var record cleanupRecord
 		if err = json.Unmarshal(value, &record); err != nil {
@@ -158,15 +210,16 @@ func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 		service.mu.Lock()
 		session, live := service.sessions[record.ID]
 		busy := live && session.operation != idle
+		authorized := live && !terminal(session.State) && session.State != RevocationPending
 		service.mu.Unlock()
 		if busy {
 			continue
 		}
-		if !all && live && !terminal(session.State) && session.State != RevocationPending && record.Due.After(service.now()) {
+		if !all && authorized && record.Due.After(service.now()) {
 			continue
 		}
 		if err := service.revokeCredential(ctx, revokedCredential{id: record.ID, profile: record.Profile, token: record.Token, secret: record.Secret}); err != nil {
-			result = errors.Join(result, err)
+			result = errors.Join(result, fmt.Errorf("cleanup session %q: %w", record.ID, err))
 		}
 	}
 	return result
