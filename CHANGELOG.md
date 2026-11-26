@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.14.0](https://github.com/jr200-labs/keymint/compare/v1.13.2...v1.14.0) (2026-11-26)
+
+
+### Features
+
+* add broker scope policies and operator tooling ([#151](https://github.com/jr200-labs/keymint/issues/151)) ([97df146](https://github.com/jr200-labs/keymint/commit/97df146dc4e7b73194cbbb3c54546340da34feeb))
+* **telegram:** instrument owner enrollment and relay calls ([#148](https://github.com/jr200-labs/keymint/issues/148)) ([d119b09](https://github.com/jr200-labs/keymint/commit/d119b09757f9fb5dfec43824bad93ae196f98efd))
+
+
+### Bug Fixes
+
+* address follow-up credential broker review findings ([#150](https://github.com/jr200-labs/keymint/issues/150)) ([6874930](https://github.com/jr200-labs/keymint/commit/6874930ac0f3f50a4b52acfb5fd86d2b5cdac3d1))
+* harden emergency credential recovery and shutdown ([#152](https://github.com/jr200-labs/keymint/issues/152)) ([0a8d35d](https://github.com/jr200-labs/keymint/commit/0a8d35de271b00306f17253cc7724393a6549680))
+
 ## [1.13.2](https://github.com/jr200-labs/keymint/compare/v1.13.1...v1.13.2) (2026-11-26)
 
 
