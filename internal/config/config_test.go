@@ -271,3 +271,25 @@ func TestGitHubDeviceRequiresPublicGitHubAPI(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallationAPIBaseRequiresHTTPS(t *testing.T) {
+	for _, tc := range []struct {
+		base  string
+		valid bool
+	}{
+		{"", true},
+		{"https://ghe.example/api/v3/", true},
+		{"http://ghe.example/api/v3", false},
+		{"https://user:password@ghe.example", false},
+		{"https://ghe.example?query=1", false},
+		{"https://ghe.example#fragment", false},
+		{"https://ghe.example?", false},
+		{"https://ghe.example#", false},
+		{"https://:443", false},
+	} {
+		cfg := &Config{Keys: map[string]Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused", APIBaseURL: tc.base}}}
+		if err := cfg.Validate(); (err == nil) != tc.valid {
+			t.Errorf("base %q: %v", tc.base, err)
+		}
+	}
+}

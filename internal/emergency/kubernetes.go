@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/kubehttp"
 	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -33,7 +34,11 @@ func NewKubernetesIssuer() (*KubernetesIssuer, error) {
 	if host == "" || port == "" {
 		return nil, errors.New("Kubernetes service environment is unavailable")
 	}
-	ca, err := os.ReadFile(serviceAccountCAPath)
+	return newKubernetesIssuer(host, port, serviceAccountCAPath)
+}
+
+func newKubernetesIssuer(host, port, caPath string) (*KubernetesIssuer, error) {
+	ca, err := os.ReadFile(caPath)
 	if err != nil {
 		return nil, fmt.Errorf("read service account CA: %w", err)
 	}
@@ -41,8 +46,8 @@ func NewKubernetesIssuer() (*KubernetesIssuer, error) {
 	if !pool.AppendCertsFromPEM(ca) {
 		return nil, errors.New("parse service account CA")
 	}
-	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
-	return &KubernetesIssuer{apiServer: "https://" + host + ":" + port, tokenPath: serviceAccountTokenPath, http: &http.Client{Transport: transport, Timeout: 15 * time.Second}}, nil
+	transport := kubehttp.Transport(pool)
+	return &KubernetesIssuer{apiServer: "https://" + net.JoinHostPort(host, port), tokenPath: serviceAccountTokenPath, http: &http.Client{Transport: transport, Timeout: 15 * time.Second}}, nil
 }
 
 func (issuer *KubernetesIssuer) Issue(ctx context.Context, namespace, serviceAccount string, ttl time.Duration, existingSecret string) (string, string, time.Time, error) {
@@ -148,11 +153,16 @@ func (issuer *KubernetesIssuer) request(ctx context.Context, method, path string
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
+	const maxBody = 1 << 20
+	bodyLimit := io.LimitReader(response.Body, maxBody)
+	// Drain small responses for HTTP/1.1 reuse. Cap the total bytes read
+	// even when the apiserver returns an error or an unexpected payload.
+	defer func() { _, _ = io.Copy(io.Discard, bodyLimit) }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return &kubernetesHTTPError{code: response.StatusCode}
 	}
 	if output != nil {
-		return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output)
+		return json.NewDecoder(bodyLimit).Decode(output)
 	}
 	return nil
 }

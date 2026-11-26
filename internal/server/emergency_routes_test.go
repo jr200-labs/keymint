@@ -2,13 +2,17 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/config"
+	"github.com/jr200-labs/keymint/internal/emergency"
 )
 
 func TestEmergencyRoutesAuthenticateAndReportOutcomes(t *testing.T) {
@@ -55,5 +59,84 @@ func TestEmergencyRoutesAuthenticateAndReportOutcomes(t *testing.T) {
 				t.Error("sensitive endpoint permits caching")
 			}
 		}
+	}
+}
+
+func TestEmergencyRevokeRetriesBeforePublishingTerminalEvent(t *testing.T) {
+	ctx := context.Background()
+	revocations := 0
+	available := false
+	client := &http.Client{Transport: emergencyTransport(func(r *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		body := ""
+		switch {
+		case r.Method == http.MethodDelete:
+			revocations++
+			if !available {
+				status = http.StatusServiceUnavailable
+			}
+		case r.URL.Path == "/login/device/code":
+			body = `{"device_code":"code","user_code":"user","interval":5}`
+		case r.URL.Path == "/login/oauth/access_token":
+			body = `{"access_token":"synthetic"}`
+		case r.URL.Path == "/user":
+			body = `{"id":1}`
+		default:
+			t.Errorf("unexpected upstream route %q", r.URL.Path)
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	cfg := &config.Config{
+		EmergencyProfiles: map[string]config.EmergencyProfile{"human": {
+			Provider: "github_user", ClientID: "app", ClientSecret: "secret", AllowedUserIDs: []int64{1}, Scopes: []string{"repo"},
+		}},
+		Allowlist: []config.AllowEntry{{Subject: "caller", EmergencyProfiles: []string{"human"}}},
+	}
+	em, err := emergency.New(cfg, client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = em.Close() }()
+	session, err := em.Create(ctx, "caller", "human", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := em.Get(ctx, "caller", session.ID); err != nil || got.State != emergency.Active {
+		t.Fatalf("authentication state=%s err=%v", got.State, err)
+	}
+	srv, err := New(cfg, func(context.Context, config.Key, TokenScope) (string, time.Time, error) {
+		return "", time.Time{}, nil
+	}, &fakeReviewer{subjectByToken: map[string]string{"valid": "caller"}}, nil, em)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	deleteSession := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodDelete, "/emergency/sessions/"+session.ID, nil)
+		req.Header.Set("Authorization", "Bearer valid")
+		response := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(response, req)
+		return response
+	}
+	if response := deleteSession(); response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "pending") {
+		t.Fatalf("first revocation returned %d %s", response.Code, response.Body.String())
+	}
+	if err := em.Prune(ctx); !errors.Is(err, emergency.ErrRevocationPending) || revocations != 2 {
+		t.Fatalf("after one retry: revocations=%d err=%v", revocations, err)
+	}
+	page, err := em.Events(ctx, "caller", "", 0)
+	if err != nil || len(page.Events) != 3 || page.Events[2].Type != "session.revocation_pending" {
+		t.Fatalf("events before confirmation=%+v err=%v", page.Events, err)
+	}
+	available = true
+	if err := em.Prune(ctx); err != nil || revocations != 3 {
+		t.Fatalf("after successful retry: revocations=%d err=%v", revocations, err)
+	}
+	page, err = em.Events(ctx, "caller", page.NextCursor, 0)
+	if err != nil || len(page.Events) != 1 || page.Events[0].Type != "session.revoked" {
+		t.Fatalf("events after confirmation=%+v err=%v", page.Events, err)
+	}
+	if response := deleteSession(); response.Code != http.StatusNotFound {
+		t.Fatalf("missing session returned %d", response.Code)
 	}
 }

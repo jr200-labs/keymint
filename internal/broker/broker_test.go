@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -142,5 +143,41 @@ func TestCloseCancelsOutstandingMint(t *testing.T) {
 	}
 	if _, _, err := b.Mint(context.Background(), key, mint.Scope{}); err == nil {
 		t.Fatal("closed broker accepted request")
+	}
+}
+
+func TestMintSharesParsedKeyAndPreservesTokensOnUnrelatedReload(t *testing.T) {
+	b, key, _ := testBroker(t)
+	var parsed crypto.PrivateKey
+	calls := 0
+	b.exchange = func(_ context.Context, req mint.Request) (mint.Token, error) {
+		calls++
+		if parsed == nil {
+			parsed = req.PrivateKey
+		} else if parsed != req.PrivateKey {
+			t.Error("parsed key was duplicated across scopes")
+		}
+		return mint.Token{Token: fmt.Sprintf("token-%d", calls), ExpiresAt: b.now().Add(time.Hour)}, nil
+	}
+	ctx := context.Background()
+	for _, scope := range []mint.Scope{{}, {Repositories: []string{"repo"}}} {
+		if _, _, err := b.Mint(ctx, key, scope); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Config{
+		Keys:      map[string]config.Key{"app": key},
+		Allowlist: []config.AllowEntry{{Subject: "new-subject", Keys: []string{"app"}}},
+	}
+	if err := b.Reload(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for i, scope := range []mint.Scope{{}, {Repositories: []string{"repo"}}} {
+		if token, _, err := b.Mint(ctx, key, scope); err != nil || token != fmt.Sprintf("token-%d", i+1) {
+			t.Fatalf("cached token after reload = %q, error %v", token, err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls=%d want 2", calls)
 	}
 }

@@ -3,8 +3,10 @@ package emergency
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,7 +38,7 @@ func TestKubernetesIssuerReadsRotatedServiceAccountTokenForEveryRequest(t *testi
 		if got := request.Header.Get("Authorization"); got != "Bearer "+wantToken {
 			t.Errorf("Authorization = %q, want bearer for current token", got)
 		}
-		writer.WriteHeader(http.StatusNoContent)
+		_, _ = writer.Write([]byte(`{"kind":"Status"}`))
 	}))
 	defer server.Close()
 
@@ -49,7 +51,14 @@ func TestKubernetesIssuerReadsRotatedServiceAccountTokenForEveryRequest(t *testi
 	if err := os.WriteFile(tokenPath, []byte(wantToken), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := issuer.request(context.Background(), http.MethodDelete, "/api/v1/second", nil, nil); err != nil {
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if !info.Reused {
+				t.Error("issuer did not reuse connection after deleting without decoding a body")
+			}
+		},
+	})
+	if err := issuer.request(ctx, http.MethodDelete, "/api/v1/second", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -86,5 +95,27 @@ func TestKubernetesIssuerUsesAPIServerDefaultAudience(t *testing.T) {
 	token, _, expiresAt, err := issuer.Issue(context.Background(), "operators", "breakglass", time.Minute, "")
 	if err != nil || token != "cluster-token" || expiresAt.IsZero() {
 		t.Fatalf("Issue() = token %q expires %v error %v", token, expiresAt, err)
+	}
+}
+
+func TestKubernetesIssuerUsesIPv6HostAndBoundedTransport(t *testing.T) {
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	defer server.Close()
+	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(caPath, certificate, 0600); err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := newKubernetesIssuer("fd00::1", "6443", caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issuer.apiServer != "https://[fd00::1]:6443" {
+		t.Errorf("unexpected API URL: %q", issuer.apiServer)
+	}
+	transport := issuer.http.Transport.(*http.Transport)
+	if transport.TLSHandshakeTimeout <= 0 || transport.ResponseHeaderTimeout <= 0 ||
+		transport.IdleConnTimeout <= 0 || transport.MaxIdleConnsPerHost <= 0 {
+		t.Error("missing Kubernetes transport bounds")
 	}
 }

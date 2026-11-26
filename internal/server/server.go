@@ -27,18 +27,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jr200-labs/keymint/internal/kubehttp"
 	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -789,7 +790,14 @@ func (s *Server) handleEmergencyRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.emergency.Revoke(r.Context(), subject, r.PathValue("id")); err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
+		switch {
+		case errors.Is(err, emergency.ErrSessionUnavailable):
+			writeJSONError(w, http.StatusNotFound, "emergency session is unavailable")
+		case errors.Is(err, emergency.ErrRevocationPending):
+			writeJSONError(w, http.StatusBadGateway, "emergency credential revocation is pending")
+		default:
+			writeJSONError(w, http.StatusServiceUnavailable, "emergency revocation could not be confirmed")
+		}
 		return
 	}
 	logging.FromContext(r.Context()).Info("emergency session revoked", zap.String("subject", subject), zap.String("session", r.PathValue("id")))
@@ -872,24 +880,28 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusRequestEntityTooLarge, "token scope is too large")
 		return
 	}
-	if r.ContentLength != 0 {
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 8193))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&scope); err != nil {
-			s.recordOutcome(span, metricKey, "invalid_scope")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8192))
+	if err != nil {
+		s.recordOutcome(span, metricKey, "invalid_scope")
+		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "token scope is too large")
+		} else {
 			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
-			return
 		}
-		if err := decoder.Decode(new(any)); err != io.EOF {
-			s.recordOutcome(span, metricKey, "invalid_scope")
-			writeJSONError(w, http.StatusBadRequest, "invalid token scope")
-			return
-		}
-		if err := scope.Validate(); err != nil {
-			s.recordOutcome(span, metricKey, "invalid_scope")
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&scope)
+	if !errors.Is(err, io.EOF) && (err != nil || !errors.Is(decoder.Decode(new(any)), io.EOF)) {
+		s.recordOutcome(span, metricKey, "invalid_scope")
+		writeJSONError(w, http.StatusBadRequest, "invalid token scope")
+		return
+	}
+	if err := scope.Validate(); err != nil {
+		s.recordOutcome(span, metricKey, "invalid_scope")
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// 6. Mint
@@ -971,6 +983,9 @@ func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	if err != nil {
 		host = r.RemoteAddr
 	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
 	if len(trustedProxies) == 0 || !ipInCIDRs(host, trustedProxies) {
 		return host
 	}
@@ -978,21 +993,20 @@ func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	// Peer is a trusted proxy: parse XFF right-to-left, skipping
 	// any further trusted hops, return the first untrusted IP we
 	// encounter. That's the client.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			ip := strings.TrimSpace(parts[i])
-			if ip == "" {
-				continue
+	for _, line := range slices.Backward(r.Header.Values("X-Forwarded-For")) {
+		for _, value := range slices.Backward(strings.Split(line, ",")) {
+			ip := net.ParseIP(strings.TrimSpace(value))
+			if ip == nil {
+				return host
 			}
-			if !ipInCIDRs(ip, trustedProxies) {
-				return ip
+			if !ipInCIDRs(ip.String(), trustedProxies) {
+				return ip.String()
 			}
 		}
 	}
-	// Fall back to X-Real-IP if XFF was empty / all-trusted.
-	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" && !ipInCIDRs(real, trustedProxies) {
-		return real
+	// Fall back to X-Real-IP if XFF was absent or all-trusted.
+	if real := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); real != nil && !ipInCIDRs(real.String(), trustedProxies) {
+		return real.String()
 	}
 	return host
 }
@@ -1087,22 +1101,6 @@ func NewK8sTokenReviewer(expectedAudiences []string) (*K8sTokenReviewer, error) 
 		return nil, fmt.Errorf("server: stat service account token: %w", err)
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs:    rootCAs,
-			MinVersion: tls.VersionTLS12,
-		},
-		// Bound resource consumption when talking to the apiserver.
-		// Without these, defaults leak idle conns under apiserver
-		// slowness and TLS handshakes cost CPU under sudden load.
-		MaxIdleConns:          50,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-	}
-
 	// Circuit breaker around TokenReview. If the apiserver degrades
 	// (consistently slow or 5xx), open the breaker and fail-fast for
 	// 30s so we don't pile up 10-second-stalled goroutines and exhaust
@@ -1125,7 +1123,7 @@ func NewK8sTokenReviewer(expectedAudiences []string) (*K8sTokenReviewer, error) 
 		expectedAudiences: append([]string(nil), expectedAudiences...),
 		httpClient: &http.Client{
 			Timeout:   10 * time.Second,
-			Transport: transport,
+			Transport: kubehttp.Transport(rootCAs),
 		},
 		breaker: cb,
 	}, nil

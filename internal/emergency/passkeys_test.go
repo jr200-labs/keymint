@@ -25,7 +25,7 @@ import (
 
 // Synthetic authenticator fixtures use real signatures and protocol encodings;
 // no browser, physical authenticator, upstream network or private user key.
-func passkeyResponse(t *testing.T, service *Service, token string, key *ecdsa.PrivateKey, registration bool, origin string) *http.Request {
+func passkeyResponse(t *testing.T, service *Service, token string, key *ecdsa.PrivateKey, registration bool, origin string, signCount uint32) *http.Request {
 	t.Helper()
 	challenge := service.ceremonies[token].data.Challenge
 	kind := "webauthn.get"
@@ -40,7 +40,7 @@ func passkeyResponse(t *testing.T, service *Service, token string, key *ecdsa.Pr
 		flag |= 64
 	}
 	auth = append(auth, flag)
-	auth = append(auth, 0, 0, 0, 1)
+	auth = binary.BigEndian.AppendUint32(auth, signCount)
 	id := []byte("synthetic-passkey-id")
 	enc := base64.RawURLEncoding.EncodeToString
 	response := map[string]any{"clientDataJSON": enc(client)}
@@ -62,7 +62,6 @@ func passkeyResponse(t *testing.T, service *Service, token string, key *ecdsa.Pr
 		response["attestationObject"] = enc(attestation)
 		response["transports"] = []string{"internal"}
 	} else {
-		auth[len(auth)-1] = 2
 		hash := sha256.Sum256(client)
 		signed := sha256.Sum256(append(append([]byte{}, auth...), hash[:]...))
 		signature, err := ecdsa.SignASN1(rand.Reader, key, signed[:])
@@ -107,7 +106,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = service.VerifyPasskey("caller", token, passkeyResponse(t, service, token, key, true, "https://keys.example")); err != nil {
+	if err = service.VerifyPasskey("caller", token, passkeyResponse(t, service, token, key, true, "https://keys.example", 1)); err != nil {
 		t.Fatal(err)
 	}
 	for _, origin := range []string{"https://keys.example", "https://other.example"} {
@@ -116,7 +115,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, token, _ = strings.Cut(session.VerificationURI, "#")
-		request := passkeyResponse(t, service, token, key, false, origin)
+		request := passkeyResponse(t, service, token, key, false, origin, 2)
 		err = service.VerifyPasskey("caller", token, request)
 		if origin == "https://keys.example" {
 			if err != nil {
@@ -127,6 +126,20 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 			}
 		} else if err == nil {
 			t.Fatal("wrong origin accepted")
+		}
+	}
+	for _, counter := range []uint32{1, 2} {
+		session, err := service.Create(context.Background(), "caller", "passkey", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, token, _ := strings.Cut(session.VerificationURI, "#")
+		request := passkeyResponse(t, service, token, key, false, "https://keys.example", counter)
+		if err := service.VerifyPasskey("caller", token, request); err == nil || !strings.Contains(err.Error(), "counter") {
+			t.Fatalf("non-advancing counter %d returned %v", counter, err)
+		}
+		if err := service.Authorize("caller", session.ID); err == nil {
+			t.Fatal("non-advancing counter authorized session")
 		}
 	}
 	ctx := context.Background()
@@ -167,7 +180,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(options["approval_duration_minutes"], []int{5, 15, 30, 60}) || options["default_approval_duration_minutes"] != 5 {
 		t.Fatalf("approval duration options = %v, error = %v", options["approval_duration_minutes"], err)
 	}
-	approvalRequest := passkeyResponse(t, service, approvalToken, key, false, "https://keys.example")
+	approvalRequest := passkeyResponse(t, service, approvalToken, key, false, "https://keys.example", 3)
 	approvalRequest.Header.Set(ApprovalDurationHeader, "90")
 	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err == nil {
 		t.Fatal("accepted a duration above the profile maximum")

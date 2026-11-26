@@ -16,6 +16,11 @@ const (
 )
 const RevocationPending State = "revocation_pending"
 
+var (
+	ErrSessionUnavailable = errors.New("emergency session is unavailable")
+	ErrRevocationPending  = errors.New("emergency credential revocation is pending")
+)
+
 func terminal(state State) bool { return state == Revoked || state == Expired || state == Invalidated }
 func transitionAllowed(from, to State) bool {
 	if terminal(from) {
@@ -60,7 +65,7 @@ func (service *Service) transitionLocked(ctx context.Context, session *Session, 
 	err := service.record(ctx, event, &copy)
 	if err == nil || state != Active {
 		session.State = state
-		session.terminalEventPending = terminal(state) && err != nil
+		session.withdrawalEventPending = err != nil
 	}
 	return err
 }
@@ -72,9 +77,13 @@ func (service *Service) transitionLocked(ctx context.Context, session *Session, 
 func (service *Service) beginOperation(ctx context.Context, subject, id string, op operation) (*Session, func(), error) {
 	service.mu.Lock()
 	session, err := service.ownedSession(subject, id)
-	if err != nil || service.closed {
+	if service.closed {
 		service.mu.Unlock()
-		return nil, nil, errors.New("emergency session is unavailable")
+		return nil, nil, errors.New("emergency service is closed")
+	}
+	if err != nil {
+		service.mu.Unlock()
+		return nil, nil, ErrSessionUnavailable
 	}
 	if session.gate == nil {
 		session.gate = make(chan struct{}, 1)
@@ -88,9 +97,13 @@ func (service *Service) beginOperation(ctx context.Context, subject, id string, 
 	}
 	service.mu.Lock()
 	if service.sessions[id] != session || service.closed {
+		closed := service.closed
 		service.mu.Unlock()
 		<-gate
-		return nil, nil, errors.New("emergency session changed while waiting")
+		if closed {
+			return nil, nil, errors.New("emergency service is closed")
+		}
+		return nil, nil, ErrSessionUnavailable
 	}
 	session.operation = op
 	return session, func() { service.mu.Lock(); session.operation = idle; service.mu.Unlock(); <-gate }, nil

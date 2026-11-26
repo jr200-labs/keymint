@@ -124,6 +124,19 @@ the deploy accordingly:
   every `TokenReview` call. Use a projected SA volume so the kubelet
   rotates the token in place; do not bake the token into an env var.
 
+- **Installation token requests.** Send an empty body to
+  `POST /token/<key>` for a token with the installation's default access,
+  or send a JSON object with `repositories` and/or `permissions` to
+  narrow its scope. The same rules apply to chunked requests and HTTP/2
+  requests without a `Content-Length` header. Bodies larger than 8 KiB
+  return HTTP 413. Invalid scopes return HTTP 400.
+
+- **GitHub API base URL.** Leave `keys.<name>.api_base_url` unset for
+  `https://api.github.com`. For GitHub Enterprise Server, specify an
+  absolute HTTPS URL such as `https://github.example.com/api/v3`. Keymint
+  accepts and trims trailing slashes. Credentials, queries, and fragments
+  are invalid in the configured URL.
+
 - **Actionable permission errors.** When GitHub explicitly rejects token
   permissions that the installation has not granted, `POST /token/<key>`
   returns HTTP 422 with `code: github_permissions_not_granted` and a readable
@@ -134,9 +147,15 @@ the deploy accordingly:
   internal errors and arbitrary upstream response bodies are not disclosed.
 
 - **Two-tier rate limiting.** Inbound requests are rate-limited
-  per-remote-IP before authentication (10 r/s, burst 20) and
-  per-resolved-ServiceAccount after authentication (100 r/s, burst
-  200). A flooder cannot exhaust an authenticated caller's bucket.
+  per-client-IP before authentication (10 r/s, burst 20) and per resolved
+  ServiceAccount after authentication (100 r/s, burst 200). When the immediate
+  peer matches `trusted_proxies`, Keymint walks all `X-Forwarded-For` header
+  values from right to left and uses the first valid IP outside the trusted
+  ranges. A malformed hop encountered during the walk falls back to the peer IP.
+  When the chain is absent or all its hops are trusted, Keymint uses a valid
+  untrusted `X-Real-IP` if present, then the peer IP. Both limiters keep buckets
+  in maps without a fixed capacity and sweep fully refilled buckets every
+  30 seconds.
 
 - **Single-flight token caching.** When a cached installation token
   expires, only one in-flight request actually mints a new one;
@@ -148,15 +167,11 @@ the deploy accordingly:
   Enterprise base URL configured per key. A sick GHE clock cannot
   poison signing for unrelated endpoints.
 
-- **Bounded rate limiters.** Both pre-auth (per-IP) and post-auth
-  (per-subject) rate limiters live behind LRUs sized to a few
-  thousand entries. A flood of unique IPs or subjects evicts older
-  buckets instead of growing memory without bound.
-
 - **Hot key rotation.** Operators rotating the kubernetes Secret
   carrying an App PEM are picked up automatically — keymint
-  compares mtime+size of the on-disk file before reusing a parsed
-  RSA key, and reloads when either changes.
+  caches the parsed RSA key by PEM path and checks file identity,
+  modification time, size, and watcher generation before reusing it.
+  Reloading unrelated configuration preserves cached installation tokens.
 
 - **TokenReview circuit breaker.** Calls to the kubernetes API are
   guarded by a circuit breaker that opens for 30s when failure
@@ -173,10 +188,11 @@ the deploy accordingly:
   via singleflight; below 1 min it refreshes synchronously. No
   guaranteed latency spike at the 5-min mark.
 
-- **Tuned outbound HTTP transports.** Both the kubernetes-API client
-  and the GitHub-API client set explicit `MaxIdleConnsPerHost`,
-  `IdleConnTimeout`, `TLSHandshakeTimeout`, and
-  `ResponseHeaderTimeout` instead of inheriting stdlib defaults.
+- **Tuned outbound HTTP transports.** Kubernetes TokenReview and emergency
+  credential issuance share transport settings that bound idle connections,
+  TLS handshakes, and response-header waits. Both support IPv6 API server
+  addresses. The issuer drains small responses so it can reuse connections.
+  The GitHub API client also sets explicit connection and timeout limits.
 
 - **TokenReview cache (positive + negative).** Successful TokenReview results are cached for ~60 s and rejections for ~15 s, both in LRUs keyed by the SHA-256 of the bearer token. Bursty legitimate callers don't amplify into the kubernetes API; bursts of invalid/revoked tokens (misconfigured CI, attackers) also collapse to one apiserver call per TTL window. Revoked ServiceAccounts lose access on the next positive-TTL boundary.
 
@@ -232,9 +248,11 @@ the deploy accordingly:
 
 - **GitHub rate-limit observability.** Each `/access_tokens`
   response's `X-RateLimit-Remaining` and `X-RateLimit-Reset`
-  headers are exported as Prometheus gauges
-  (`keymint_github_ratelimit_remaining{api_base_url}`,
-  `keymint_github_ratelimit_reset_unix{api_base_url}`). Breaker
+  headers update the Prometheus gauges
+  `keymint_github_ratelimit_remaining{api_base_url}` and
+  `keymint_github_ratelimit_reset_unix{api_base_url}`. A missing or invalid
+  remaining-quota header leaves both gauges unchanged. The reset gauge
+  updates when the reset timestamp is also valid. Breaker
   state is exposed as `keymint_github_breaker_state` (0 closed,
   1 half-open, 2 open).
 
@@ -416,9 +434,13 @@ Kubernetes bound Secrets separately.
 A session begins in `awaiting_github`, `awaiting_totp` or `awaiting_passkey` and
 becomes `active` only after verification and durable activation audit succeed.
 Explicit revocation first enters `revocation_pending`, which immediately denies
-credential access while external cleanup runs. `revoked`, `expired` and
-`invalidated` are terminal states and cannot reactivate. Profile revisions are
-immutable within a session. Removal or changed authority invalidates it.
+credential access while external cleanup runs. `DELETE /emergency/sessions/{id}`
+returns HTTP 502 if cleanup fails and remains pending, HTTP 404 if the session
+is unavailable, or HTTP 503 if Keymint otherwise cannot confirm the revocation.
+The broker retries pending cleanup once per prune pass and publishes
+`session.revoked` after cleanup succeeds. `revoked`, `expired`, and
+`invalidated` are terminal states. Profile revisions are immutable within a
+session. Removal or changed authority invalidates it.
 The broker allows up to 16 sessions per workload identity and 1024 overall,
 including creations in progress. A Kubernetes credential reports the earlier
 of the token and session expirations.
@@ -435,7 +457,9 @@ Consumers must treat pending revocation as loss of authority and reconcile stale
 bindings after restart or journal replacement. See
 [ADR 0003](docs/adr/0003-publish-durable-emergency-session-events.md). Enrolling a
 passkey requires a still-active TOTP proof when enrollment finishes, not just
-when its ceremony starts.
+when its ceremony starts. Keymint rejects assertions with a WebAuthn clone
+warning, including previously flagged credentials. Replace a flagged passkey
+through the TOTP-backed enrollment flow.
 
 Padd chooses organization storage for its shared-secret path and repository
 storage for private repositories in Free-plan organizations. Both use the same
