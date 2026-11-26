@@ -34,8 +34,9 @@ type Event struct {
 }
 
 type EventPage struct {
-	Events     []Event `json:"events"`
-	NextCursor string  `json:"next_cursor"`
+	Events           []Event `json:"events"`
+	NextCursor       string  `json:"next_cursor"`
+	HistoryTruncated bool    `json:"history_truncated,omitempty"`
 }
 
 type eventStore struct {
@@ -73,7 +74,8 @@ session_id TEXT PRIMARY KEY, digest TEXT NOT NULL, redeemed INTEGER NOT NULL DEF
 CREATE TABLE IF NOT EXISTS emergency_totp (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, attempts INTEGER NOT NULL, last_step INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_totp_failures (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, failures INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);`); err != nil {
+CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);
+CREATE INDEX IF NOT EXISTS emergency_events_session_time ON emergency_events(session_id, occurred_at);`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate emergency event state: %w", err)
 	}
@@ -159,7 +161,7 @@ func (store *eventStore) watch(ctx context.Context, subject, after string, wait 
 	store.mu.Unlock()
 	afterID := store.parseCursor(after)
 	page, err := store.list(ctx, subject, afterID)
-	if err != nil || len(page.Events) != 0 || wait == 0 {
+	if err != nil || len(page.Events) != 0 || page.HistoryTruncated || wait == 0 {
 		return page, err
 	}
 	timer := time.NewTimer(wait)
@@ -174,13 +176,22 @@ func (store *eventStore) watch(ctx context.Context, subject, after string, wait 
 }
 
 func (store *eventStore) list(ctx context.Context, subject string, after int64) (EventPage, error) {
-	rows, err := store.db.QueryContext(ctx, `SELECT id, type, session_id, profile, provider, state, expires_at, occurred_at
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return EventPage{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var floor int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM emergency_metadata WHERE key='pruned_through'), 0)`).Scan(&floor); err != nil {
+		return EventPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, type, session_id, profile, provider, state, expires_at, occurred_at
 FROM emergency_events WHERE subject = ? AND id > ? ORDER BY id LIMIT ?`, subject, after, maxEventPage)
 	if err != nil {
 		return EventPage{}, err
 	}
 	defer func() { _ = rows.Close() }()
-	page := EventPage{Events: []Event{}, NextCursor: store.cursor(after)}
+	page := EventPage{Events: []Event{}, NextCursor: store.cursor(after), HistoryTruncated: after < floor}
 	for rows.Next() {
 		var event Event
 		var expiresAt, occurredAt int64
@@ -191,6 +202,9 @@ FROM emergency_events WHERE subject = ? AND id > ? ORDER BY id LIMIT ?`, subject
 		event.OccurredAt = time.UnixMilli(occurredAt).UTC()
 		page.Events = append(page.Events, event)
 		page.NextCursor = store.cursor(event.ID)
+	}
+	if len(page.Events) == 0 && page.HistoryTruncated {
+		page.NextCursor = store.cursor(floor)
 	}
 	return page, rows.Err()
 }
@@ -236,6 +250,46 @@ FROM emergency_session_state WHERE state NOT IN ('expired', 'revoked', 'invalida
 		if err := store.append(ctx, event); err != nil {
 			return fmt.Errorf("invalidate restored emergency session: %w", err)
 		}
+	}
+	return nil
+}
+
+// prune removes complete histories only after a terminal session's latest
+// event has aged out and its encrypted retry record is gone.
+func (store *eventStore) prune(ctx context.Context, before time.Time) (result error) {
+	started := time.Now()
+	defer func() { store.metrics.ObserveOperation("journal_prune", started, result) }()
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const eligible = `SELECT s.session_id FROM emergency_session_state AS s
+WHERE s.state IN ('expired','revoked','invalidated')
+AND NOT EXISTS (SELECT 1 FROM emergency_cleanup AS c WHERE c.session_id=s.session_id)
+AND NOT EXISTS (SELECT 1 FROM emergency_events AS e WHERE e.session_id=s.session_id AND e.occurred_at>=?)
+ORDER BY s.session_id LIMIT 1000`
+	cutoff := before.UnixMilli()
+	var highest int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM emergency_events WHERE session_id IN (`+eligible+`)`, cutoff).Scan(&highest); err != nil {
+		return err
+	}
+	for _, table := range []string{"emergency_approvals", "emergency_events", "emergency_session_state"} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE session_id IN ("+eligible+")", cutoff); err != nil {
+			return err
+		}
+	}
+	if highest > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO emergency_metadata(key,value) VALUES ('pruned_through',?)
+ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))`, highest); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if highest > 0 {
+		store.signal()
 	}
 	return nil
 }

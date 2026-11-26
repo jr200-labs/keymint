@@ -2,6 +2,7 @@ package emergency
 
 import (
 	"context"
+	"errors"
 	"github.com/jr200-labs/keymint/internal/config"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -207,5 +208,37 @@ func TestQuarantineCleanupRepairsStartupAfterKeyLoss(t *testing.T) {
 	var archived int
 	if err := recovered.events.db.QueryRow(`SELECT COUNT(*) FROM emergency_cleanup_quarantine`).Scan(&archived); err != nil || archived != 2 || calls != 0 {
 		t.Fatalf("archived=%d revocations=%d error=%v", archived, calls, err)
+	}
+}
+
+func TestCleanupStatusReadsPendingAndArchivedWithoutEncryptionKey(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "events.db")
+	svc, err := New(&config.Config{EmergencyStateFile: path}, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"pending", "archived"} {
+		if err := svc.cleanup.put(ctx, cleanupRecord{ID: id, Token: "hidden"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.events.close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QuarantineCleanup(ctx, path, "archived"); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := path + ".cleanup-key"
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	status, err := InspectCleanup(ctx, path)
+	if err != nil || len(status.Pending) != 1 || status.Pending[0] != "pending" ||
+		len(status.Quarantined) != 1 || status.Quarantined[0].SessionID != "archived" || status.Quarantined[0].QuarantinedAt.IsZero() {
+		t.Fatalf("unexpected status: %+v, error=%v", status, err)
+	}
+	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspection changed key file: %v", err)
 	}
 }

@@ -38,7 +38,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -77,9 +76,9 @@ type MintFunc func(context.Context, config.Key, mint.Scope) (string, time.Time, 
 // the operator hot-reloads keymint's config.yaml.
 type configSnapshot struct {
 	cfg            *config.Config
-	allowedSubject map[string]map[string]bool // subject -> keys -> true
-	allowedRelease map[string]map[string]bool // subject -> release keys -> true
-	trustedProxies []*net.IPNet               // parsed once at snapshot build
+	allowedSubject map[string]map[string]config.AllowEntry // subject -> key -> mint policy
+	allowedRelease map[string]map[string]bool              // subject -> release keys -> true
+	trustedProxies []*net.IPNet                            // parsed once at snapshot build
 }
 
 // reviewCache caches both positive and negative TokenReview results
@@ -308,6 +307,9 @@ func (s *Server) runEmergencyJanitor() {
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), emergencyJanitorInterval)
+			if err := s.emergency.PruneJournal(ctx); err != nil {
+				zap.L().Error("prune emergency journal", zap.Error(err))
+			}
 			if err := s.emergency.Prune(ctx); err != nil {
 				zap.L().Error("prune expired emergency sessions", zap.Error(err))
 			}
@@ -327,14 +329,14 @@ func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.janitorStop) }); s.work
 // buildSnapshot precomputes the subject -> keys allow map and
 // parsed trusted-proxy CIDRs for fast lookup at request time.
 func buildSnapshot(cfg *config.Config) *configSnapshot {
-	allowed := make(map[string]map[string]bool, len(cfg.Allowlist))
+	allowed := make(map[string]map[string]config.AllowEntry, len(cfg.Allowlist))
 	allowedRelease := make(map[string]map[string]bool, len(cfg.Allowlist))
 	for _, e := range cfg.Allowlist {
 		if allowed[e.Subject] == nil {
-			allowed[e.Subject] = make(map[string]bool)
+			allowed[e.Subject] = make(map[string]config.AllowEntry)
 		}
 		for _, k := range e.Keys {
-			allowed[e.Subject][k] = true
+			allowed[e.Subject][k] = e
 		}
 		if len(e.ReleaseKeys) != 0 && allowedRelease[e.Subject] == nil {
 			allowedRelease[e.Subject] = make(map[string]bool)
@@ -365,9 +367,8 @@ func (s *Server) ValidateReload(cfg *config.Config) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("server: reload validation: %w", err)
 	}
-	current := s.currentConfig()
-	if !reflect.DeepEqual(current.Passkeys, cfg.Passkeys) || current.EmergencyStateFile != cfg.EmergencyStateFile || !reflect.DeepEqual(current.ExpectedAudiences, cfg.ExpectedAudiences) {
-		return errors.New("passkeys, emergency_state_file and expected_audiences changes require restart")
+	if err := cfg.ValidateReloadFrom(s.currentConfig()); err != nil {
+		return err
 	}
 	if s.emergency != nil && len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
 		return errors.New("emergency_state_file is required for emergency profiles")
@@ -489,12 +490,13 @@ func (s *Server) handlePasskeyEnrollmentCreate(w http.ResponseWriter, r *http.Re
 	}
 	var input struct {
 		ProofSessionID string `json:"proof_session_id"`
+		Label          string `json:"label,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	enrollment, err := s.emergency.BeginPasskeyEnrollment(subject, input.ProofSessionID)
+	enrollment, err := s.emergency.BeginLabeledPasskeyEnrollment(subject, input.ProofSessionID, input.Label)
 	if err != nil {
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
@@ -854,7 +856,8 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	log = log.With(zap.String("subject", subject))
 
 	// 3. Allowlist check
-	if !snapshot.allowedSubject[subject][keyName] {
+	policy, allowed := snapshot.allowedSubject[subject][keyName]
+	if !allowed {
 		s.recordOutcome(span, metricKey, metrics.OutcomeForbidden)
 		span.SetStatus(codes.Error, "forbidden")
 		log.Warn("subject not permitted")
@@ -901,6 +904,14 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 	if err := scope.Validate(); err != nil {
 		s.recordOutcome(span, metricKey, "invalid_scope")
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !policy.AllowsMintScope(scope) {
+		s.recordOutcome(span, metricKey, metrics.OutcomeForbidden)
+		span.SetStatus(codes.Error, "scope outside allowlist")
+		log.Warn("token scope outside allowlist")
+		writeJSONError(w, http.StatusForbidden, "token scope is outside the workload allowlist")
 		return
 	}
 

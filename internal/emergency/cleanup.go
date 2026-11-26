@@ -87,19 +87,82 @@ func openCleanupStore(db *sql.DB, statePath string) (*cleanupStore, error) {
 	return &cleanupStore{db: db, cipher: aead}, nil
 }
 
+type CleanupStatus struct {
+	Pending     []string             `json:"pending"`
+	Quarantined []QuarantinedCleanup `json:"quarantined"`
+}
+
+type QuarantinedCleanup struct {
+	SessionID     string    `json:"session_id"`
+	QuarantinedAt time.Time `json:"quarantined_at"`
+}
+
+// InspectCleanup reads only record metadata and does not require the encryption key.
+func InspectCleanup(ctx context.Context, statePath string) (CleanupStatus, error) {
+	status := CleanupStatus{Pending: []string{}, Quarantined: []QuarantinedCleanup{}}
+	db, err := openExistingStateDB(statePath, "ro")
+	if err != nil {
+		return status, err
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return status, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT session_id FROM emergency_cleanup ORDER BY session_id`)
+	if err != nil {
+		return status, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return status, err
+		}
+		status.Pending = append(status.Pending, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return status, err
+	}
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='emergency_cleanup_quarantine')`).Scan(&exists); err != nil || !exists {
+		return status, err
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT session_id,quarantined_at FROM emergency_cleanup_quarantine ORDER BY id`)
+	if err != nil {
+		return status, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var record QuarantinedCleanup
+		var timestamp int64
+		if err := rows.Scan(&record.SessionID, &timestamp); err != nil {
+			return status, err
+		}
+		record.QuarantinedAt = time.Unix(timestamp, 0).UTC()
+		status.Quarantined = append(status.Quarantined, record)
+	}
+	return status, rows.Err()
+}
+
+func openExistingStateDB(statePath, mode string) (*sql.DB, error) {
+	if statePath == "" {
+		return nil, errors.New("an existing emergency state file is required")
+	}
+	path, err := filepath.Abs(statePath)
+	if err != nil {
+		return nil, err
+	}
+	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "mode=" + mode + "&_pragma=busy_timeout(5000)"}
+	return sql.Open("sqlite", dsn.String())
+}
+
 // QuarantineCleanup moves encrypted cleanup records out of the retry queue.
 // The service must be stopped so it cannot repopulate records from memory.
 // An empty session ID selects every outstanding record.
 func QuarantineCleanup(ctx context.Context, statePath, sessionID string) (int64, error) {
-	if statePath == "" {
-		return 0, errors.New("an existing emergency state file is required")
-	}
-	path, err := filepath.Abs(statePath)
-	if err != nil {
-		return 0, err
-	}
-	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "mode=rw&_pragma=busy_timeout(5000)"}
-	db, err := sql.Open("sqlite", dsn.String())
+	db, err := openExistingStateDB(statePath, "rw")
 	if err != nil {
 		return 0, err
 	}

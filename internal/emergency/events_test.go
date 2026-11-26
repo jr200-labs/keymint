@@ -151,3 +151,52 @@ func TestPruneJournalsExpirationOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestJournalRetentionKeepsLiveAndPendingCleanupHistory(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(&config.Config{EmergencyStateFile: filepath.Join(t.TempDir(), "events.db"), EmergencyJournalRetention: "24h"}, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.events.close() }()
+	now := time.Now()
+	svc.now = func() time.Time { return now }
+	older := now.Add(-48 * time.Hour)
+	writeEvent := func(id, kind string, state State, at time.Time) {
+		t.Helper()
+		if err := svc.events.append(ctx, Event{SessionID: id, Subject: "caller", Type: kind,
+			State: state, OccurredAt: at, ExpiresAt: older.Add(time.Minute), ApprovalDigest: "digest"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEvent("gone", "session.created", AwaitingPasskey, older)
+	writeEvent("gone", "session.revoked", Revoked, older)
+	writeEvent("live", "session.activated", Active, older)
+	writeEvent("queued", "session.invalidated", Invalidated, older)
+	if err := svc.cleanup.put(ctx, cleanupRecord{ID: "queued", Due: older}); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent("recent", "session.created", AwaitingPasskey, older)
+	writeEvent("recent", "session.expired", Expired, now.Add(-time.Hour))
+	if err := svc.PruneJournal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	page, err := svc.Events(ctx, "caller", svc.events.cursor(1), 0)
+	if err != nil || !page.HistoryTruncated || len(page.Events) != 4 ||
+		page.Events[0].SessionID != "live" || page.Events[1].SessionID != "queued" {
+		t.Fatalf("unexpected retained page: %+v, error=%v", page, err)
+	}
+	for _, table := range []string{"emergency_session_state", "emergency_approvals", "emergency_events"} {
+		var count int
+		if err := svc.events.db.QueryRow("SELECT COUNT(*) FROM " + table + " WHERE session_id='gone'").Scan(&count); err != nil || count != 0 {
+			t.Fatalf("gone still present in %s: %d, %v", table, count, err)
+		}
+	}
+	after, err := svc.Events(ctx, "caller", page.NextCursor, 0)
+	if err != nil || after.HistoryTruncated || len(after.Events) != 0 {
+		t.Fatalf("unexpected page after retained history: %+v, error=%v", after, err)
+	}
+	if err := svc.PruneJournal(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

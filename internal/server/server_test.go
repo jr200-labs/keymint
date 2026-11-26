@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -663,7 +664,7 @@ func TestReload_AtomicallySwapsConfig(t *testing.T) {
 	if _, ok := srv.currentConfig().Keys["new-key"]; !ok {
 		t.Errorf("new-key missing after reload")
 	}
-	if !srv.snapshot.Load().allowedSubject["system:serviceaccount:agents:agent-runner"]["new-key"] {
+	if _, ok := srv.snapshot.Load().allowedSubject["system:serviceaccount:agents:agent-runner"]["new-key"]; !ok {
 		t.Errorf("allowlist not rebuilt for new-key")
 	}
 }
@@ -994,5 +995,52 @@ func TestMintAcceptsEmptyUnknownLengthAndCapsScopeBody(t *testing.T) {
 	}
 	if mintCalls != 3 {
 		t.Fatalf("mint called %d times, want 3", mintCalls)
+	}
+}
+
+func TestMintEnforcesWorkloadScopeBeforeExchange(t *testing.T) {
+	cfg := &config.Config{
+		Keys: map[string]config.Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}},
+		Allowlist: []config.AllowEntry{{Subject: "caller", Keys: []string{"app"},
+			Repositories: []string{"example"}, Permissions: map[string]string{"contents": "write"}, RequireScope: true}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	srv, err := New(cfg, func(_ context.Context, _ config.Key, scope TokenScope) (string, time.Time, error) {
+		calls++
+		if !reflect.DeepEqual(scope.Repositories, []string{"example"}) || !reflect.DeepEqual(scope.Permissions, map[string]string{"contents": "read"}) {
+			t.Errorf("unexpected upstream scope: %+v", scope)
+		}
+		return "synthetic", time.Now().Add(time.Hour), nil
+	}, &fakeReviewer{subjectByToken: map[string]string{"valid": "caller"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	handler := srv.Routes()
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{"", http.StatusForbidden},
+		{`{"repositories":["example"]}`, http.StatusForbidden},
+		{`{"permissions":{"contents":"read"}}`, http.StatusForbidden},
+		{`{"repositories":["other"],"permissions":{"contents":"read"}}`, http.StatusForbidden},
+		{`{"repositories":["example"],"permissions":{"contents":"admin"}}`, http.StatusForbidden},
+		{`{"repositories":["example"],"permissions":{"contents":"read","issues":"read"}}`, http.StatusForbidden},
+		{`{"repositories":["example"],"permissions":{"contents":"read"}}`, http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/token/app", strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer valid")
+		got := httptest.NewRecorder()
+		handler.ServeHTTP(got, req)
+		if got.Code != tc.want {
+			t.Errorf("scope %q returned %d want %d", tc.body, got.Code, tc.want)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("upstream exchanges=%d want 1", calls)
 	}
 }

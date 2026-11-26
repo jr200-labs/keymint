@@ -13,17 +13,22 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/jr200-labs/keymint/internal/githubsecret"
+	"github.com/jr200-labs/keymint/internal/mint"
 	"gopkg.in/yaml.v3"
 )
 
@@ -76,7 +81,8 @@ type Config struct {
 	EmergencyProfiles map[string]EmergencyProfile `yaml:"emergency_profiles,omitempty"`
 	Passkeys          *PasskeyConfig              `yaml:"passkeys,omitempty"`
 	// EmergencyStateFile stores the durable, credential-free lifecycle journal.
-	EmergencyStateFile string `yaml:"emergency_state_file,omitempty"`
+	EmergencyStateFile        string `yaml:"emergency_state_file,omitempty"`
+	EmergencyJournalRetention string `yaml:"emergency_journal_retention,omitempty"`
 }
 
 // PasskeyConfig defines Keymint's WebAuthn relying party and persistent state.
@@ -90,9 +96,10 @@ type PasskeyConfig struct {
 
 // EmergencyProfile describes one credential source activated by a human.
 type EmergencyProfile struct {
-	Provider       string `yaml:"provider"`
-	Authentication string `yaml:"authentication,omitempty"`
-	MaxTTL         string `yaml:"max_ttl,omitempty"`
+	Provider           string   `yaml:"provider"`
+	Authentication     string   `yaml:"authentication,omitempty"`
+	MaxTTL             string   `yaml:"max_ttl,omitempty"`
+	PasskeyCredentials []string `yaml:"passkey_credentials,omitempty"`
 
 	// GitHub OAuth App device flow.
 	ClientID           string   `yaml:"client_id,omitempty"`
@@ -188,7 +195,10 @@ type AllowEntry struct {
 
 	// Keys is the set of Key names from the top-level Keys map that
 	// this Subject is allowed to mint for.
-	Keys []string `yaml:"keys"`
+	Keys         []string          `yaml:"keys"`
+	Repositories []string          `yaml:"repositories,omitempty"`
+	Permissions  map[string]string `yaml:"permissions,omitempty"`
+	RequireScope bool              `yaml:"require_scope,omitempty"`
 
 	// EmergencyProfiles are the human-authenticated profiles this workload may
 	// activate. Empty means routine installation tokens only.
@@ -197,6 +207,72 @@ type AllowEntry struct {
 	// ReleaseKeys are the destination-bound signing keys this workload may
 	// request after activating one of its EmergencyProfiles.
 	ReleaseKeys []string `yaml:"release_keys,omitempty"`
+}
+
+func (e AllowEntry) HasMintPolicy() bool {
+	return e.RequireScope || e.Repositories != nil || e.Permissions != nil
+}
+
+func (e AllowEntry) AllowsMintScope(scope mint.Scope) bool {
+	if e.RequireScope && (len(scope.Repositories) == 0 || len(scope.Permissions) == 0) {
+		return false
+	}
+	if e.Repositories != nil {
+		if len(scope.Repositories) == 0 {
+			return false
+		}
+		for _, repository := range scope.Repositories {
+			if !slices.ContainsFunc(e.Repositories, func(allowed string) bool { return strings.EqualFold(allowed, repository) }) {
+				return false
+			}
+		}
+	}
+	if e.Permissions != nil {
+		if len(scope.Permissions) == 0 {
+			return false
+		}
+		for permission, requested := range scope.Permissions {
+			ceiling := e.Permissions[permission]
+			if ceiling != requested && !(ceiling == "write" && requested == "read") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ValidateService checks startup invariants shared by serve and preflight.
+func (c *Config) ValidateService() error {
+	for name, key := range c.Keys {
+		if key.PrivateKeyFile == "" {
+			return fmt.Errorf("service key %q requires private_key_file", name)
+		}
+	}
+	if len(c.EmergencyProfiles) > 0 && c.EmergencyStateFile == "" {
+		return errors.New("emergency_state_file is required for recoverable credential revocation")
+	}
+	if len(c.ExpectedAudiences) == 0 || slices.ContainsFunc(c.ExpectedAudiences, func(a string) bool { return strings.TrimSpace(a) == "" }) {
+		return errors.New("expected_audiences must contain nonempty audiences")
+	}
+	return nil
+}
+
+func (c *Config) ValidateReloadFrom(current *Config) error {
+	if !reflect.DeepEqual(current.Passkeys, c.Passkeys) || current.EmergencyStateFile != c.EmergencyStateFile || !slices.Equal(current.ExpectedAudiences, c.ExpectedAudiences) {
+		return errors.New("passkeys, emergency_state_file and expected_audiences changes require restart")
+	}
+	return nil
+}
+
+func (c *Config) JournalRetention() (time.Duration, error) {
+	if c.EmergencyJournalRetention == "" {
+		return 0, nil
+	}
+	retention, err := time.ParseDuration(c.EmergencyJournalRetention)
+	if err != nil || retention < 24*time.Hour || c.EmergencyStateFile == "" {
+		return 0, errors.New("emergency_journal_retention requires emergency_state_file and a duration of at least 24h")
+	}
+	return retention, nil
 }
 
 // Load reads and parses a config file from disk. If path is empty,
@@ -211,14 +287,19 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	bytes, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(bytes, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("config: %s must contain a single YAML document", path)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -238,8 +319,13 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "keymint", "config.yaml"), nil
 }
 
+var passkeyID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // Validate checks that the config is internally consistent.
 func (c *Config) Validate() error {
+	if _, err := c.JournalRetention(); err != nil {
+		return err
+	}
 	if err := c.validateTelegramRelays(); err != nil {
 		return err
 	}
@@ -311,6 +397,8 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	type mintBinding struct{ subject, key string }
+	mintBindings := make(map[mintBinding]bool)
 	for i, e := range c.Allowlist {
 		if e.Subject == "" {
 			return fmt.Errorf("allowlist[%d]: subject is required", i)
@@ -318,7 +406,21 @@ func (c *Config) Validate() error {
 		if len(e.Keys) == 0 && len(e.EmergencyProfiles) == 0 && len(e.ReleaseKeys) == 0 {
 			return fmt.Errorf("allowlist[%d]: keys, emergency_profiles, or release_keys is required", i)
 		}
+		if e.HasMintPolicy() {
+			if len(e.Keys) == 0 || (e.Repositories != nil && len(e.Repositories) == 0) || (e.Permissions != nil && len(e.Permissions) == 0) {
+				return fmt.Errorf("allowlist[%d]: token ceilings require keys and nonempty configured scopes", i)
+			}
+			scope := mint.Scope{Repositories: slices.Clone(e.Repositories), Permissions: e.Permissions}
+			if err := scope.Validate(); err != nil {
+				return fmt.Errorf("allowlist[%d]: %w", i, err)
+			}
+		}
 		for _, ref := range e.Keys {
+			binding := mintBinding{e.Subject, ref}
+			if restricted, exists := mintBindings[binding]; exists && (restricted || e.HasMintPolicy()) {
+				return fmt.Errorf("allowlist[%d]: overlapping token policies for subject %q and key %q", i, e.Subject, ref)
+			}
+			mintBindings[binding] = e.HasMintPolicy()
 			if _, ok := c.Keys[ref]; !ok {
 				return fmt.Errorf("allowlist[%d]: unknown key %q (not in keys map)", i, ref)
 			}
@@ -340,6 +442,18 @@ func (c *Config) Validate() error {
 		}
 		if _, err := profile.TTL(); err != nil {
 			return fmt.Errorf("emergency profile %q: %w", name, err)
+		}
+		if profile.PasskeyCredentials != nil {
+			if profile.AuthenticationMethod() != "webauthn" || len(profile.PasskeyCredentials) == 0 {
+				return fmt.Errorf("emergency profile %q: passkey_credentials requires WebAuthn and at least one credential ID", name)
+			}
+			seen := map[string]bool{}
+			for _, id := range profile.PasskeyCredentials {
+				if !passkeyID.MatchString(id) || seen[id] {
+					return fmt.Errorf("emergency profile %q: invalid or duplicate passkey credential ID", name)
+				}
+				seen[id] = true
+			}
 		}
 		switch profile.AuthenticationMethod() {
 		case "github_device":
