@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.13.2](https://github.com/jr200-labs/keymint/compare/v1.13.1...v1.13.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* address emergency credential review findings ([#146](https://github.com/jr200-labs/keymint/issues/146)) ([e79d2d3](https://github.com/jr200-labs/keymint/commit/e79d2d32b56c0e88d05ae14bb868605671bbb0ce))
+* **deps:** update github-actions ([#145](https://github.com/jr200-labs/keymint/issues/145)) ([f26dd4d](https://github.com/jr200-labs/keymint/commit/f26dd4d58d188a3afce80ba2d21a97a7406ec2df))
+
 ## [1.13.1](https://github.com/jr200-labs/keymint/compare/v1.13.0...v1.13.1) (2026-11-26)
 
 
