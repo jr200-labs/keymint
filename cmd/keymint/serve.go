@@ -67,7 +67,7 @@ This mode is intended to run inside a Kubernetes cluster with the
 "tokenreviews.authentication.k8s.io: create" RBAC permission. App
 private keys are read from filesystem paths (mounted Secret), not from
 SOPS files.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			logging.Setup(logLevel, logHuman)
 			log := zap.L()
 
@@ -206,6 +206,8 @@ SOPS files.`,
 				zap.Int("allowlist_entries", len(cfg.Allowlist)),
 			)
 
+			stop, stopSignals := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stopSignals()
 			errCh := make(chan error, 2)
 			go func() {
 				if certFile != "" && keyFile != "" {
@@ -220,39 +222,7 @@ SOPS files.`,
 				errCh <- metricsServer.ListenAndServe()
 			}()
 
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-			select {
-			case err := <-errCh:
-				if err != nil && !errors.Is(err, http.ErrServerClosed) {
-					return err
-				}
-			case sig := <-sigCh:
-				log.Info("shutting down gracefully...", zap.String("signal", sig.String()))
-				ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-				defer cancel()
-
-				// Shut both servers down concurrently so the metrics
-				// listener doesn't lose its grace window when the API
-				// listener uses up the full deadline.
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
-					if err := httpServer.Shutdown(ctx); err != nil {
-						log.Error("api shutdown failed", zap.Error(err))
-					}
-				}()
-				go func() {
-					defer wg.Done()
-					if err := metricsServer.Shutdown(ctx); err != nil {
-						log.Error("metrics shutdown failed", zap.Error(err))
-					}
-				}()
-				wg.Wait()
-			}
-			return nil
+			return awaitHTTPShutdown(stop, errCh, shutdownTimeout, httpServer, metricsServer)
 		},
 	}
 
@@ -266,6 +236,36 @@ SOPS files.`,
 	cmd.Flags().StringVar(&certFile, "tls-cert", "", "path to TLS certificate file")
 	cmd.Flags().StringVar(&keyFile, "tls-key", "", "path to TLS private key file")
 	return cmd
+}
+
+// awaitHTTPShutdown owns both listeners even when only one manages to start.
+func awaitHTTPShutdown(stop context.Context, listenerErrors <-chan error, timeout time.Duration, api, metrics *http.Server) error {
+	var listenerErr error
+	select {
+	case listenerErr = <-listenerErrors:
+		if errors.Is(listenerErr, http.ErrServerClosed) {
+			listenerErr = nil
+		}
+	case <-stop.Done():
+		zap.L().Info("shutting down HTTP listeners")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	shutdownErrors := make(chan error, 2)
+	for _, listener := range []struct {
+		name   string
+		server *http.Server
+	}{{"api", api}, {"metrics", metrics}} {
+		go func() {
+			err := listener.server.Shutdown(ctx)
+			if err != nil {
+				err = fmt.Errorf("%s shutdown: %w", listener.name, errors.Join(err, listener.server.Close()))
+			}
+			shutdownErrors <- err
+		}()
+	}
+	return errors.Join(listenerErr, <-shutdownErrors, <-shutdownErrors)
 }
 
 // watchConfigFile runs an fsnotify loop on the parent directory of

@@ -252,37 +252,60 @@ func (store *cleanupStore) unseal(id string, sealed []byte) (cleanupRecord, erro
 	return record, err
 }
 
-func (service *Service) revokeTrackedCredential(ctx context.Context, credential revokedCredential) error {
+func (store *cleanupStore) get(ctx context.Context, id string) (cleanupRecord, error) {
 	var sealed []byte
-	err := service.cleanup.db.QueryRowContext(ctx, `SELECT sealed FROM emergency_cleanup WHERE session_id=?`, credential.id).Scan(&sealed)
+	if err := store.db.QueryRowContext(ctx, `SELECT sealed FROM emergency_cleanup WHERE session_id=?`, id).Scan(&sealed); err != nil {
+		return cleanupRecord{}, err
+	}
+	return store.unseal(id, sealed)
+}
+
+func (store *cleanupStore) reschedule(ctx context.Context, id string, due time.Time) error {
+	record, err := store.get(ctx, id)
+	if err != nil {
+		return err
+	}
+	record.Due = due
+	return store.put(ctx, record)
+}
+
+func (service *Service) revokeTrackedCredential(ctx context.Context, credential revokedCredential) error {
+	record, err := service.cleanup.get(ctx, credential.id)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// Some sessions revoke before issuing a tracked credential.
 	case err != nil:
 		return err
 	default:
-		record, err := service.cleanup.unseal(credential.id, sealed)
-		if err != nil {
-			return err
-		}
 		credential = revokedCredential{id: record.ID, profile: record.Profile, token: record.Token, secret: record.Secret}
 	}
 	return service.revokeCredential(ctx, credential)
 }
 
 func (service *Service) rememberCredential(ctx context.Context, id string, profile config.EmergencyProfile, token, secret string, due time.Time) error {
-	// Materialize file-backed OAuth identity before persisting cleanup, so a
-	// subsequent configuration or Secret rotation cannot retarget revocation.
+	// Updates to an existing OAuth token keep the original cleanup credentials.
+	// In particular, adding a Kubernetes Secret must survive OAuth file rotation.
 	if token != "" {
-		clientID, clientSecret, ids, err := githubIdentity(profile)
-		if err != nil {
+		record, err := service.cleanup.get(ctx, id)
+		switch {
+		case err == nil && record.Token == token:
+			profile = record.Profile
+		case err == nil:
+			return errors.New("a different credential is already tracked for this session")
+		case !errors.Is(err, sql.ErrNoRows):
 			return err
+		default:
+			clientID, clientSecret, ids, err := githubIdentity(profile)
+			if err != nil {
+				return err
+			}
+			profile.ClientID, profile.ClientSecret, profile.AllowedUserIDs = clientID, clientSecret, ids
+			profile.ClientIDFile, profile.ClientSecretFile, profile.AllowedUserIDsFile = "", "", ""
 		}
-		profile.ClientID, profile.ClientSecret, profile.AllowedUserIDs = clientID, clientSecret, ids
-		profile.ClientIDFile, profile.ClientSecretFile, profile.AllowedUserIDsFile = "", "", ""
 	}
 	return service.cleanup.put(ctx, cleanupRecord{ID: id, Profile: profile, Token: token, Secret: secret, Due: due})
 }
+
 func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 	return service.drainCleanupExcept(ctx, all, nil)
 }
@@ -303,13 +326,18 @@ func (service *Service) drainCleanupExcept(ctx context.Context, all bool, attemp
 		busy := live && session.operation != idle
 		pending := live && session.State == RevocationPending
 		authorized := live && !terminal(session.State) && !pending
+		due := record.Due
+		if live && session.State == Active {
+			// The snapshot may predate a just-completed activation.
+			due = session.ExpiresAt
+		}
 		service.mu.Unlock()
 		// The live revocation path owns pending sessions so it can publish
 		// the terminal event after cleanup succeeds.
 		if busy || attempted[record.ID] || (!all && pending) {
 			continue
 		}
-		if !all && authorized && record.Due.After(service.now()) {
+		if !all && authorized && due.After(service.now()) {
 			continue
 		}
 		if err := service.revokeCredential(ctx, revokedCredential{id: record.ID, profile: record.Profile, token: record.Token, secret: record.Secret}); err != nil {

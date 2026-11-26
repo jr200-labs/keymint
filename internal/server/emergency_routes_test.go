@@ -76,7 +76,7 @@ func TestEmergencyRevokeRetriesBeforePublishingTerminalEvent(t *testing.T) {
 				status = http.StatusServiceUnavailable
 			}
 		case r.URL.Path == "/login/device/code":
-			body = `{"device_code":"code","user_code":"user","interval":5}`
+			body = `{"device_code":"code","user_code":"user","verification_uri":"https://github.com/login/device","interval":5}`
 		case r.URL.Path == "/login/oauth/access_token":
 			body = `{"access_token":"synthetic"}`
 		case r.URL.Path == "/user":

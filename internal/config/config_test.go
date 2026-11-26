@@ -311,3 +311,32 @@ func TestMintPolicyRejectsOverlappingBindings(t *testing.T) {
 		t.Fatal("empty repository ceiling accepted")
 	}
 }
+
+func TestTelegramRelayOriginsValidateAndRejectCanonicalDuplicates(t *testing.T) {
+	cfg := &Config{
+		ExpectedAudiences:  []string{"keymint"},
+		EmergencyStateFile: "/unused",
+		Passkeys:           &PasskeyConfig{},
+		EmergencyProfiles:  map[string]EmergencyProfile{"approval": {Provider: "approval", Authentication: "webauthn"}},
+		Allowlist:          []AllowEntry{{Subject: "operator", EmergencyProfiles: []string{"approval"}}},
+		TelegramRelays:     map[string]TelegramRelay{},
+	}
+	createRelay := func(subject, origin string) TelegramRelay {
+		return TelegramRelay{OwnerID: 42, OperatorSubject: "operator", ApprovalProfile: "approval",
+			RelaySubject: subject, URL: origin, ControlKeyFile: "/control", WrappingKeyFile: "/wrapping"}
+	}
+	cfg.TelegramRelays["first"] = createRelay("one", "https://Relay.Example")
+	for _, tc := range []struct {
+		origin, want string
+	}{
+		{"https://relay.example:443", "own origin"},
+		{"https://relay.example#", "plain HTTPS origin"},
+		{"https://relay.example:8443", ""},
+	} {
+		cfg.TelegramRelays["second"] = createRelay("two", tc.origin)
+		err := cfg.validateTelegramRelays()
+		if (tc.want == "" && err != nil) || (tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want))) {
+			t.Errorf("origin %q returned %v, want %q", tc.origin, err, tc.want)
+		}
+	}
+}

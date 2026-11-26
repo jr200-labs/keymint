@@ -171,8 +171,12 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer, instrument
 		_ = events.close()
 		return nil, err
 	}
+	now := service.now()
 	for _, record := range restored {
-		record.Due = service.now()
+		if !record.Due.After(now) {
+			continue
+		}
+		record.Due = now
 		if err = cleanup.put(context.Background(), record); err != nil {
 			_ = events.close()
 			return nil, err
@@ -645,7 +649,10 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	profile := session.profile
 	if copy.State == Expired {
 		service.mu.Unlock()
-		err = service.revokeCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
+		if copy.accessToken == "" && copy.boundSecret == "" {
+			return publicSession(&copy), nil
+		}
+		err = service.revokeTrackedCredential(ctx, revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
 		if err == nil {
 			service.mu.Lock()
 			session.accessToken, session.boundSecret = "", ""
@@ -664,28 +671,35 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	service.mu.Lock()
 	current := service.sessions[id]
 	valid := current == session && current.State == AwaitingGitHub && current.ExpiresAt.After(service.now())
+	if err == nil && !valid {
+		err = errors.New("session changed during authentication")
+	}
+	if err == nil && copy.State == Active {
+		err = service.transitionLocked(ctx, current, Active, eventFor(Active))
+		if err == nil {
+			err = service.cleanup.reschedule(ctx, id, copy.ExpiresAt)
+		}
+	}
 	if err != nil {
-		if valid && errors.Is(err, errScopeMismatch) {
-			journalErr := service.transitionLocked(ctx, current, Invalidated, eventFor(Invalidated))
-			if journalErr == nil {
-				delete(service.sessions, id)
-			}
+		cleanupCtx := context.WithoutCancel(ctx)
+		remove := false
+		if valid && copy.deviceCode == "" {
+			// The device exchange consumed the code. Fail closed if validation,
+			// activation, or cleanup scheduling failed.
+			journalErr := service.transitionLocked(cleanupCtx, current, Invalidated, eventFor(Invalidated))
+			remove = journalErr == nil
 			err = errors.Join(err, journalErr)
 		}
 		service.mu.Unlock()
-		return Session{}, err
-	}
-	if !valid {
-		service.mu.Unlock()
-		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken, secret: copy.boundSecret})
-		return Session{}, errors.Join(errors.New("session changed during authentication"), cleanupErr)
-	}
-	if copy.State == Active {
-		if err = service.transitionLocked(ctx, current, Active, eventFor(Active)); err != nil {
-			service.mu.Unlock()
-			_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: copy.accessToken})
-			return Session{}, err
+		if copy.accessToken != "" {
+			err = errors.Join(err, service.revokeTrackedCredential(cleanupCtx, revokedCredential{id: id, profile: profile, token: copy.accessToken}))
 		}
+		if remove {
+			service.mu.Lock()
+			delete(service.sessions, id)
+			service.mu.Unlock()
+		}
+		return Session{}, err
 	}
 	*current = copy
 	service.mu.Unlock()
@@ -781,8 +795,14 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 	token, secret, expiresAt, err := service.issuer.Issue(ctx, profile.Namespace, profile.ServiceAccount, ttl, boundSecret)
 	service.mu.Lock()
 	if service.sessions[id] != session || session.State != Active || !session.ExpiresAt.After(service.now()) || service.closed {
+		credential := revokedCredential{id: id, profile: profile, token: session.accessToken, secret: boundSecret}
 		service.mu.Unlock()
-		cleanupErr := service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{id: id, profile: profile, token: session.accessToken, secret: boundSecret})
+		cleanupErr := service.revokeTrackedCredential(context.WithoutCancel(ctx), credential)
+		if cleanupErr == nil {
+			service.mu.Lock()
+			session.accessToken, session.boundSecret = "", ""
+			service.mu.Unlock()
+		}
 		return Credential{}, errors.Join(errors.New("session changed during credential issuance"), cleanupErr)
 	}
 	if err != nil {
@@ -910,6 +930,7 @@ func (service *Service) ownedSession(subject, id string) (*Session, error) {
 }
 
 type deviceResponse struct {
+	Error           string `json:"error"`
 	DeviceCode      string `json:"device_code"`
 	UserCode        string `json:"user_code"`
 	VerificationURI string `json:"verification_uri"`
@@ -935,11 +956,23 @@ func (service *Service) startGitHubDevice(ctx context.Context, profile config.Em
 	if err := service.doJSON(request, &response); err != nil {
 		return device{}, fmt.Errorf("start GitHub device flow: %w", err)
 	}
+	switch response.Error {
+	case "":
+	case "unauthorized_client", "incorrect_client_credentials", "device_flow_disabled":
+		return device{}, fmt.Errorf("GitHub device flow: %s", response.Error)
+	default:
+		return device{}, errors.New("GitHub rejected the device flow request")
+	}
+	uri, err := url.Parse(response.VerificationURI)
+	if strings.TrimSpace(response.DeviceCode) == "" || strings.TrimSpace(response.UserCode) == "" ||
+		err != nil || uri.Scheme != "https" || uri.Hostname() == "" || uri.User != nil {
+		return device{}, errors.New("GitHub returned an invalid device flow response")
+	}
 	return device{response.DeviceCode, response.UserCode, response.VerificationURI, time.Duration(max(response.Interval, 5)) * time.Second}, nil
 }
 
 func (service *Service) pollGitHub(ctx context.Context, session *Session, profile config.EmergencyProfile) error {
-	clientID, _, allowedUserIDs, err := githubIdentity(profile)
+	clientID, clientSecret, allowedUserIDs, err := githubIdentity(profile)
 	if err != nil {
 		return err
 	}
@@ -965,33 +998,32 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		session.nextPoll = service.now().Add(session.pollEvery)
 		return nil
 	}
-	// Stage cleanup immediately after exchange, before identity/scope validation.
+	session.deviceCode = ""
+	// Stage cleanup with the identity read before the exchange. The record
+	// stays immediately due until Get publishes activation.
+	profile.ClientID, profile.ClientSecret, profile.AllowedUserIDs = clientID, clientSecret, allowedUserIDs
+	profile.ClientIDFile, profile.ClientSecretFile, profile.AllowedUserIDsFile = "", "", ""
 	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", service.now()); err != nil {
 		_ = service.revokeCredential(context.WithoutCancel(ctx), revokedCredential{profile: profile, token: token.AccessToken})
 		return fmt.Errorf("persist credential cleanup: %w", err)
 	}
+	session.accessToken = token.AccessToken
 	if len(session.Scopes) > 0 {
 		granted := strings.FieldsFunc(token.Scope, func(r rune) bool { return r == ',' || r == ' ' })
 		slices.Sort(granted)
 		granted = slices.Compact(granted)
 		if !slices.Equal(granted, session.Scopes) {
-			_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 			return errScopeMismatch
 		}
 	}
 	userID, err := service.githubUserID(ctx, profile, token.AccessToken)
 	if err != nil {
-		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return err
 	}
 	if !containsID(allowedUserIDs, userID) {
-		_ = service.revokeCredential(ctx, revokedCredential{id: session.ID, profile: profile, token: token.AccessToken})
 		return errors.New("authenticated GitHub user is not allowed for this profile")
 	}
-	if err := service.rememberCredential(ctx, session.ID, profile, token.AccessToken, "", session.ExpiresAt); err != nil {
-		return err
-	}
-	session.accessToken, session.State = token.AccessToken, Active
+	session.State = Active
 	return nil
 }
 
@@ -1077,7 +1109,7 @@ func (service *Service) revokeCredential(ctx context.Context, credential revoked
 				result = errors.Join(result, err)
 			} else {
 				defer func() { _ = response.Body.Close() }()
-				if response.StatusCode < 200 || response.StatusCode >= 300 {
+				if response.StatusCode != http.StatusNotFound && (response.StatusCode < 200 || response.StatusCode >= 300) {
 					result = errors.Join(result, fmt.Errorf("revoke GitHub token: HTTP %d", response.StatusCode))
 				}
 			}

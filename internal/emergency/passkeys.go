@@ -162,11 +162,13 @@ func (manager *passkeys) finishLogin(session webauthn.SessionData, request *http
 	if err != nil {
 		return err
 	}
-	if credential.Authenticator.CloneWarning {
-		return errors.New("passkey signature counter did not advance or the credential was previously flagged")
-	}
 	for index := range manager.user.Credentials {
 		if string(manager.user.Credentials[index].ID) == string(credential.ID) {
+			if credential.Authenticator.CloneWarning {
+				// Keep the credential blocked in memory even if storage is unavailable.
+				manager.user.Credentials[index].Authenticator.CloneWarning = true
+				return errors.Join(errors.New("passkey signature counter did not advance"), manager.persist())
+			}
 			previous := manager.user.Credentials[index]
 			manager.user.Credentials[index] = *credential
 			if err := manager.persist(); err != nil {
