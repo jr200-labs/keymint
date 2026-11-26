@@ -282,7 +282,7 @@ func New(cfg *config.Config, mint MintFunc, reviewer TokenReviewer, m *metrics.M
 		mint:                mint,
 		auth:                newAuthenticator(reviewer, m),
 		metrics:             m,
-		telegramRelayClient: defaultTelegramRelayClient,
+		telegramRelayClient: tracing.HTTPClient(defaultTelegramRelayClient),
 		janitorStop:         make(chan struct{}),
 	}
 	s.snapshot.Store(buildSnapshot(cfg))

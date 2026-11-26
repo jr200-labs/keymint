@@ -16,7 +16,11 @@ import (
 
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
+	"github.com/jr200-labs/keymint/internal/logging"
 	"github.com/skip2/go-qrcode"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 )
 
 type telegramAction struct {
@@ -40,6 +44,76 @@ var defaultTelegramRelayClient = &http.Client{
 	},
 }
 
+type telegramObservation struct {
+	action, outcome, enrollmentID, state string
+}
+
+func (s *Server) observeTelegram(r *http.Request, observation *telegramObservation, started time.Time) {
+	duration := time.Since(started)
+	action, outcome := observation.action, observation.outcome
+	if s.metrics != nil {
+		s.metrics.TelegramRequests.WithLabelValues(action, outcome).Inc()
+		s.metrics.TelegramDuration.WithLabelValues(action).Observe(duration.Seconds())
+	}
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(attribute.String("keymint.telegram.action", action), attribute.String("keymint.telegram.outcome", outcome))
+	if observation.state != "" {
+		span.SetAttributes(attribute.String("keymint.telegram.state", observation.state))
+	}
+
+	logger := logging.FromContext(r.Context())
+	fields := []zap.Field{zap.String("action", action), zap.String("outcome", outcome), zap.Duration("duration", duration)}
+	if observation.enrollmentID != "" {
+		fields = append(fields, zap.String("enrollment_id", observation.enrollmentID))
+	}
+	if observation.state != "" {
+		fields = append(fields, zap.String("state", observation.state))
+	}
+	switch outcome {
+	case "control_key_unavailable", "wrapping_key_unavailable", "relay_url_invalid", "relay_timeout",
+		"relay_unreachable", "relay_http_error", "relay_invalid_response", "qr_invalid_token", "qr_render_error", "internal_error":
+		logger.Warn("Telegram request failed", fields...)
+	case "success":
+		switch action {
+		case "approval", "start", "password", "commit", "cancel", "wrapping_key":
+			logger.Info("Telegram request completed", fields...)
+		case "status":
+			switch observation.state {
+			case "enrolled", "expired", "failed", "canceled", "cancelled":
+				logger.Info("Telegram enrollment state observed", fields...)
+			}
+		}
+	default:
+		logger.Debug("Telegram request rejected", fields...)
+	}
+}
+
+func telegramEnrollmentAction(method, action string) string {
+	switch method {
+	case http.MethodGet:
+		switch action {
+		case "status", "qr":
+			return action
+		}
+	case http.MethodPost:
+		switch action {
+		case "start", "commit", "cancel", "password":
+			return action
+		}
+	}
+	return "unknown"
+}
+
+func telegramObservedState(state string) string {
+	switch state {
+	case "starting", "qr", "password_required", "verifying", "verified", "committing",
+		"enrolled", "expired", "failed", "canceled", "cancelled":
+		return state
+	default:
+		return "unknown"
+	}
+}
+
 func telegramApproval(name string, relay config.TelegramRelay) (string, string) {
 	label := fmt.Sprintf("Enroll Telegram account %d for relay %s", relay.OwnerID, name)
 	digest := sha256.Sum256(fmt.Appendf(nil, "keymint.telegram-enrollment.v1\x00%s\x00%d\x00%s\x00%s", name, relay.OwnerID, relay.URL, relay.RelaySubject))
@@ -47,17 +121,22 @@ func telegramApproval(name string, relay config.TelegramRelay) (string, string) 
 }
 
 func (s *Server) handleTelegramApproval(w http.ResponseWriter, r *http.Request) {
+	observation := telegramObservation{action: "approval", outcome: "internal_error"}
+	defer s.observeTelegram(r, &observation, time.Now())
 	w.Header().Set("Cache-Control", "no-store")
 	relay, ok := s.telegramOperator(w, r)
 	if !ok {
+		observation.outcome = "access_denied"
 		return
 	}
 	digest, label := telegramApproval(r.PathValue("relay"), relay.config)
 	session, err := s.emergency.CreateApproval(r.Context(), relay.subject, relay.config.ApprovalProfile, config.MinApprovalTTL, digest, label)
 	if err != nil {
+		observation.outcome = "approval_unavailable"
 		writeJSONError(w, http.StatusForbidden, "Telegram enrollment approval is unavailable")
 		return
 	}
+	observation.outcome, observation.enrollmentID, observation.state = "success", session.ID, string(emergency.AwaitingPasskey)
 	writeJSON(w, session)
 }
 
@@ -80,107 +159,124 @@ func (s *Server) telegramOperator(w http.ResponseWriter, r *http.Request) (teleg
 }
 
 func (s *Server) handleTelegramEnrollment(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("relay"), r.PathValue("id")
+	action := telegramEnrollmentAction(r.Method, r.PathValue("action"))
+	observation := telegramObservation{action: action, outcome: "internal_error"}
+	defer s.observeTelegram(r, &observation, time.Now())
 	w.Header().Set("Cache-Control", "no-store")
 	operator, ok := s.telegramOperator(w, r)
 	if !ok {
+		observation.outcome = "access_denied"
 		return
 	}
-	name, id, action := r.PathValue("relay"), r.PathValue("id"), r.PathValue("action")
+	if action == "unknown" {
+		observation.outcome = "unknown_action"
+		http.NotFound(w, r)
+		return
+	}
 	digest, label := telegramApproval(name, operator.config)
 	relayAction := telegramAction{Action: action, ID: id, OwnerID: operator.config.OwnerID}
-	if r.Method == http.MethodGet {
-		if action != "status" && action != "qr" {
-			http.NotFound(w, r)
-			return
-		}
+	switch action {
+	case "qr":
 		relayAction.Action = "status"
-	} else {
-		switch action {
-		case "start", "commit", "cancel":
-		case "password":
-			var input struct {
-				Password string `json:"password"`
-			}
-			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-			decoder.DisallowUnknownFields()
-			if decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF || input.Password == "" || len(input.Password) > 1024 {
-				writeJSONError(w, http.StatusBadRequest, "Telegram password is required")
-				return
-			}
-			relayAction.Password = input.Password
-		default:
-			http.NotFound(w, r)
+	case "password":
+		var input struct {
+			Password string `json:"password"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF || input.Password == "" || len(input.Password) > 1024 {
+			observation.outcome = "invalid_password_request"
+			writeJSONError(w, http.StatusBadRequest, "Telegram password is required")
 			return
 		}
+		relayAction.Password = input.Password
 	}
 	session, err := s.emergency.Get(r.Context(), operator.subject, id)
 	if err != nil || session.State != emergency.Active || session.Profile != operator.config.ApprovalProfile ||
 		session.ApprovalDigest != digest || session.ApprovalLabel != label ||
 		!session.ExpiresAt.After(time.Now()) || s.currentConfig().TelegramRelays[name] != operator.config {
+		observation.outcome = "approval_required"
 		writeJSONError(w, http.StatusForbidden, "active passkey approval for this Telegram relay is required")
 		return
 	}
+	observation.enrollmentID = session.ID
 	relayAction.ExpiresAt = session.ExpiresAt
 	if !session.ApprovalUsed {
 		if action != "start" || s.emergency.RedeemApproval(r.Context(), operator.subject, id, digest) != nil {
+			observation.outcome = "approval_not_redeemed"
 			writeJSONError(w, http.StatusConflict, "start the approved Telegram enrollment first")
 			return
 		}
 	}
-	status, code, err := s.callTelegramRelay(r, operator.config, relayAction)
-	if err != nil {
-		writeJSONError(w, code, err.Error())
+	status, failure := s.callTelegramRelay(r, operator.config, relayAction)
+	if failure != nil {
+		observation.outcome = failure.outcome
+		writeJSONError(w, failure.status, failure.message)
 		return
 	}
+	observation.state = telegramObservedState(status.State)
 	if action == "qr" {
-		writeTelegramQR(w, status, r.Header.Get("Accept") == "text/plain")
+		observation.outcome = writeTelegramQR(w, status, r.Header.Get("Accept") == "text/plain")
 		return
 	}
+	observation.outcome = "success"
 	status.LoginURL = ""
 	writeJSON(w, status)
 }
 
-func (s *Server) callTelegramRelay(r *http.Request, relay config.TelegramRelay, action telegramAction) (telegramStatus, int, error) {
+type telegramRelayFailure struct {
+	status  int
+	outcome string
+	message string
+}
+
+func (s *Server) callTelegramRelay(r *http.Request, relay config.TelegramRelay, action telegramAction) (telegramStatus, *telegramRelayFailure) {
 	var status telegramStatus
 	key, err := readTelegramKey(relay.ControlKeyFile)
 	if err != nil {
-		return status, http.StatusServiceUnavailable, errors.New("Telegram relay control key is unavailable")
+		return status, &telegramRelayFailure{http.StatusServiceUnavailable, "control_key_unavailable", "Telegram relay control key is unavailable"}
 	}
 	defer clear(key)
 	body, err := json.Marshal(action)
 	if err != nil {
-		return status, http.StatusBadRequest, errors.New("invalid Telegram enrollment request")
+		return status, &telegramRelayFailure{http.StatusBadRequest, "internal_error", "invalid Telegram enrollment request"}
 	}
 	defer clear(body)
 	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, relay.URL+"/v1/enrollment", bytes.NewReader(body))
 	if err != nil {
-		return status, http.StatusServiceUnavailable, errors.New("Telegram relay URL is invalid")
+		return status, &telegramRelayFailure{http.StatusServiceUnavailable, "relay_url_invalid", "Telegram relay URL is invalid"}
 	}
 	request.Header.Set("Authorization", "Bearer "+base64.StdEncoding.EncodeToString(key))
 	request.Header.Set("Content-Type", "application/json")
 	response, err := s.telegramRelayClient.Do(request)
 	if err != nil {
-		return status, http.StatusBadGateway, errors.New("Telegram relay is unreachable")
+		outcome := "relay_unreachable"
+		if timeout, ok := err.(*url.Error); ok && timeout.Timeout() {
+			outcome = "relay_timeout"
+		}
+		return status, &telegramRelayFailure{http.StatusBadGateway, outcome, "Telegram relay is unreachable"}
 	}
 	defer func() { _ = response.Body.Close() }()
 	switch response.StatusCode {
 	case http.StatusOK:
 		if json.NewDecoder(io.LimitReader(response.Body, 8192)).Decode(&status) == nil && status.State != "" {
-			return status, http.StatusOK, nil
+			return status, nil
 		}
+		return status, &telegramRelayFailure{http.StatusBadGateway, "relay_invalid_response", "Telegram relay could not process enrollment"}
 	case http.StatusConflict:
-		return status, http.StatusConflict, errors.New("Telegram relay rejected this enrollment state")
+		return status, &telegramRelayFailure{http.StatusConflict, "relay_conflict", "Telegram relay rejected this enrollment state"}
 	}
-	return status, http.StatusBadGateway, errors.New("Telegram relay could not process enrollment")
+	return status, &telegramRelayFailure{http.StatusBadGateway, "relay_http_error", "Telegram relay could not process enrollment"}
 }
 
-func writeTelegramQR(w http.ResponseWriter, status telegramStatus, terminal bool) {
+func writeTelegramQR(w http.ResponseWriter, status telegramStatus, terminal bool) string {
 	login, err := url.Parse(status.LoginURL)
 	if err != nil || status.State != "qr" || !status.ExpiresAt.After(time.Now()) ||
 		login.Scheme != "tg" || login.Host != "login" || login.Path != "" || login.User != nil || login.Fragment != "" ||
 		len(login.Query()) != 1 || len(login.Query()["token"]) != 1 {
 		writeJSONError(w, http.StatusConflict, "Telegram QR is not ready")
-		return
+		return "qr_not_ready"
 	}
 	encodedToken := login.Query().Get("token")
 	token, err := base64.RawURLEncoding.DecodeString(encodedToken)
@@ -190,53 +286,61 @@ func writeTelegramQR(w http.ResponseWriter, status telegramStatus, terminal bool
 	}
 	if err != nil || len(token) == 0 {
 		writeJSONError(w, http.StatusBadGateway, "Telegram relay returned an invalid QR token")
-		return
+		return "qr_invalid_token"
 	}
 	qr, err := qrcode.New(login.String(), qrcode.Medium)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "Telegram QR could not be rendered")
-		return
+		return "qr_render_error"
 	}
 	if terminal {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, qr.ToSmallString(true))
-		return
+		return "success"
 	}
 	png, err := qr.PNG(320)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "Telegram QR could not be rendered")
-		return
+		return "qr_render_error"
 	}
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Length", strconv.Itoa(len(png)))
 	_, _ = w.Write(png)
+	return "success"
 }
 
 func (s *Server) handleTelegramWrappingKey(w http.ResponseWriter, r *http.Request) {
+	observation := telegramObservation{action: "wrapping_key", outcome: "internal_error"}
+	defer s.observeTelegram(r, &observation, time.Now())
 	w.Header().Set("Cache-Control", "no-store")
 	snapshot := s.snapshot.Load()
 	subject, failure := s.auth.authenticate(r.Context(), r, snapshot.trustedProxies)
 	if failure != nil {
+		observation.outcome = "access_denied"
 		writeJSONError(w, failure.status, failure.message)
 		return
 	}
 	relay, ok := snapshot.cfg.TelegramRelays[r.PathValue("relay")]
 	if !ok || subject != relay.RelaySubject {
+		observation.outcome = "access_denied"
 		writeJSONError(w, http.StatusForbidden, "Telegram wrapping key is unavailable")
 		return
 	}
 	key, err := readTelegramKey(relay.WrappingKeyFile)
 	if err != nil {
+		observation.outcome = "wrapping_key_unavailable"
 		writeJSONError(w, http.StatusServiceUnavailable, "Telegram wrapping key is unavailable")
 		return
 	}
 	defer clear(key)
 	if s.snapshot.Load() != snapshot {
+		observation.outcome = "policy_changed"
 		writeJSONError(w, http.StatusConflict, "Telegram relay policy changed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(key)))
+	observation.outcome = "success"
 	_, _ = w.Write(key)
 }
 

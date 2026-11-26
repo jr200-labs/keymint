@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,14 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/emergency"
+	"github.com/jr200-labs/keymint/internal/tracing"
+	dto "github.com/prometheus/client_model/go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestTelegramWrappingKeyRestrictedToRelayIdentity(t *testing.T) {
@@ -48,6 +57,20 @@ func TestTelegramWrappingKeyRestrictedToRelayIdentity(t *testing.T) {
 }
 
 func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing.T) {
+	logCore, observed := observer.New(zap.DebugLevel)
+	t.Cleanup(zap.ReplaceGlobals(zap.New(logCore)))
+	provider := sdktrace.NewTracerProvider()
+	previousTracer := tracer
+	tracer = provider.Tracer("telegram-test")
+	t.Cleanup(func() { tracer = previousTracer })
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+	m := testMetrics(t)
+	const traceID = "11111111111111111111111111111111"
+	const password = "test-password-that-must-not-appear"
+	const untrustedState = "upstream-state-that-must-not-appear"
+	const unknownAction = "unknown-action-that-must-not-appear"
 	dir := t.TempDir()
 	control := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x41}, 32))
 	controlFile := filepath.Join(dir, "control")
@@ -57,6 +80,10 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 	var received []telegramAction
 	var receivedMu sync.Mutex
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		if trace.SpanContextFromContext(ctx).TraceID().String() != traceID {
+			t.Error("relay request missing trace correlation")
+		}
 		var input telegramAction
 		if r.URL.Path != "/v1/enrollment" || r.Header.Get("Authorization") != "Bearer "+control ||
 			json.NewDecoder(r.Body).Decode(&input) != nil {
@@ -66,6 +93,20 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 		receivedMu.Lock()
 		received = append(received, input)
 		receivedMu.Unlock()
+		switch input.Action {
+		case "commit":
+			writeJSON(w, telegramStatus{State: "enrolled"})
+			return
+		case "password":
+			if input.Password != password {
+				t.Error("unexpected password forwarded to relay")
+			}
+			writeJSON(w, telegramStatus{State: untrustedState})
+			return
+		case "cancel":
+			_, _ = w.Write([]byte(untrustedState))
+			return
+		}
 		// Telegram client libraries can return a padded base64url login token.
 		loginURL := "tg://login?token=" + base64.URLEncoding.EncodeToString([]byte{0xfb, 0xff})
 		writeJSON(w, telegramStatus{State: "qr", LoginURL: loginURL, ExpiresAt: time.Now().Add(time.Minute)})
@@ -93,11 +134,17 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 	srv := newTelegramTestServer(t, cfg, reviewer, service)
 	client := *defaultTelegramRelayClient
 	client.Transport = upstream.Client().Transport
-	srv.telegramRelayClient = &client
+	srv.telegramRelayClient = tracing.HTTPClient(&client)
+	srv.metrics = m
 	handler := srv.Routes()
 	request := func(method, path, role string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, nil)
+		body := strings.NewReader("")
+		if strings.HasSuffix(path, "/password") {
+			body = strings.NewReader(`{"password":"` + password + `"}`)
+		}
+		req := httptest.NewRequest(method, path, body)
 		req.Header.Set("Authorization", "Bearer "+role)
+		req.Header.Set("Traceparent", "00-"+traceID+"-2222222222222222-01")
 		resp := httptest.NewRecorder()
 		handler.ServeHTTP(resp, req)
 		return resp
@@ -141,6 +188,15 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 	if response := request(http.MethodPost, path+"/commit", "operator"); response.Code != http.StatusOK {
 		t.Fatalf("approved commit returned %d", response.Code)
 	}
+	if response := request(http.MethodPost, path+"/password", "operator"); response.Code != http.StatusOK {
+		t.Fatalf("approved password submission returned %d", response.Code)
+	}
+	if response := request(http.MethodPost, path+"/cancel", "operator"); response.Code != http.StatusBadGateway {
+		t.Fatalf("malformed relay response returned %d", response.Code)
+	}
+	if response := request(http.MethodPost, path+"/"+unknownAction, "operator"); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown action returned %d", response.Code)
+	}
 	if err := service.Revoke(context.Background(), "operator", solution.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +205,40 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 	}
 	receivedMu.Lock()
 	defer receivedMu.Unlock()
-	if len(received) != 3 || received[0].Action != "start" || received[1].Action != "status" ||
+	if len(received) != 5 || received[0].Action != "start" || received[1].Action != "status" ||
 		received[2].Action != "commit" || received[2].ID != solution.ID || received[2].OwnerID != 42 {
 		t.Fatal("relay received incorrect enrollment actions")
 	}
+	for _, labels := range [][2]string{
+		{"approval", "success"}, {"approval", "access_denied"}, {"start", "success"},
+		{"qr", "success"}, {"commit", "success"}, {"password", "success"}, {"cancel", "relay_invalid_response"},
+		{"unknown", "unknown_action"},
+	} {
+		if got := counterValue(m.TelegramRequests.WithLabelValues(labels[:]...)); got != 1 {
+			t.Errorf("count for %v = %v", labels, got)
+		}
+	}
+	histogram, err := m.TelegramDuration.GetMetricWithLabelValues("commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	duration := &dto.Metric{}
+	if err := histogram.(interface{ Write(*dto.Metric) error }).Write(duration); err != nil || duration.GetHistogram().GetSampleCount() != 4 {
+		t.Fatalf("commit latency observations = %d, %v", duration.GetHistogram().GetSampleCount(), err)
+	}
+	milestones := observed.FilterField(zap.String("enrollment_id", solution.ID))
+	if milestones.FilterField(zap.String("action", "approval")).Len() != 1 ||
+		milestones.FilterField(zap.String("action", "commit")).FilterField(zap.String("state", "enrolled")).Len() != 1 ||
+		milestones.FilterField(zap.String("outcome", "relay_invalid_response")).Len() != 1 {
+		t.Error("missing correlated milestones or relay failure")
+	}
+	logs := fmt.Sprint(observed.All())
+	for _, sensitive := range []string{control, password, "tg://", untrustedState, unknownAction, solution.VerificationURI} {
+		if strings.Contains(logs, sensitive) {
+			t.Error("Telegram telemetry included sensitive or unbounded request data")
+		}
+	}
+
 }
 
 func seedTelegramPasskey(t *testing.T, path string) *ecdsa.PrivateKey {

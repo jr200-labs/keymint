@@ -56,6 +56,8 @@ type Metrics struct {
 	HTTPRequests               *prometheus.CounterVec
 	HTTPDuration               *prometheus.HistogramVec
 	HTTPInFlight               prometheus.Gauge
+	TelegramRequests           *prometheus.CounterVec
+	TelegramDuration           *prometheus.HistogramVec
 	// MintRequestsTotal counts inbound mint requests by outcome and key.
 	MintRequestsTotal *prometheus.CounterVec
 
@@ -108,6 +110,8 @@ func New() *Metrics {
 		HTTPRequests:               prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Name: "http_requests_total", Help: "All HTTP routes by bounded route, method and status."}, []string{"route", "method", "status"}),
 		HTTPDuration:               prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: "http_duration_seconds", Help: "HTTP handler duration by route."}, []string{"route"}),
 		HTTPInFlight:               prometheus.NewGauge(prometheus.GaugeOpts{Namespace: namespace, Name: "http_in_flight", Help: "In-flight HTTP handlers."}),
+		TelegramRequests:           prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Name: "telegram_requests_total", Help: "Telegram enrollment and key requests by action and outcome."}, []string{"action", "outcome"}),
+		TelegramDuration:           prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: "telegram_request_duration_seconds", Help: "Telegram enrollment and key request latency by action."}, []string{"action"}),
 		MintRequestsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
@@ -190,6 +194,7 @@ func New() *Metrics {
 	}
 
 	prometheus.MustRegister(
+		m.TelegramRequests, m.TelegramDuration,
 		m.OperationsTotal, m.OperationDuration, m.CleanupRecords, m.CleanupDue, m.CleanupOldestSeconds, m.GitHubEndpointBreakerState,
 		m.HTTPRequests, m.HTTPDuration, m.HTTPInFlight,
 		m.MintRequestsTotal,
