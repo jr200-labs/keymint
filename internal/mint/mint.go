@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -250,7 +251,7 @@ func Mint(ctx context.Context, req Request) (Token, error) {
 		return Token{}, errors.New("mint: InstallationID is required")
 	}
 
-	apiBase := req.APIBaseURL
+	apiBase := strings.TrimRight(req.APIBaseURL, "/")
 	if apiBase == "" {
 		apiBase = DefaultGitHubAPI
 	}
@@ -409,8 +410,8 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 		}
 	}
 
-	if req.OnRateLimit != nil {
-		remaining, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Remaining"), 10, 64)
+	remaining, remainingErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Remaining"), 10, 64)
+	if req.OnRateLimit != nil && remainingErr == nil && remaining >= 0 {
 		resetUnix, _ := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
 		var resetAt time.Time
 		if resetUnix > 0 {

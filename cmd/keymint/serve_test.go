@@ -3,7 +3,12 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestServiceConfigRequiresRecoverableEmergencyStorage(t *testing.T) {
@@ -24,4 +29,48 @@ func TestServiceConfigRequiresRecoverableEmergencyStorage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigWatcherDebouncesOnlyMatchingEvents(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		events := make(chan fsnotify.Event)
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		var reloads atomic.Int32
+		go func() {
+			defer close(done)
+			watchConfigEvents("config.yaml", events, nil, stop, func() { reloads.Add(1) })
+		}()
+		defer func() { close(stop); <-done }()
+		send := func(name string, op fsnotify.Op) {
+			events <- fsnotify.Event{Name: name, Op: op}
+			synctest.Wait()
+		}
+		send("unrelated", fsnotify.Write)
+		send("config.yaml", fsnotify.Chmod)
+		time.Sleep(configReloadDebounce)
+		synctest.Wait()
+		if got := reloads.Load(); got != 0 {
+			t.Fatalf("unrelated events reloaded %d times", got)
+		}
+		send("config.yaml", fsnotify.Write)
+		time.Sleep(configReloadDebounce / 2)
+		send("..data", fsnotify.Create)
+		time.Sleep(configReloadDebounce / 2)
+		synctest.Wait()
+		if reloads.Load() != 0 {
+			t.Fatal("reloaded before the final event settled")
+		}
+		time.Sleep(configReloadDebounce)
+		synctest.Wait()
+		if got := reloads.Load(); got != 1 {
+			t.Fatalf("burst reloaded %d times, want 1", got)
+		}
+		send("config.yaml", fsnotify.Create)
+		time.Sleep(configReloadDebounce)
+		synctest.Wait()
+		if got := reloads.Load(); got != 2 {
+			t.Fatalf("separate update reloaded %d times, want 2", got)
+		}
+	})
 }

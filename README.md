@@ -148,15 +148,17 @@ the deploy accordingly:
   Enterprise base URL configured per key. A sick GHE clock cannot
   poison signing for unrelated endpoints.
 
-- **Bounded rate limiters.** Both pre-auth (per-IP) and post-auth
-  (per-subject) rate limiters live behind LRUs sized to a few
-  thousand entries. A flood of unique IPs or subjects evicts older
-  buckets instead of growing memory without bound.
+- **Per-IP and per-subject rate limits.** The pre-auth limiter uses the
+  client IP, which Keymint resolves from the full forwarded chain when
+  the immediate peer is trusted. The post-auth limiter uses the
+  authenticated subject. Both use maps with no fixed capacity and sweep
+  fully refilled buckets every 30 seconds.
 
 - **Hot key rotation.** Operators rotating the kubernetes Secret
   carrying an App PEM are picked up automatically — keymint
-  compares mtime+size of the on-disk file before reusing a parsed
-  RSA key, and reloads when either changes.
+  caches the parsed RSA key by PEM path and checks file identity,
+  modification time, size, and watcher generation before reusing it.
+  Reloading unrelated configuration preserves cached installation tokens.
 
 - **TokenReview circuit breaker.** Calls to the kubernetes API are
   guarded by a circuit breaker that opens for 30s when failure
@@ -416,7 +418,10 @@ Kubernetes bound Secrets separately.
 A session begins in `awaiting_github`, `awaiting_totp` or `awaiting_passkey` and
 becomes `active` only after verification and durable activation audit succeed.
 Explicit revocation first enters `revocation_pending`, which immediately denies
-credential access while external cleanup runs. `revoked`, `expired` and
+credential access while external cleanup runs. DELETE returns HTTP 502
+when credential revocation is pending and HTTP 404 for an unavailable
+session. The broker publishes `session.revoked` after cleanup succeeds.
+`revoked`, `expired` and
 `invalidated` are terminal states and cannot reactivate. Profile revisions are
 immutable within a session. Removal or changed authority invalidates it.
 The broker allows up to 16 sessions per workload identity and 1024 overall,
@@ -435,7 +440,9 @@ Consumers must treat pending revocation as loss of authority and reconcile stale
 bindings after restart or journal replacement. See
 [ADR 0003](docs/adr/0003-publish-durable-emergency-session-events.md). Enrolling a
 passkey requires a still-active TOTP proof when enrollment finishes, not just
-when its ceremony starts.
+when its ceremony starts. Keymint rejects assertions with a WebAuthn clone
+warning, including previously flagged credentials. Replace a flagged passkey
+through the TOTP-backed enrollment flow.
 
 Padd chooses organization storage for its shared-secret path and repository
 storage for private repositories in Free-plan organizations. Both use the same

@@ -60,7 +60,7 @@ func APIBase(base string) (string, error) {
 		base = "https://api.github.com"
 	}
 	u, err := url.Parse(base)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(base, "#") {
 		return "", errors.New("Actions destination requires a trusted HTTPS API URL")
 	}
 	u.Host = strings.ToLower(u.Host)

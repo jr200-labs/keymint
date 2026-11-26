@@ -927,3 +927,72 @@ func TestBearerToken(t *testing.T) {
 		})
 	}
 }
+
+func TestClientIPUsesAllForwardedHeadersAndValidatedIPs(t *testing.T) {
+	_, proxy, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, want string
+		forwarded  []string
+	}{
+		{"proxy appends its own line", "2001:db8::1", []string{"arbitrary", "2001:0db8:0:0::1, 10.2.3.4"}},
+		{"malformed rightmost untrusted hop", "10.0.0.1", []string{"192.0.2.1", "arbitrary, 10.2.3.4"}},
+		{"malformed real IP", "10.0.0.1", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/token/app", nil)
+			r.RemoteAddr = "10.0.0.1:1234"
+			r.Header.Set("X-Real-IP", "arbitrary")
+			for _, value := range tc.forwarded {
+				r.Header.Add("X-Forwarded-For", value)
+			}
+			if got := clientIP(r, []*net.IPNet{proxy}); got != tc.want {
+				t.Fatalf("client IP = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMintAcceptsEmptyUnknownLengthAndCapsScopeBody(t *testing.T) {
+	cfg := &config.Config{
+		Keys:      map[string]config.Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}},
+		Allowlist: []config.AllowEntry{{Subject: "caller", Keys: []string{"app"}}},
+	}
+	mintCalls := 0
+	srv, err := New(cfg, func(_ context.Context, _ config.Key, scope TokenScope) (string, time.Time, error) {
+		mintCalls++
+		if len(scope.Repositories) != 0 || len(scope.Permissions) != 0 {
+			t.Errorf("expected an empty scope, got %+v", scope)
+		}
+		return "token", time.Now().Add(time.Hour), nil
+	}, &fakeReviewer{subjectByToken: map[string]string{"valid": "caller"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{"", http.StatusOK},
+		{"{}", http.StatusOK},
+		{"{}" + strings.Repeat(" ", 8190), http.StatusOK},
+		{"{}" + strings.Repeat(" ", 8191), http.StatusRequestEntityTooLarge},
+		{strings.Repeat("!", 8193), http.StatusRequestEntityTooLarge},
+		{"{} {}", http.StatusBadRequest},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/token/app", strings.NewReader(tc.body))
+		r.ContentLength = -1
+		r.Header.Set("Authorization", "Bearer valid")
+		w := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("body length %d: status=%d want %d", len(tc.body), w.Code, tc.want)
+		}
+	}
+	if mintCalls != 3 {
+		t.Fatalf("mint called %d times, want 3", mintCalls)
+	}
+}

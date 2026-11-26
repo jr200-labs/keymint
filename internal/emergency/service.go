@@ -67,17 +67,17 @@ type Session struct {
 	UserCode        string    `json:"user_code,omitempty"`
 	ExpiresAt       time.Time `json:"expires_at"`
 
-	approvalTTL          time.Duration
-	profile              config.EmergencyProfile
-	subject              string
-	deviceCode           string
-	accessToken          string
-	nextPoll             time.Time
-	pollEvery            time.Duration
-	boundSecret          string
-	operation            operation
-	gate                 chan struct{}
-	terminalEventPending bool
+	approvalTTL            time.Duration
+	profile                config.EmergencyProfile
+	subject                string
+	deviceCode             string
+	accessToken            string
+	nextPoll               time.Time
+	pollEvery              time.Duration
+	boundSecret            string
+	operation              operation
+	gate                   chan struct{}
+	withdrawalEventPending bool
 }
 
 type PasskeyEnrollment struct {
@@ -558,26 +558,32 @@ func (service *Service) Prune(ctx context.Context) error {
 	var result error
 	service.mu.Lock()
 	var expired []revokedCredential
+	var pending []struct{ subject, id string }
+	attempted := make(map[string]bool)
 	for id, current := range service.sessions {
 		if current.operation != idle {
 			continue
 		}
-		if current.ExpiresAt.After(now) && !terminal(current.State) && current.State != RevocationPending {
+		if current.State == RevocationPending {
+			pending = append(pending, struct{ subject, id string }{current.subject, id})
+			attempted[id] = true
+			continue
+		}
+		if current.ExpiresAt.After(now) && !terminal(current.State) {
 			continue
 		}
 		target, event := Expired, "session.expired"
-		if current.State == RevocationPending {
-			target, event = Revoked, eventFor(Revoked)
-		} else if terminal(current.State) {
+		if terminal(current.State) {
 			target, event = current.State, eventFor(current.State)
 		}
-		if !terminal(current.State) || current.terminalEventPending {
+		if !terminal(current.State) || current.withdrawalEventPending {
 			if err := service.transitionLocked(ctx, current, target, event); err != nil {
 				result = errors.Join(result, err)
 				continue
 			}
 		}
 		if current.accessToken != "" || current.boundSecret != "" {
+			attempted[id] = true
 			expired = append(expired, revokedCredential{id: current.ID, profile: current.profile, token: current.accessToken, secret: current.boundSecret})
 		}
 		delete(service.sessions, id)
@@ -589,9 +595,14 @@ func (service *Service) Prune(ctx context.Context) error {
 	}
 	service.mu.Unlock()
 	for _, credential := range expired {
-		result = errors.Join(result, service.revokeCredential(ctx, credential))
+		result = errors.Join(result, service.revokeTrackedCredential(ctx, credential))
 	}
-	return errors.Join(result, service.drainCleanup(ctx, false))
+	for _, session := range pending {
+		if err := service.Revoke(ctx, session.subject, session.id); err != nil && !errors.Is(err, ErrSessionUnavailable) {
+			result = errors.Join(result, fmt.Errorf("cleanup session %q: %w", session.id, err))
+		}
+	}
+	return errors.Join(result, service.drainCleanupExcept(ctx, false, attempted))
 }
 
 func (service *Service) Get(ctx context.Context, subject, id string) (Session, error) {
@@ -817,23 +828,35 @@ func (service *Service) Revoke(ctx context.Context, subject, id string) error {
 	}
 	defer release()
 	if terminal(session.State) {
-		service.mu.Unlock()
+		defer service.mu.Unlock()
+		if session.State == Revoked && session.withdrawalEventPending {
+			if err := service.transitionLocked(ctx, session, Revoked, eventFor(Revoked)); err != nil {
+				return err
+			}
+			delete(service.sessions, id)
+		}
 		return nil
 	}
-	if err = service.transitionLocked(ctx, session, RevocationPending, eventFor(RevocationPending)); err != nil {
-		service.mu.Unlock()
-		return err
+	if session.State != RevocationPending || session.withdrawalEventPending {
+		err = service.transitionLocked(ctx, session, RevocationPending, eventFor(RevocationPending))
+		if err != nil {
+			service.mu.Unlock()
+			return err
+		}
 	}
 	credential := revokedCredential{id: id, profile: session.profile, token: session.accessToken, secret: session.boundSecret}
 	service.mu.Unlock()
-	err = service.revokeCredential(ctx, credential)
+	err = service.revokeTrackedCredential(ctx, credential)
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrRevocationPending, err)
 	}
+	session.accessToken, session.boundSecret = "", ""
 	if terminal(session.State) {
-		delete(service.sessions, id)
+		if !session.withdrawalEventPending {
+			delete(service.sessions, id)
+		}
 		return nil
 	}
 	if err = service.transitionLocked(ctx, session, Revoked, eventFor(Revoked)); err != nil {

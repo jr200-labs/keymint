@@ -259,6 +259,9 @@ func (c *Config) Validate() error {
 		if k.PrivateKeyFile == "" && k.PrivateKeySOPS == "" {
 			return fmt.Errorf("key %q: must set private_key_file or private_key_sops", name)
 		}
+		if _, err := githubsecret.APIBase(k.APIBaseURL); err != nil {
+			return fmt.Errorf("key %q: api_base_url must be an absolute HTTPS API URL without credentials, query, or fragment", name)
+		}
 	}
 	identifier := regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
 	type releaseBinding struct {

@@ -167,22 +167,46 @@ func (store *cleanupStore) list(ctx context.Context) ([]cleanupRecord, error) {
 		if err = rows.Scan(&id, &sealed); err != nil {
 			return nil, err
 		}
-		n := store.cipher.NonceSize()
-		if len(sealed) < n {
-			return nil, fmt.Errorf("invalid encrypted cleanup record for session %q", id)
-		}
-		value, err := store.cipher.Open(nil, sealed[:n], sealed[n:], []byte(id))
+		record, err := store.unseal(id, sealed)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt cleanup record for session %q: %w", id, err)
-		}
-		var record cleanupRecord
-		if err = json.Unmarshal(value, &record); err != nil {
 			return nil, err
 		}
 		records = append(records, record)
 	}
 	return records, rows.Err()
 }
+func (store *cleanupStore) unseal(id string, sealed []byte) (cleanupRecord, error) {
+	var record cleanupRecord
+	n := store.cipher.NonceSize()
+	if len(sealed) < n {
+		return record, fmt.Errorf("invalid encrypted cleanup record for session %q", id)
+	}
+	value, err := store.cipher.Open(nil, sealed[:n], sealed[n:], []byte(id))
+	if err != nil {
+		return record, fmt.Errorf("decrypt cleanup record for session %q: %w", id, err)
+	}
+	err = json.Unmarshal(value, &record)
+	return record, err
+}
+
+func (service *Service) revokeTrackedCredential(ctx context.Context, credential revokedCredential) error {
+	var sealed []byte
+	err := service.cleanup.db.QueryRowContext(ctx, `SELECT sealed FROM emergency_cleanup WHERE session_id=?`, credential.id).Scan(&sealed)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Some sessions revoke before issuing a tracked credential.
+	case err != nil:
+		return err
+	default:
+		record, err := service.cleanup.unseal(credential.id, sealed)
+		if err != nil {
+			return err
+		}
+		credential = revokedCredential{id: record.ID, profile: record.Profile, token: record.Token, secret: record.Secret}
+	}
+	return service.revokeCredential(ctx, credential)
+}
+
 func (service *Service) rememberCredential(ctx context.Context, id string, profile config.EmergencyProfile, token, secret string, due time.Time) error {
 	// Materialize file-backed OAuth identity before persisting cleanup, so a
 	// subsequent configuration or Secret rotation cannot retarget revocation.
@@ -197,6 +221,10 @@ func (service *Service) rememberCredential(ctx context.Context, id string, profi
 	return service.cleanup.put(ctx, cleanupRecord{ID: id, Profile: profile, Token: token, Secret: secret, Due: due})
 }
 func (service *Service) drainCleanup(ctx context.Context, all bool) error {
+	return service.drainCleanupExcept(ctx, all, nil)
+}
+
+func (service *Service) drainCleanupExcept(ctx context.Context, all bool, attempted map[string]bool) error {
 	defer service.observeCleanup()
 	records, err := service.cleanup.list(ctx)
 	if err != nil {
@@ -210,9 +238,12 @@ func (service *Service) drainCleanup(ctx context.Context, all bool) error {
 		service.mu.Lock()
 		session, live := service.sessions[record.ID]
 		busy := live && session.operation != idle
-		authorized := live && !terminal(session.State) && session.State != RevocationPending
+		pending := live && session.State == RevocationPending
+		authorized := live && !terminal(session.State) && !pending
 		service.mu.Unlock()
-		if busy {
+		// The live revocation path owns pending sessions so it can publish
+		// the terminal event after cleanup succeeds.
+		if busy || attempted[record.ID] || (!all && pending) {
 			continue
 		}
 		if !all && authorized && record.Due.After(service.now()) {
@@ -237,7 +268,7 @@ func (service *Service) observeCleanup() {
 	service.mu.Lock()
 	for _, record := range records {
 		session := service.sessions[record.ID]
-		if session == nil || !record.Due.After(service.now()) {
+		if session == nil || terminal(session.State) || session.State == RevocationPending || !record.Due.After(service.now()) {
 			due++
 			if age := service.now().Sub(record.Due).Seconds(); age > oldest {
 				oldest = age

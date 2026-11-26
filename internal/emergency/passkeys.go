@@ -94,6 +94,9 @@ func (manager *passkeys) finishLogin(session webauthn.SessionData, request *http
 	if err != nil {
 		return err
 	}
+	if credential.Authenticator.CloneWarning {
+		return errors.New("passkey signature counter did not advance or the credential was previously flagged")
+	}
 	for index := range manager.user.Credentials {
 		if string(manager.user.Credentials[index].ID) == string(credential.ID) {
 			manager.user.Credentials[index] = *credential

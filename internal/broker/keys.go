@@ -67,12 +67,14 @@ func (t *pemGenerationTracker) reload(cfg *config.Config, log *zap.Logger) error
 			_ = t.watcher.Remove(dir)
 		}
 	}
-	t.targets = desired
 	for dir, targets := range desired {
 		for target := range targets {
-			t.bump(filepath.Join(dir, target))
+			if !t.targets[dir][target] {
+				t.bump(filepath.Join(dir, target))
+			}
 		}
 	}
+	t.targets = desired
 	return nil
 }
 func (t *pemGenerationTracker) watch(w *fsnotify.Watcher, log *zap.Logger) {
@@ -85,10 +87,13 @@ func (t *pemGenerationTracker) watch(w *fsnotify.Watcher, log *zap.Logger) {
 			}
 			t.mu.Lock()
 			targets := t.targets[filepath.Dir(event.Name)]
-			if filepath.Base(event.Name) == "..data" || targets[filepath.Base(event.Name)] {
+			base := filepath.Base(event.Name)
+			if base == "..data" {
 				for target := range targets {
 					t.bump(filepath.Join(filepath.Dir(event.Name), target))
 				}
+			} else if targets[base] {
+				t.bump(event.Name)
 			}
 			t.mu.Unlock()
 		case err, ok := <-w.Errors:

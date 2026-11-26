@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -56,9 +57,9 @@ type cachedToken struct {
 	ExpiresAt time.Time
 }
 type keyCacheEntry struct {
-	key   crypto.PrivateKey
-	mtime time.Time
-	size  int64
+	key        crypto.PrivateKey
+	info       os.FileInfo
+	generation uint64
 }
 type Options struct {
 	Timeout time.Duration
@@ -198,7 +199,7 @@ func (b *Broker) issue(ctx context.Context, id string, key config.Key, scope min
 	defer cancel()
 	stop := context.AfterFunc(b.ctx, cancel)
 	defer stop()
-	private, err := b.loadKey(id, key.PrivateKeyFile)
+	private, err := b.loadKey(key.PrivateKeyFile)
 	if err != nil {
 		return result, err
 	}
@@ -232,12 +233,15 @@ func (b *Broker) issue(ctx context.Context, id string, key config.Key, scope min
 	b.tokens.Add(id, result)
 	return result, nil
 }
-func (b *Broker) loadKey(id, path string) (crypto.PrivateKey, error) {
+func (b *Broker) loadKey(path string) (crypto.PrivateKey, error) {
+	cacheKey := filepath.Clean(path)
+	generation := b.generations.current(cacheKey)
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	if cached, ok := b.keys.Get(id); ok && cached.mtime.Equal(info.ModTime()) && cached.size == info.Size() {
+	if cached, ok := b.keys.Get(cacheKey); ok && cached.generation == generation &&
+		os.SameFile(cached.info, info) && cached.info.ModTime().Equal(info.ModTime()) && cached.info.Size() == info.Size() {
 		return cached.key, nil
 	}
 	bytes, err := os.ReadFile(path)
@@ -248,6 +252,6 @@ func (b *Broker) loadKey(id, path string) (crypto.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.keys.Add(id, keyCacheEntry{key, info.ModTime(), info.Size()})
+	b.keys.Add(cacheKey, keyCacheEntry{key: key, info: info, generation: generation})
 	return key, nil
 }

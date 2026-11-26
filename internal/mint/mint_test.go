@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -365,5 +366,40 @@ func TestExchangeObservesStatusAndClockOffset(t *testing.T) {
 	})
 	if err == nil || status != "503" || offset < 50*time.Second {
 		t.Fatalf("status=%s offset=%v error=%v", status, offset, err)
+	}
+}
+
+func TestMintRateLimitObservationRequiresValidRemaining(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		want   bool
+	}{
+		{"", false}, {"unknown", false}, {"-1", false}, {"0", true}, {"100", true},
+	} {
+		t.Run(tc.header, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v3/app/installations/1/access_tokens" {
+					t.Errorf("unexpected path %q", r.URL.Path)
+				}
+				if tc.header != "" {
+					w.Header().Set("X-RateLimit-Remaining", tc.header)
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer upstream.Close()
+			called := false
+			_, err := Mint(context.Background(), Request{
+				AppID: 1, InstallationID: 1, PrivateKey: generateTestKey(t), APIBaseURL: upstream.URL + "/api/v3/",
+				OnRateLimit: func(base string, remaining int64, _ time.Time) {
+					called = true
+					if base != upstream.URL+"/api/v3" || strconv.FormatInt(remaining, 10) != tc.header {
+						t.Errorf("unexpected observation: %q %d", base, remaining)
+					}
+				},
+			})
+			if err == nil || called != tc.want {
+				t.Fatalf("upstream error=%v callback=%t want=%t", err, called, tc.want)
+			}
+		})
 	}
 }

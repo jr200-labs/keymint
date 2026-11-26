@@ -302,6 +302,10 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 		return
 	}
 
+	watchConfigEvents(target, w.Events, w.Errors, stop, onChange)
+}
+
+func watchConfigEvents(target string, events <-chan fsnotify.Event, watcherErrors <-chan error, stop <-chan struct{}, onChange func()) {
 	// Debounce: kubelet's ConfigMap/Secret update fires several
 	// fsnotify events in rapid succession (..data symlink swap,
 	// permission changes, etc.). Reset a quiet-period timer on
@@ -326,7 +330,7 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 		case <-debounceCh:
 			debounce = nil
 			onChange()
-		case event, ok := <-w.Events:
+		case event, ok := <-events:
 			if !ok {
 				return
 			}
@@ -353,7 +357,7 @@ func watchConfigFile(path string, stop <-chan struct{}, onChange func()) {
 				}
 				debounce.Reset(configReloadDebounce)
 			}
-		case err, ok := <-w.Errors:
+		case err, ok := <-watcherErrors:
 			if !ok {
 				return
 			}
