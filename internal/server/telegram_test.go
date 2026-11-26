@@ -66,7 +66,9 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 		receivedMu.Lock()
 		received = append(received, input)
 		receivedMu.Unlock()
-		writeJSON(w, telegramStatus{State: "qr", LoginURL: "tg://login?token=YWJj", ExpiresAt: time.Now().Add(time.Minute)})
+		// Telegram client libraries can return a padded base64url login token.
+		loginURL := "tg://login?token=" + base64.URLEncoding.EncodeToString([]byte{0xfb, 0xff})
+		writeJSON(w, telegramStatus{State: "qr", LoginURL: loginURL, ExpiresAt: time.Now().Add(time.Minute)})
 	}))
 	t.Cleanup(upstream.Close)
 	cfg := &config.Config{
@@ -129,9 +131,12 @@ func TestTelegramApprovalCreatesBoundPasskeyAndRejectsUnverifiedCalls(t *testing
 		strings.Contains(response.Body.String(), "tg://") {
 		t.Fatalf("start returned %d or exposed the login URL", response.Code)
 	}
-	if response := request(http.MethodGet, path+"/qr", "operator"); response.Code != http.StatusOK ||
-		response.Header().Get("Content-Type") != "image/png" {
-		t.Fatalf("approved QR returned %d", response.Code)
+	qrResponse := request(http.MethodGet, path+"/qr", "operator")
+	if qrResponse.Code != http.StatusOK || qrResponse.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("approved QR returned %d", qrResponse.Code)
+	}
+	if _, err := png.Decode(qrResponse.Body); err != nil {
+		t.Fatalf("approved QR could not be decoded: %v", err)
 	}
 	if response := request(http.MethodPost, path+"/commit", "operator"); response.Code != http.StatusOK {
 		t.Fatalf("approved commit returned %d", response.Code)

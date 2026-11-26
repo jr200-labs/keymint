@@ -182,7 +182,12 @@ func writeTelegramQR(w http.ResponseWriter, status telegramStatus, terminal bool
 		writeJSONError(w, http.StatusConflict, "Telegram QR is not ready")
 		return
 	}
-	token, err := base64.RawURLEncoding.DecodeString(login.Query().Get("token"))
+	encodedToken := login.Query().Get("token")
+	token, err := base64.RawURLEncoding.DecodeString(encodedToken)
+	if err != nil {
+		// Some Telegram client libraries include base64url padding.
+		token, err = base64.URLEncoding.DecodeString(encodedToken)
+	}
 	if err != nil || len(token) == 0 {
 		writeJSONError(w, http.StatusBadGateway, "Telegram relay returned an invalid QR token")
 		return
