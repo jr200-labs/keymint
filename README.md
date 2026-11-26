@@ -436,7 +436,11 @@ file with the database, restrict both to the broker identity, and run one
 replica. Live authorization remains memory-only, but encrypted revocation
 records survive restart until remote cleanup succeeds. The event stream never
 contains tokens or revocation secrets. Losing either persistent file prevents
-reliable cleanup; retain both during upgrades and recovery.
+reliable cleanup. Retain both during upgrades and recovery. Restart makes
+outstanding cleanup due immediately and preserves the original age of overdue
+records. OAuth cleanup uses the GitHub identity captured at exchange, including
+after mounted files rotate. A 404 from GitHub's token revocation endpoint
+confirms that the token is already absent.
 
 For Kubernetes upgrades, keep one process owning this volume, including while
 old and new pods transition. A `Recreate` Deployment strategy avoids overlapping
@@ -533,8 +537,9 @@ bindings after restart or journal replacement. See
 [ADR 0003](docs/adr/0003-publish-durable-emergency-session-events.md). Enrolling a
 passkey requires a still-active TOTP proof when enrollment finishes, not just
 when its ceremony starts. Keymint rejects assertions with a WebAuthn clone
-warning, including previously flagged credentials. Replace a flagged passkey
-through the TOTP-backed enrollment flow.
+warning and records the warning in the passkey inventory. Flagged credentials
+stay blocked across restarts. Replace them through the TOTP-backed enrollment
+flow.
 
 Padd chooses organization storage for its shared-secret path and repository
 storage for private repositories in Free-plan organizations. Both use the same

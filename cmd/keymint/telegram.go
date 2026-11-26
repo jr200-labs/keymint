@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -28,10 +29,8 @@ func newTelegramEnrollCmd() *cobra.Command {
 		Short: "Approve and enroll a Telegram account through Keymint",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			origin = strings.TrimSuffix(origin, "/")
-			u, err := url.Parse(origin)
-			if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Path != "" ||
-				u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !telegramRelayName.MatchString(args[0]) || tokenFile == "" {
+			base, err := config.TelegramHTTPSOrigin(strings.TrimSuffix(origin, "/"))
+			if err != nil || !telegramRelayName.MatchString(args[0]) || tokenFile == "" {
 				return errors.New("a Keymint HTTPS origin, relay name and operator token file are required")
 			}
 			if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
@@ -40,7 +39,7 @@ func newTelegramEnrollCmd() *cobra.Command {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()
 			client := telegramEnrollmentClient{
-				origin: origin, tokenFile: tokenFile,
+				origin: base, tokenFile: tokenFile,
 				http: &http.Client{
 					Timeout:       10 * time.Second,
 					CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

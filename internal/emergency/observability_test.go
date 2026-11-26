@@ -44,4 +44,15 @@ func TestCleanupAndJournalFailureObservations(t *testing.T) {
 	if value.GetCounter().GetValue() != 1 {
 		t.Fatal("missing journal failure")
 	}
+	session := &Session{ID: "expired", subject: "caller", State: Active, ExpiresAt: time.Now().Add(-time.Minute)}
+	service.sessions[session.ID] = session
+	got, err := service.Get(context.Background(), "caller", session.ID)
+	if err != nil || got.State != Expired {
+		t.Fatalf("expired credential-free session: state=%s err=%v", got.State, err)
+	}
+	_ = m.OperationsTotal.WithLabelValues("credential_revoke", "success").Write(value)
+	if value.GetCounter().GetValue() != 0 {
+		t.Fatal("credential-free expiry counted as a revocation")
+	}
+
 }

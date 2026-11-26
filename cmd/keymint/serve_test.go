@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -73,4 +77,40 @@ func TestConfigWatcherDebouncesOnlyMatchingEvents(t *testing.T) {
 			t.Fatalf("separate update reloaded %d times, want 2", got)
 		}
 	})
+}
+
+func TestListenerStartupFailureStopsSiblingBeforeReturn(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	api := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	defer func() { _ = api.Close() }()
+	metrics := &http.Server{Addr: listener.Addr().String()}
+	defer func() { _ = metrics.Close() }()
+	errs := make(chan error, 2)
+	go func() { errs <- api.Serve(listener) }()
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	go func() { errs <- metrics.ListenAndServe() }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := awaitHTTPShutdown(ctx, errs, time.Second, api, metrics); err == nil {
+		t.Fatal("expected the metrics bind error")
+	}
+	select {
+	case err := <-errs:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("unexpected API shutdown error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("API listener outlived startup error")
+	}
 }

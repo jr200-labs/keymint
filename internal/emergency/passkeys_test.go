@@ -147,20 +147,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 			t.Fatal("wrong origin accepted")
 		}
 	}
-	for _, counter := range []uint32{1, 2} {
-		session, err := service.Create(context.Background(), "caller", "passkey", time.Minute)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, token, _ := strings.Cut(session.VerificationURI, "#")
-		request := passkeyResponse(t, service, token, key, false, "https://keys.example", counter)
-		if err := service.VerifyPasskey("caller", token, request); err == nil || !strings.Contains(err.Error(), "counter") {
-			t.Fatalf("non-advancing counter %d returned %v", counter, err)
-		}
-		if err := service.Authorize("caller", session.ID); err == nil {
-			t.Fatal("non-advancing counter authorized session")
-		}
-	}
+
 	ctx := context.Background()
 	digest := strings.Repeat("a", 64)
 	if _, err := service.CreateApproval(ctx, "caller", "approval", 5*time.Minute, digest, strings.Repeat("a", 3001)); err == nil {
@@ -225,7 +212,46 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 		t.Fatalf("revoked enrollment proof: %v", err)
 	}
 
+	startLogin := func(counter uint32) (Session, string, *http.Request) {
+		t.Helper()
+		session, err := service.Create(ctx, "caller", "passkey", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, token, _ := strings.Cut(session.VerificationURI, "#")
+		return session, token, passkeyResponse(t, service, token, key, false, "https://keys.example", counter)
+	}
+	// Prepare a higher-counter assertion before flagging the credential,
+	// proving that an already-issued ceremony can't bypass the warning.
+	later, laterToken, laterRequest := startLogin(4)
+	_, cloneToken, cloneRequest := startLogin(2)
+	if err := service.VerifyPasskey("caller", cloneToken, cloneRequest); err == nil || !strings.Contains(err.Error(), "counter") {
+		t.Fatalf("non-advancing counter returned %v", err)
+	}
+	flagged, err := ListPasskeys(cfg.Passkeys.StateFile)
+	if err != nil || len(flagged) != 1 || !flagged[0].CloneWarning {
+		t.Fatalf("clone warning not durable: %+v, %v", flagged, err)
+	}
+	laterData := service.ceremonies[laterToken].data
+	afterRestartRequest := passkeyResponse(t, service, laterToken, key, false, "https://keys.example", 4)
+	if err := service.VerifyPasskey("caller", laterToken, laterRequest); err == nil {
+		t.Fatal("flagged credential accepted for an in-flight ceremony")
+	}
+	if err := service.Authorize("caller", later.ID); err == nil {
+		t.Fatal("flagged credential granted authority")
+	}
+
 	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(cfg, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.passkeys.finishLogin(laterData, afterRestartRequest, allowed.PasskeyCredentials); err == nil {
+		t.Error("flagged credential accepted after restart")
+	}
+	if err := restarted.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := RevokePasskey(cfg.Passkeys.StateFile, inventory[0].ID); err != nil {
@@ -235,13 +261,4 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("revoked credential still in inventory: %+v, %v", keys, err)
 	}
-	restarted, err := New(cfg, http.DefaultClient, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = restarted.Close() }()
-	if _, err := restarted.Create(ctx, "caller", "passkey", time.Minute); err == nil {
-		t.Fatal("revoked passkey still available after restart")
-	}
-
 }

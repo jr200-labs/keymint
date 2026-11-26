@@ -338,7 +338,7 @@ func TestSessionCapacityReservesDeviceStartsPerSubject(t *testing.T) {
 		<-finish
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(`{"device_code":"test","user_code":"test","interval":5}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"device_code":"test","user_code":"test","verification_uri":"https://github.com/login/device","interval":5}`)),
 		}, nil
 	})}
 	cfg := &config.Config{
@@ -400,6 +400,35 @@ func TestSessionCapacityReservesDeviceStartsPerSubject(t *testing.T) {
 			}
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for reserved creations")
+		}
+	}
+}
+
+func TestGitHubDeviceRejectsOAuthErrorsAndIncompleteChallenges(t *testing.T) {
+	for _, body := range []string{
+		`{"error":"unauthorized_client","device_code":"code","user_code":"user","verification_uri":"https://github.com/login/device"}`,
+		`{"user_code":"user","verification_uri":"https://github.com/login/device"}`,
+		`{"device_code":"code","verification_uri":"https://github.com/login/device"}`,
+		`{"device_code":"code","user_code":"user","verification_uri":"http://github.com/login/device"}`,
+	} {
+		ctx := context.Background()
+		cfg := &config.Config{EmergencyProfiles: map[string]config.EmergencyProfile{"operator": {
+			Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{42},
+		}}, Allowlist: []config.AllowEntry{{Subject: "caller", EmergencyProfiles: []string{"operator"}}}}
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})}
+		service, err := New(cfg, client, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = service.Close() })
+		if _, err := service.Create(ctx, "caller", "operator", time.Minute); err == nil {
+			t.Fatalf("malformed response accepted: %s", body)
+		}
+		page, err := service.Events(ctx, "caller", "", 0)
+		if err != nil || len(page.Events) != 0 || len(service.sessions) != 0 || len(service.creating) != 0 {
+			t.Fatalf("malformed response left session, events, or reservation: %+v, %v", page, err)
 		}
 	}
 }
