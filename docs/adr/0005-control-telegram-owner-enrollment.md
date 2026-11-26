@@ -69,3 +69,24 @@ The relay requests its wrapping key via
 token must target Keymint's configured audience. The response is exactly
 32 bytes and uses `Cache-Control: no-store`. Operator clients and agent
 workloads have no access to this endpoint for that relay.
+
+## Observability
+
+Keymint exposes `keymint_telegram_requests_total{action,outcome}` and
+`keymint_telegram_request_duration_seconds{action}` on its Prometheus
+listener. The action label covers approval, start, status, QR, password,
+commit, cancel, and wrapping-key requests. The outcome distinguishes
+authorization or approval errors, relay conflicts, relay timeouts and
+connection errors, malformed relay responses, and QR failures. A successful
+request means the action returned a response. Look for state `enrolled`
+in a commit or status observation to confirm completion.
+
+Structured milestone and failure logs include `enrollment_id` when Keymint
+has resolved an authorized enrollment. That field matches the approval
+session ID in the emergency journal. Routine successful polls appear in
+HTTP request logs, with the bounded relay state available on the request
+span. When OpenTelemetry is enabled, Keymint propagates trace context to
+the relay and records the outbound HTTP status or transport failure.
+
+Metrics use fixed action and outcome labels. Telemetry excludes passwords,
+QR contents, key material, and relay payloads.
