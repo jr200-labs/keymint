@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -165,5 +166,46 @@ func TestCleanupFailureUsesConfiguredLogger(t *testing.T) {
 	service.Reload(&config.Config{})
 	if observed.FilterMessage("retry credential cleanup after config reload").Len() != 1 {
 		t.Fatal("cleanup error bypassed configured zap logger")
+	}
+}
+
+func TestQuarantineCleanupRepairsStartupAfterKeyLoss(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{EmergencyStateFile: filepath.Join(t.TempDir(), "events.db")}
+	status, calls := 204, 0
+	client := cleanupClient(&status, &calls)
+	service, err := New(cfg, client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := config.EmergencyProfile{ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}}
+	for _, id := range []string{"first", "second"} {
+		if err := service.rememberCredential(ctx, id, profile, "token", "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.events.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cfg.EmergencyStateFile + ".cleanup-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg, client, nil); err == nil || !strings.Contains(err.Error(), "decrypt cleanup record") {
+		t.Fatalf("expected startup failure after key loss, got %v", err)
+	}
+	if count, err := QuarantineCleanup(ctx, cfg.EmergencyStateFile, "first"); err != nil || count != 1 {
+		t.Fatalf("quarantine one = %d, %v", count, err)
+	}
+	if count, err := QuarantineCleanup(ctx, cfg.EmergencyStateFile, ""); err != nil || count != 1 {
+		t.Fatalf("quarantine remaining = %d, %v", count, err)
+	}
+	recovered, err := New(cfg, client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	var archived int
+	if err := recovered.events.db.QueryRow(`SELECT COUNT(*) FROM emergency_cleanup_quarantine`).Scan(&archived); err != nil || archived != 2 || calls != 0 {
+		t.Fatalf("archived=%d revocations=%d error=%v", archived, calls, err)
 	}
 }

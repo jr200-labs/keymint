@@ -261,6 +261,11 @@ func (c *Config) Validate() error {
 		}
 	}
 	identifier := regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+	type releaseBinding struct {
+		repository string
+		scope      githubsecret.Scope
+	}
+	bindings := make(map[releaseBinding]string)
 	for name, key := range c.ReleaseKeys {
 		if key.SecretScopes != nil && len(key.SecretScopes) == 0 {
 			return fmt.Errorf("release key %q: secret_scopes must not be empty", name)
@@ -291,6 +296,16 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("release key %q: repository binding %q is invalid or duplicated", name, repository)
 			}
 			seen[repository] = true
+			for _, scope := range []githubsecret.Scope{githubsecret.Repository, githubsecret.Organization} {
+				if !key.AllowsSecretScope(scope) {
+					continue
+				}
+				binding := releaseBinding{repository, scope}
+				if other, exists := bindings[binding]; exists {
+					return fmt.Errorf("release keys %q and %q share repository %q and secret scope %q", other, name, repository, scope)
+				}
+				bindings[binding] = name
+			}
 		}
 	}
 	for i, e := range c.Allowlist {
@@ -325,6 +340,10 @@ func (c *Config) Validate() error {
 		}
 		switch profile.AuthenticationMethod() {
 		case "github_device":
+			base, err := githubsecret.APIBase(profile.APIBaseURL)
+			if err != nil || base != "https://api.github.com" {
+				return fmt.Errorf("emergency profile %q: github_device requires the github.com REST API", name)
+			}
 			if (profile.ClientID == "" && profile.ClientIDFile == "") || (profile.ClientSecret == "" && profile.ClientSecretFile == "") || (len(profile.AllowedUserIDs) == 0 && profile.AllowedUserIDsFile == "") || len(profile.Scopes) == 0 {
 				return fmt.Errorf("emergency profile %q: client ID, client secret, allowed user IDs, and scopes are required", name)
 			}

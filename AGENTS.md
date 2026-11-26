@@ -29,8 +29,7 @@ Two modes:
   static, CGO-disabled
 - **Lint**: `make lint` downloads shared `.golangci.yml` from
   `jr200-labs/github-action-templates` (sync-shared pattern)
-- **Tests**: unit tests next to code; integration tests under
-  `tests/integration/` with `-tags=integration`
+- Run `make test` for the Go tests and `make test-race` for race detection.
 
 ## Release flow
 

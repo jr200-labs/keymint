@@ -180,8 +180,19 @@ func TestReleaseLookupCannotOutliveAuthorizationOrCrossAuthorities(t *testing.T)
 			defer func() { http.DefaultTransport = old }()
 			cfg = &config.Config{EmergencyStateFile: filepath.Join(t.TempDir(), "events.db"), Keys: map[string]config.Key{"installation": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused", APIBaseURL: upstream.URL}}, ReleaseKeys: map[string]config.ReleaseKey{"signing": {GitHubKey: "installation", Kind: "sparkle_ed25519", SecretName: "SPARKLE_EDDSA_PRIVATE_KEY", SecretScopes: []githubsecret.Scope{githubsecret.Organization}, Repositories: []string{"owner/repo"}, PrivateKeyFile: "/must-not-read"}}, Allowlist: []config.AllowEntry{{Subject: "caller", ReleaseKeys: []string{"signing"}}}}
 			sessionBase := upstream.URL
-			if mode == "api_mismatch" {
+			switch mode {
+			case "api_mismatch":
 				sessionBase = "https://different.example/api/v3"
+			case "reload":
+				sessionBase = "https://api.github.com"
+				key := cfg.Keys["installation"]
+				key.APIBaseURL = sessionBase
+				cfg.Keys["installation"] = key
+				http.DefaultTransport = emergencyTransport(func(r *http.Request) (*http.Response, error) {
+					local := r.Clone(r.Context())
+					local.URL.Host = upstream.Listener.Addr().String()
+					return upstream.Client().Transport.RoundTrip(local)
+				})
 			}
 			em, id = activeEmergency(t, cfg, sessionBase)
 			m := testMetrics(t)

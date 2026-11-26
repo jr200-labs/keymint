@@ -71,6 +71,7 @@ state TEXT NOT NULL, expires_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_approvals (
 session_id TEXT PRIMARY KEY, digest TEXT NOT NULL, redeemed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS emergency_totp (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, attempts INTEGER NOT NULL, last_step INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS emergency_totp_failures (identity TEXT PRIMARY KEY, started INTEGER NOT NULL, failures INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS emergency_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS emergency_events_subject_id ON emergency_events(subject, id);`); err != nil {
 		_ = db.Close()

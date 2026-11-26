@@ -41,6 +41,7 @@ mounted Secret in-cluster).`,
 	root.AddCommand(newHelperCmd())
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newTelegramEnrollCmd())
+	root.AddCommand(newCleanupQuarantineCmd())
 
 	return root
 }

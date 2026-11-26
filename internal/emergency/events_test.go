@@ -2,6 +2,7 @@ package emergency
 
 import (
 	"context"
+	"fmt"
 	"github.com/jr200-labs/keymint/internal/config"
 	"net/http"
 	"path/filepath"
@@ -109,5 +110,44 @@ func TestRevocationRecordsTerminalState(t *testing.T) {
 	page, err = service.Events(context.Background(), "caller", page.NextCursor, 0)
 	if err != nil || len(page.Events) != 0 {
 		t.Fatal("revoked session treated as unfinished")
+	}
+}
+
+func TestPruneJournalsExpirationOnce(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail_first=%t", failFirst), func(t *testing.T) {
+			service, err := New(&config.Config{}, http.DefaultClient, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = service.Close() })
+			ctx := context.Background()
+			service.sessions["session"] = &Session{ID: "session", subject: "caller", State: Active, ExpiresAt: time.Now().Add(-time.Minute)}
+			if failFirst {
+				_, err = service.events.db.Exec(`CREATE TRIGGER reject_expiry BEFORE INSERT ON emergency_events
+					WHEN NEW.type='session.expired' BEGIN SELECT RAISE(ABORT,'injected journal failure'); END`)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err = service.Get(ctx, "caller", "session"); (err != nil) != failFirst {
+				t.Fatalf("get returned %v", err)
+			}
+			if failFirst {
+				if _, err := service.events.db.Exec(`DROP TRIGGER reject_expiry`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := service.Prune(ctx); err != nil {
+				t.Fatal(err)
+			}
+			page, err := service.Events(ctx, "caller", "", 0)
+			if err != nil || len(page.Events) != 1 || page.Events[0].Type != "session.expired" {
+				t.Fatalf("events=%+v error=%v", page.Events, err)
+			}
+			if _, err := service.Get(ctx, "caller", "session"); err == nil {
+				t.Fatal("expired session survived pruning")
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package emergency
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -76,7 +77,7 @@ func TestKubernetesSessionRequiresTOTPAndRevokesBoundToken(t *testing.T) {
 		t.Fatalf("active session was not authorized: %v", err)
 	}
 	credential, err := service.Credential(context.Background(), "system:serviceaccount:agents:relay", session.ID)
-	if err != nil || credential.Token != "kubernetes-token" {
+	if err != nil || credential.Token != "kubernetes-token" || !credential.ExpiresAt.Equal(session.ExpiresAt) {
 		t.Fatalf("credential = %#v, %v", credential, err)
 	}
 	if err := service.Revoke(context.Background(), "system:serviceaccount:agents:relay", session.ID); err != nil {
@@ -326,5 +327,79 @@ func TestRestrictedGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSessionCapacityReservesDeviceStartsPerSubject(t *testing.T) {
+	started := make(chan struct{}, maxSessionsPerSubject+2)
+	finish := make(chan struct{}, maxSessionsPerSubject+1)
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		started <- struct{}{}
+		<-finish
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"device_code":"test","user_code":"test","interval":5}`)),
+		}, nil
+	})}
+	cfg := &config.Config{
+		EmergencyProfiles: map[string]config.EmergencyProfile{"human": {Provider: "github_user", ClientID: "test", ClientSecret: "test", AllowedUserIDs: []int64{1}}},
+		Allowlist: []config.AllowEntry{
+			{Subject: "first", EmergencyProfiles: []string{"human"}},
+			{Subject: "second", EmergencyProfiles: []string{"human"}},
+		},
+	}
+	service, err := New(cfg, client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	defer close(finish)
+
+	create := func(subject string, done chan<- error) {
+		_, err := service.Create(ctx, subject, "human", time.Minute)
+		done <- err
+	}
+	done := make(chan error, maxSessionsPerSubject+2)
+	awaitDeviceStart := func() {
+		t.Helper()
+		select {
+		case <-started:
+		case err := <-done:
+			t.Fatalf("creation returned before device start: %v", err)
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for device start")
+		}
+	}
+	for range maxSessionsPerSubject {
+		go create("first", done)
+		awaitDeviceStart()
+	}
+	go create("first", done)
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "emergency session capacity reached" {
+			t.Fatalf("unexpected capacity result: %v", err)
+		}
+	case <-started:
+		t.Fatal("excess session contacted GitHub")
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for capacity result")
+	}
+	go create("second", done)
+	awaitDeviceStart()
+	for range maxSessionsPerSubject + 1 {
+		finish <- struct{}{}
+	}
+	for range maxSessionsPerSubject + 1 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("reserved creation failed: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for reserved creations")
+		}
 	}
 }
