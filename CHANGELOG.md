@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.1](https://github.com/jr200-labs/keymint/compare/v1.13.0...v1.13.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **telegram:** render QR codes for padded login tokens ([#143](https://github.com/jr200-labs/keymint/issues/143)) ([b6bd746](https://github.com/jr200-labs/keymint/commit/b6bd746fff7963d799cd69be15eb4e538cafc388))
+
 ## [1.13.0](https://github.com/jr200-labs/keymint/compare/v1.12.0...v1.13.0) (2026-11-25)
 
 
