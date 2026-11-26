@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/githubsecret"
@@ -41,28 +40,14 @@ func Seal(key config.ReleaseKey, destination Destination) (Sealed, error) {
 	if err != nil || len(destinationBytes) != 32 {
 		return Sealed{}, errors.New("destination public key is invalid")
 	}
-	info, err := os.Stat(key.PrivateKeyFile)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxPrivateKeyFile {
-		return Sealed{}, errors.New("release signing key is unavailable")
-	}
-	encoded, err := os.ReadFile(key.PrivateKeyFile)
+	privateText, public, err := readPrivateKey(key)
 	if err != nil {
-		return Sealed{}, errors.New("release signing key is unavailable")
+		return Sealed{}, err
 	}
-	privateText := strings.TrimSpace(string(encoded))
-	bundle, err := base64.StdEncoding.DecodeString(privateText)
-	if err != nil || len(bundle) != ed25519.PrivateKeySize+ed25519.PublicKeySize {
-		return Sealed{}, errors.New("release signing key has an invalid Sparkle Ed25519 export")
-	}
-	private := ed25519.NewKeyFromSeed(bundle[:ed25519.SeedSize])
-	public := private.Public().(ed25519.PublicKey)
-	if !bytes.Equal(bundle[:ed25519.PrivateKeySize], private) ||
-		!bytes.Equal(bundle[ed25519.PrivateKeySize:], public) {
-		return Sealed{}, errors.New("release signing key has an inconsistent Sparkle Ed25519 export")
-	}
+	defer clear(privateText)
 	var recipient [32]byte
 	copy(recipient[:], destinationBytes)
-	ciphertext, err := box.SealAnonymous(nil, []byte(privateText), &recipient, rand.Reader)
+	ciphertext, err := box.SealAnonymous(nil, privateText, &recipient, rand.Reader)
 	if err != nil {
 		return Sealed{}, fmt.Errorf("seal release signing key: %w", err)
 	}
@@ -73,4 +58,38 @@ func Seal(key config.ReleaseKey, destination Destination) (Sealed, error) {
 		DestinationKey: destination.KeyID,
 		EncryptedValue: base64.StdEncoding.EncodeToString(ciphertext),
 	}, nil
+}
+
+// ValidateFile checks the signing key format without sealing or returning it.
+func ValidateFile(key config.ReleaseKey) error {
+	text, _, err := readPrivateKey(key)
+	clear(text)
+	return err
+}
+
+func readPrivateKey(key config.ReleaseKey) ([]byte, ed25519.PublicKey, error) {
+	info, err := os.Stat(key.PrivateKeyFile)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxPrivateKeyFile {
+		return nil, nil, errors.New("release signing key is unavailable")
+	}
+	encoded, err := os.ReadFile(key.PrivateKeyFile)
+	if err != nil {
+		return nil, nil, errors.New("release signing key is unavailable")
+	}
+	defer clear(encoded)
+	text := bytes.TrimSpace(encoded)
+	bundle := make([]byte, base64.StdEncoding.DecodedLen(len(text)))
+	defer clear(bundle)
+	n, err := base64.StdEncoding.Decode(bundle, text)
+	if err != nil || n != ed25519.PrivateKeySize+ed25519.PublicKeySize {
+		return nil, nil, errors.New("release signing key has an invalid Sparkle Ed25519 export")
+	}
+	private := ed25519.NewKeyFromSeed(bundle[:ed25519.SeedSize])
+	defer clear(private)
+	public := private.Public().(ed25519.PublicKey)
+	if !bytes.Equal(bundle[:ed25519.PrivateKeySize], private) ||
+		!bytes.Equal(bundle[ed25519.PrivateKeySize:n], public) {
+		return nil, nil, errors.New("release signing key has an inconsistent Sparkle Ed25519 export")
+	}
+	return bytes.Clone(text), public, nil
 }

@@ -293,3 +293,21 @@ func TestInstallationAPIBaseRequiresHTTPS(t *testing.T) {
 		}
 	}
 }
+
+func TestMintPolicyRejectsOverlappingBindings(t *testing.T) {
+	entry := AllowEntry{Subject: "subject", Keys: []string{"app"}}
+	restricted := entry
+	restricted.Repositories = []string{"repo"}
+	cfg := &Config{
+		Keys:      map[string]Key{"app": {AppID: 1, InstallationID: 1, PrivateKeyFile: "/unused"}},
+		Allowlist: []AllowEntry{entry, restricted},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "overlapping token policies") {
+		t.Fatalf("overlapping binding accepted: %v", err)
+	}
+	cfg.Allowlist[0].Repositories = []string{}
+	cfg.Allowlist = cfg.Allowlist[:1]
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("empty repository ceiling accepted")
+	}
+}

@@ -344,6 +344,24 @@ func (s *Server) handleTelegramWrappingKey(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(key)
 }
 
+// ValidateTelegramRelayFiles checks the mounted relay key pair without exposing it.
+func ValidateTelegramRelayFiles(relay config.TelegramRelay) error {
+	control, err := readTelegramKey(relay.ControlKeyFile)
+	if err != nil {
+		return fmt.Errorf("control key: %w", err)
+	}
+	defer clear(control)
+	wrapping, err := readTelegramKey(relay.WrappingKeyFile)
+	if err != nil {
+		return fmt.Errorf("wrapping key: %w", err)
+	}
+	defer clear(wrapping)
+	if bytes.Equal(control, wrapping) {
+		return errors.New("control and wrapping keys must be distinct")
+	}
+	return nil
+}
+
 func readTelegramKey(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {

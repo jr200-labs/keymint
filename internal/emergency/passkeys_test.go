@@ -88,7 +88,11 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = service.Close() }()
+	t.Cleanup(func() {
+		if !service.closed {
+			_ = service.Close()
+		}
+	})
 	service.now = func() time.Time { return time.Unix(59, 0) }
 	proof, err := service.Create(context.Background(), "caller", "totp", time.Minute)
 	if err != nil {
@@ -97,7 +101,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if _, err = service.VerifyTOTP("caller", proof.ID, "287082"); err != nil {
 		t.Fatal(err)
 	}
-	enrollment, err := service.BeginPasskeyEnrollment("caller", proof.ID)
+	enrollment, err := service.BeginLabeledPasskeyEnrollment("caller", proof.ID, "Ops hardware key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +112,21 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	}
 	if err = service.VerifyPasskey("caller", token, passkeyResponse(t, service, token, key, true, "https://keys.example", 1)); err != nil {
 		t.Fatal(err)
+	}
+	inventory, err := ListPasskeys(cfg.Passkeys.StateFile)
+	if err != nil || len(inventory) != 1 || inventory[0].Label != "Ops hardware key" {
+		t.Fatalf("unexpected passkey inventory: %+v, %v", inventory, err)
+	}
+	allowed := cfg.EmergencyProfiles["passkey"]
+	allowed.PasskeyCredentials = []string{inventory[0].ID}
+	cfg.EmergencyProfiles["passkey"] = allowed
+	restricted := allowed
+	restricted.PasskeyCredentials = []string{strings.Repeat("f", 64)}
+	cfg.EmergencyProfiles["other-operator"] = restricted
+	cfg.Allowlist[0].EmergencyProfiles = append(cfg.Allowlist[0].EmergencyProfiles, "other-operator")
+	service.Reload(cfg)
+	if _, err := service.Create(context.Background(), "caller", "other-operator", time.Minute); err == nil {
+		t.Fatal("unlisted credential available to a scoped profile")
 	}
 	for _, origin := range []string{"https://keys.example", "https://other.example"} {
 		session, err := service.Create(context.Background(), "caller", "passkey", time.Minute)
@@ -204,6 +223,25 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	err = service.VerifyPasskey("caller", token, httptest.NewRequest("POST", "/verify", nil))
 	if err == nil || !strings.Contains(err.Error(), "proof is no longer active") {
 		t.Fatalf("revoked enrollment proof: %v", err)
+	}
+
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RevokePasskey(cfg.Passkeys.StateFile, inventory[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := ListPasskeys(cfg.Passkeys.StateFile)
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("revoked credential still in inventory: %+v, %v", keys, err)
+	}
+	restarted, err := New(cfg, http.DefaultClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restarted.Close() }()
+	if _, err := restarted.Create(ctx, "caller", "passkey", time.Minute); err == nil {
+		t.Fatal("revoked passkey still available after restart")
 	}
 
 }

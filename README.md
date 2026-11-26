@@ -131,6 +131,26 @@ the deploy accordingly:
   requests without a `Content-Length` header. Bodies larger than 8 KiB
   return HTTP 413. Invalid scopes return HTTP 400.
 
+  To enforce least-privilege minting, set ceilings on a workload's
+  `allowlist` entry.
+
+  ```yaml
+  allowlist:
+    - subject: system:serviceaccount:ci:publisher
+      keys: [release-app]
+      repositories: [my-project]
+      permissions: {contents: write}
+      require_scope: true
+  ```
+
+  A repository or permission ceiling requires a nonempty explicit request for
+  that dimension. `require_scope: true` requires both dimensions. A `write`
+  ceiling allows `read` for the same permission. Other permission levels
+  require an exact match. Requests outside the allowed scope return HTTP 403
+  before Keymint contacts GitHub. Avoid overlapping entries for a restricted
+  subject and key. Entries without ceilings retain their previous behavior.
+  GitHub can still include mandatory permissions such as metadata access.
+
 - **GitHub API base URL.** Leave `keys.<name>.api_base_url` unset for
   `https://api.github.com`. For GitHub Enterprise Server, specify an
   absolute HTTPS URL such as `https://github.example.com/api/v3`. Keymint
@@ -392,6 +412,22 @@ session and does not require an additional organization permission on the App.
 Repository lookup still needs the existing App Secrets-read grant. Configure and
 approve any missing GitHub grants before operational acceptance.
 
+### Service preflight
+
+Run validation with the same mounted files the service will use. YAML
+validation rejects unknown fields. Service validation checks mounted signing
+keys, file-backed authentication settings, Telegram relay keys, and configured
+passkey IDs. Use `--against` with the currently running configuration to check
+restart-only settings before a hot reload.
+
+```sh
+keymint validate --service --config candidate.yaml
+keymint validate --service --config candidate.yaml --against current.yaml
+```
+
+Preflight uses local files and leaves service state intact. GitHub grants,
+Kubernetes RBAC, and network reachability require deployment checks.
+
 ### Emergency cleanup storage
 
 Service deployments with emergency profiles must configure
@@ -409,6 +445,10 @@ replicas. When migrating an existing `RollingUpdate` Deployment, clear
 omitting it from a server-side apply can retain the old field and reject the
 upgrade. Verify file permissions after remounting the volume: the generated
 cleanup key must remain owner-only.
+
+Use `keymint cleanup-status --state-file /path/to/state.db` to list pending
+session IDs and quarantined IDs with their timestamps. The command reads
+metadata only and works without the cleanup encryption key.
 
 If a cleanup record cannot be decrypted or repeatedly fails remote revocation,
 use the session ID in the cleanup error to identify it. Restore the original
@@ -428,6 +468,41 @@ event journal and removes the selected records from automatic revocation and
 its pending-cleanup metrics. Any credential left active can still be used
 until it expires or is revoked. Revoke affected OAuth grants or delete affected
 Kubernetes bound Secrets separately.
+
+### Passkey inventory and profile scoping
+
+Passkey enrollment accepts an optional `label` beside `proof_session_id` in
+`POST /emergency/passkeys/enrollments`. Enrollment still requires an active
+TOTP proof. The inventory shows labels, stable credential IDs, and any stored
+clone warning.
+
+```sh
+keymint passkeys list --state-file /path/to/passkeys.json
+keymint passkeys revoke CREDENTIAL_ID --state-file /path/to/passkeys.json
+```
+
+Stop Keymint before revoking a passkey. Replace its ID in any scoped profiles
+before restarting, or remove access to the affected profiles. A profile with
+no usable matching credentials cannot start a WebAuthn ceremony. Set
+`passkey_credentials: [CREDENTIAL_ID]` under any WebAuthn emergency or approval
+profile to restrict eligible credentials. For Telegram enrollment, set it
+on the relay's approval profile. Existing profiles without this setting
+continue to use the shared passkey inventory.
+
+### Journal retention
+
+Set `emergency_journal_retention: 720h` alongside `emergency_state_file` to
+prune terminal session histories and their approval rows 30 days after the
+last event. The minimum duration is `24h`. The janitor retains live sessions
+and sessions with pending cleanup records. Quarantined cleanup records are
+managed separately. Retention is disabled by default. SQLite can reuse freed
+pages for later events.
+
+Before enabling retention, verify that event consumers handle
+`history_truncated: true` on `GET /emergency/events`. It signals possible gaps
+before the supplied cursor. Reconcile outstanding session state, process the
+retained events, and continue from `next_cursor`. Export the journal separately
+if audit policy requires a longer history.
 
 ### Emergency lifecycle and consumer compatibility
 

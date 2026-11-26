@@ -12,7 +12,7 @@ import (
 )
 
 func TestServiceConfigRequiresRecoverableEmergencyStorage(t *testing.T) {
-	base := "keys:\n  app:\n    app_id: 1\n    install_id: 2\n    private_key_file: /run/key.pem\n"
+	base := "expected_audiences: [keymint]\nkeys:\n  app:\n    app_id: 1\n    install_id: 2\n    private_key_file: /run/key.pem\n"
 	emergency := "emergency_profiles:\n  ops:\n    provider: kubernetes\n    namespace: ops\n    service_account: admin\n    totp_secret_file: /run/totp\n"
 	for _, tc := range []struct {
 		name, yaml string

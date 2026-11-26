@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
@@ -88,6 +89,8 @@ type PasskeyEnrollment struct {
 }
 
 type passkeyCeremony struct {
+	label          string
+	credentials    []string
 	proofSessionID string
 	subject        string
 	sessionID      string
@@ -132,6 +135,7 @@ type Service struct {
 	events                 *eventStore
 	cleanup                *cleanupStore
 	now                    func() time.Time
+	journalRetention       time.Duration
 }
 
 const (
@@ -213,6 +217,7 @@ func (service *Service) Close() error {
 func (service *Service) Reload(cfg *config.Config) {
 	service.mu.Lock()
 	service.revision++
+	service.journalRetention, _ = cfg.JournalRetention()
 	service.profiles = make(map[string]config.EmergencyProfile, len(cfg.EmergencyProfiles))
 	for name, profile := range cfg.EmergencyProfiles {
 		service.profiles[name] = profile
@@ -381,7 +386,7 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 		if service.passkeys == nil {
 			return Session{}, errors.New("passkeys are unavailable")
 		}
-		options, data, err := service.passkeys.beginLogin()
+		options, data, err := service.passkeys.beginLogin(profile.PasskeyCredentials)
 		if err != nil {
 			return Session{}, err
 		}
@@ -396,7 +401,7 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 			ceremonyExpiry = session.ExpiresAt
 		}
 		ceremonyToken = token
-		ceremony = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", options: options, data: *data, expiresAt: ceremonyExpiry}
+		ceremony = passkeyCeremony{subject: subject, sessionID: id, kind: "authentication", credentials: profile.PasskeyCredentials, options: options, data: *data, expiresAt: ceremonyExpiry}
 	default:
 		return Session{}, errors.New("unsupported emergency authentication")
 	}
@@ -420,6 +425,14 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 }
 
 func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (PasskeyEnrollment, error) {
+	return service.BeginLabeledPasskeyEnrollment(subject, proofSessionID, "")
+}
+
+func (service *Service) BeginLabeledPasskeyEnrollment(subject, proofSessionID, label string) (PasskeyEnrollment, error) {
+	label = strings.TrimSpace(label)
+	if len(label) > 128 || strings.IndexFunc(label, unicode.IsControl) >= 0 {
+		return PasskeyEnrollment{}, errors.New("passkey label must be at most 128 bytes without control characters")
+	}
 	if service.passkeys == nil {
 		return PasskeyEnrollment{}, errors.New("passkeys are unavailable")
 	}
@@ -445,7 +458,7 @@ func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (
 	now := service.now().UTC()
 	enrollment := PasskeyEnrollment{ID: id, State: "awaiting_passkey", VerificationURI: service.passkeyVerificationURL + "/#" + token, ExpiresAt: now.Add(5 * time.Minute)}
 	service.mu.Lock()
-	service.ceremonies[token] = passkeyCeremony{proofSessionID: proofSessionID, subject: subject, kind: "registration", options: options, data: *data, expiresAt: enrollment.ExpiresAt}
+	service.ceremonies[token] = passkeyCeremony{proofSessionID: proofSessionID, subject: subject, kind: "registration", label: label, options: options, data: *data, expiresAt: enrollment.ExpiresAt}
 	service.mu.Unlock()
 	return enrollment, nil
 }
@@ -516,7 +529,7 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 	delete(service.ceremonies, token)
 	service.mu.Unlock()
 	if ceremony.sessionID != "" {
-		if err := service.passkeys.finishLogin(ceremony.data, request); err != nil {
+		if err := service.passkeys.finishLogin(ceremony.data, request, ceremony.credentials); err != nil {
 			return fmt.Errorf("verify passkey: %w", err)
 		}
 		service.mu.Lock()
@@ -546,11 +559,21 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) || service.closed {
 		return errors.New("passkey enrollment proof is no longer active")
 	}
-	_, err = service.passkeys.finishRegistration(ceremony.data, request)
+	_, err = service.passkeys.finishRegistration(ceremony.data, request, ceremony.label)
 	if err != nil {
 		return fmt.Errorf("register passkey: %w", err)
 	}
 	return nil
+}
+
+func (service *Service) PruneJournal(ctx context.Context) error {
+	service.mu.Lock()
+	retention := service.journalRetention
+	service.mu.Unlock()
+	if retention == 0 {
+		return nil
+	}
+	return service.events.prune(ctx, service.now().Add(-retention))
 }
 
 func (service *Service) Prune(ctx context.Context) error {
@@ -969,6 +992,28 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		return err
 	}
 	session.accessToken, session.State = token.AccessToken, Active
+	return nil
+}
+
+// ValidateProfileFiles checks file-backed authentication inputs without activating a session.
+func ValidateProfileFiles(profile config.EmergencyProfile) error {
+	switch profile.AuthenticationMethod() {
+	case "github_device":
+		_, _, _, err := githubIdentity(profile)
+		return err
+	case "totp":
+		value, err := os.ReadFile(profile.TOTPSecretFile)
+		if err != nil {
+			return err
+		}
+		defer clear(value)
+		secret := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(string(value)), " ", ""))
+		decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
+		defer clear(decoded)
+		if err != nil || len(decoded) < 16 {
+			return errors.New("TOTP secret must contain at least 16 base32-encoded bytes")
+		}
+	}
 	return nil
 }
 

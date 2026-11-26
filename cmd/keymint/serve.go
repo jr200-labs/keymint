@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -404,8 +405,8 @@ func loadServiceConfig(path string) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.EmergencyProfiles) > 0 && cfg.EmergencyStateFile == "" {
-		return nil, errors.New("serve: emergency_state_file is required for recoverable credential revocation")
+	if err := cfg.ValidateService(); err != nil {
+		return nil, fmt.Errorf("serve: %w", err)
 	}
 	return cfg, nil
 }
