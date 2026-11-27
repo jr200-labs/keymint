@@ -173,7 +173,7 @@ the deploy accordingly:
   values from right to left and uses the first valid IP outside the trusted
   ranges. A malformed hop encountered during the walk falls back to the peer IP.
   When the chain is absent or all its hops are trusted, Keymint uses a valid
-  untrusted `X-Real-IP` if present, then the peer IP. Both limiters keep buckets
+  untrusted IP from the last `X-Real-IP` header, then the peer IP. Both limiters keep buckets
   in maps without a fixed capacity and sweep fully refilled buckets every
   30 seconds.
 
@@ -251,12 +251,12 @@ the deploy accordingly:
   immediate peer is in one of those blocks, keymint walks the
   `X-Forwarded-For` chain right-to-left (then falls back to
   `X-Real-IP`) to recover the real client IP for the per-IP rate
-  limiter. Empty (the default) keeps using the raw peer address —
-  spoofing-safe but useless behind a proxy.
+  limiter. Include only addresses assigned to proxies that sanitize incoming
+  forwarding headers. An empty list uses the immediate peer address.
 
   ```yaml
   trusted_proxies:
-    - 10.0.0.0/8        # cluster pod CIDR
+    - 10.0.42.7/32      # specific ingress proxy
     - 192.168.1.5/32    # specific load balancer
   ```
 
@@ -351,10 +351,13 @@ authorization starts. For example, an administrative profile containing `repo`,
 `workflow`, using the same OAuth application and workload allowlist. Omit the
 field to retain the configured profile's normal permissions.
 
-The session exposes its restriction as `scopes`. Restricted sessions validate
-the scopes returned by GitHub at token exchange; missing, extra or insufficient
-grants are rejected and token revocation is attempted. This prevents prior OAuth
-authorizations from silently broadening a reduced request. OAuth `repo` remains
+The session exposes any explicit restriction as `scopes`. Every GitHub user
+session checks that the scopes returned by GitHub match the requested scopes
+or, when omitted, the profile scopes. On mismatch, Keymint rejects the grant
+and attempts token revocation. This prevents prior OAuth authorizations from
+silently broadening a request. Configure scope lists in
+[GitHub's normalized form](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps#normalized-scopes)
+by omitting scopes already implied by another entry. OAuth `repo` remains
 a broad permission, not a per-repository restriction. Consumers must enforce
 their own operation and repository approvals and must not reuse a broader session.
 
@@ -562,7 +565,8 @@ Omit the TTL for five minutes. Approval profiles allow up to one hour by
 default, and `max_ttl` can set a lower ceiling. Include the
 task identity, request ID and operation policy in the digest. The passkey
 ceremony returns the review label and expiry so the user can review the
-action before authenticating.
+action before authenticating. The approval keeps the expiry set at session
+creation, including the time spent waiting for passkey verification.
 
 After verification, send the same digest to
 `POST /emergency/sessions/{id}/redeem-approval` as the same workload.

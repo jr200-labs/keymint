@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/jr200-labs/keymint/internal/tracing"
 	"io"
 	"net/http"
 	"net/url"
@@ -26,14 +25,16 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jr200-labs/keymint/internal/config"
 	"github.com/jr200-labs/keymint/internal/logging"
 	"github.com/jr200-labs/keymint/internal/metrics"
+	"github.com/jr200-labs/keymint/internal/tracing"
 	"go.uber.org/zap"
 )
 
-var errScopeMismatch = errors.New("GitHub granted scopes do not match the restricted request; token rejected")
+var errScopeMismatch = errors.New("GitHub granted scopes do not match the request; token rejected")
 
 type State string
 
@@ -157,7 +158,7 @@ func New(cfg *config.Config, client *http.Client, issuer TokenIssuer, instrument
 		_ = events.close()
 		return nil, err
 	}
-	service := &Service{cleanup: cleanup, http: tracing.HTTPClient(client), issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, creating: map[string]string{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
+	service := &Service{cleanup: cleanup, http: tracing.ExternalHTTPClient(client), issuer: issuer, passkeys: manager, sessions: map[string]*Session{}, creating: map[string]string{}, ceremonies: map[string]passkeyCeremony{}, events: events, now: time.Now}
 	if len(instruments) > 0 {
 		service.metrics = instruments[0]
 		events.metrics = instruments[0]
@@ -287,9 +288,13 @@ func (service *Service) CreateWithScopes(ctx context.Context, subject, profileNa
 	return service.create(ctx, subject, profileName, requestedTTL, scopes, "", "")
 }
 
+func labelControl(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r)
+}
+
 func (service *Service) CreateApproval(ctx context.Context, subject, profileName string, ttl time.Duration, digest, label string) (Session, error) {
 	decoded, err := hex.DecodeString(digest)
-	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 3000 || strings.ContainsAny(label, "\r\n") {
+	if err != nil || len(decoded) != 32 || strings.TrimSpace(label) == "" || len(label) > 3000 || strings.IndexFunc(label, labelControl) >= 0 {
 		return Session{}, errors.New("approval requires a SHA-256 digest and a review label")
 	}
 	if ttl == 0 {
@@ -401,7 +406,7 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 		session.State = AwaitingPasskey
 		session.VerificationURI = service.passkeyVerificationURL + "/#" + token
 		ceremonyExpiry := now.Add(5 * time.Minute)
-		if digest != "" {
+		if digest != "" || session.ExpiresAt.Before(ceremonyExpiry) {
 			ceremonyExpiry = session.ExpiresAt
 		}
 		ceremonyToken = token
@@ -413,6 +418,10 @@ func (service *Service) create(ctx context.Context, subject, profileName string,
 	if service.closed || service.revision != revision || !service.allowed[subject][profileName] || !session.ExpiresAt.After(service.now()) {
 		service.mu.Unlock()
 		return Session{}, errors.New("session expired or authorization changed during creation")
+	}
+	if ceremonyToken != "" && !service.hasCeremonyCapacityLocked(subject) {
+		service.mu.Unlock()
+		return Session{}, errors.New("passkey ceremony capacity reached")
 	}
 	if err := service.record(ctx, "session.created", session); err != nil {
 		service.mu.Unlock()
@@ -434,7 +443,7 @@ func (service *Service) BeginPasskeyEnrollment(subject, proofSessionID string) (
 
 func (service *Service) BeginLabeledPasskeyEnrollment(subject, proofSessionID, label string) (PasskeyEnrollment, error) {
 	label = strings.TrimSpace(label)
-	if len(label) > 128 || strings.IndexFunc(label, unicode.IsControl) >= 0 {
+	if len(label) > 128 || strings.IndexFunc(label, labelControl) >= 0 {
 		return PasskeyEnrollment{}, errors.New("passkey label must be at most 128 bytes without control characters")
 	}
 	if service.passkeys == nil {
@@ -442,7 +451,7 @@ func (service *Service) BeginLabeledPasskeyEnrollment(subject, proofSessionID, l
 	}
 	service.mu.Lock()
 	proof, err := service.ownedSession(subject, proofSessionID)
-	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) {
+	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) || service.closed {
 		service.mu.Unlock()
 		return PasskeyEnrollment{}, errors.New("an active TOTP-authenticated session is required")
 	}
@@ -462,26 +471,37 @@ func (service *Service) BeginLabeledPasskeyEnrollment(subject, proofSessionID, l
 	now := service.now().UTC()
 	enrollment := PasskeyEnrollment{ID: id, State: "awaiting_passkey", VerificationURI: service.passkeyVerificationURL + "/#" + token, ExpiresAt: now.Add(5 * time.Minute)}
 	service.mu.Lock()
+	proof, err = service.ownedSession(subject, proofSessionID)
+	if err != nil || proof.State != Active || !proof.ExpiresAt.After(service.now()) || service.closed {
+		service.mu.Unlock()
+		return PasskeyEnrollment{}, errors.New("passkey enrollment proof is no longer active")
+	}
+	if !service.hasCeremonyCapacityLocked(subject) {
+		service.mu.Unlock()
+		return PasskeyEnrollment{}, errors.New("passkey ceremony capacity reached")
+	}
+	if proof.ExpiresAt.Before(enrollment.ExpiresAt) {
+		enrollment.ExpiresAt = proof.ExpiresAt
+	}
 	service.ceremonies[token] = passkeyCeremony{proofSessionID: proofSessionID, subject: subject, kind: "registration", label: label, options: options, data: *data, expiresAt: enrollment.ExpiresAt}
 	service.mu.Unlock()
 	return enrollment, nil
 }
 
-// ApprovalDurationHeader carries the owner's selection on the passkey submission.
+// ApprovalDurationHeader is accepted for older clients if it matches the session TTL.
 const ApprovalDurationHeader = "X-Padd-Approval-Duration"
 
-func approvalDurations(profile config.EmergencyProfile) []int {
-	maxTTL, err := profile.TTL()
-	if err != nil {
-		return nil
-	}
-	var choices []int
-	for _, minutes := range []int{5, 15, 30, 60} {
-		if time.Duration(minutes)*time.Minute <= maxTTL {
-			choices = append(choices, minutes)
+func (service *Service) hasCeremonyCapacityLocked(subject string) bool {
+	now := service.now()
+	count := 0
+	for token, ceremony := range service.ceremonies {
+		if !ceremony.expiresAt.After(now) {
+			delete(service.ceremonies, token)
+		} else if ceremony.subject == subject {
+			count++
 		}
 	}
-	return choices
+	return count < maxSessionsPerSubject && len(service.ceremonies) < maxSessions
 }
 
 func (service *Service) PasskeyOptions(subject, token string) (map[string]any, error) {
@@ -498,15 +518,6 @@ func (service *Service) PasskeyOptions(subject, token string) (map[string]any, e
 		}
 		options["approval_label"] = session.ApprovalLabel
 		options["expires_at"] = session.ExpiresAt
-		choices := approvalDurations(session.profile)
-		if len(choices) > 0 {
-			options["approval_duration_minutes"] = choices
-			preferred := int(session.approvalTTL / time.Minute)
-			if !slices.Contains(choices, preferred) {
-				preferred = choices[0]
-			}
-			options["default_approval_duration_minutes"] = preferred
-		}
 	}
 	return options, nil
 }
@@ -518,22 +529,35 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 		service.mu.Unlock()
 		return errors.New("passkey ceremony not found or expired")
 	}
-	var duration time.Duration
 	if values := request.Header.Values(ApprovalDurationHeader); len(values) > 0 {
 		session := service.sessions[ceremony.sessionID]
 		minutes, err := strconv.Atoi(values[0])
 		if len(values) != 1 || err != nil || session == nil || session.Provider != "approval" ||
-			session.State != AwaitingPasskey || !session.ExpiresAt.After(service.now()) ||
-			!slices.Contains(approvalDurations(session.profile), minutes) {
+			session.approvalTTL%time.Minute != 0 || minutes != int(session.approvalTTL/time.Minute) {
 			service.mu.Unlock()
 			return errors.New("invalid REST approval duration")
 		}
-		duration = time.Duration(minutes) * time.Minute
 	}
 	delete(service.ceremonies, token)
 	service.mu.Unlock()
+
+	const maxPasskeyResponse = 64 << 10
+	if request.Body == nil {
+		return errors.New("missing passkey response")
+	}
+	body, err := io.ReadAll(io.LimitReader(request.Body, maxPasskeyResponse+1))
+	if err != nil {
+		return fmt.Errorf("read passkey response: %w", err)
+	}
+	if len(body) > maxPasskeyResponse {
+		return errors.New("passkey response is too large")
+	}
 	if ceremony.sessionID != "" {
-		if err := service.passkeys.finishLogin(ceremony.data, request, ceremony.credentials); err != nil {
+		assertion, err := protocol.ParseCredentialRequestResponseBytes(body)
+		if err != nil {
+			return fmt.Errorf("parse passkey assertion: %w", err)
+		}
+		if err := service.passkeys.finishLogin(ceremony.data, assertion, ceremony.credentials); err != nil {
 			return fmt.Errorf("verify passkey: %w", err)
 		}
 		service.mu.Lock()
@@ -542,20 +566,17 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 			service.mu.Unlock()
 			return errors.New("emergency session is unavailable")
 		}
-		if !session.ExpiresAt.After(service.now()) {
+		if !ceremony.expiresAt.After(service.now()) {
 			service.mu.Unlock()
-			return errors.New("session expired during passkey verification")
+			return errors.New("passkey ceremony expired during verification")
 		}
-		previousExpiry := session.ExpiresAt
-		if duration > 0 {
-			session.ExpiresAt = service.now().UTC().Add(duration)
-		}
-		err := service.transitionLocked(request.Context(), session, Active, "session.activated")
-		if err != nil {
-			session.ExpiresAt = previousExpiry
-		}
+		err = service.transitionLocked(request.Context(), session, Active, "session.activated")
 		service.mu.Unlock()
 		return err
+	}
+	attestation, err := protocol.ParseCredentialCreationResponseBytes(body)
+	if err != nil {
+		return fmt.Errorf("parse passkey registration: %w", err)
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -563,7 +584,10 @@ func (service *Service) VerifyPasskey(subject, token string, request *http.Reque
 	if err != nil || proof.State != Active || proof.Authentication != "totp" || !proof.ExpiresAt.After(service.now()) || service.closed {
 		return errors.New("passkey enrollment proof is no longer active")
 	}
-	_, err = service.passkeys.finishRegistration(ceremony.data, request, ceremony.label)
+	if !ceremony.expiresAt.After(service.now()) {
+		return errors.New("passkey ceremony expired during verification")
+	}
+	_, err = service.passkeys.finishRegistration(ceremony.data, attestation, ceremony.label)
 	if err != nil {
 		return fmt.Errorf("register passkey: %w", err)
 	}
@@ -668,6 +692,7 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	// it; removal and expiry remain possible while network I/O is in progress.
 	service.mu.Unlock()
 	err = service.pollGitHub(ctx, &copy, profile)
+	copy.nextPoll = service.now().Add(copy.pollEvery)
 	service.mu.Lock()
 	current := service.sessions[id]
 	valid := current == session && current.State == AwaitingGitHub && current.ExpiresAt.After(service.now())
@@ -683,11 +708,19 @@ func (service *Service) Get(ctx context.Context, subject, id string) (Session, e
 	if err != nil {
 		cleanupCtx := context.WithoutCancel(ctx)
 		remove := false
+		if valid {
+			current.nextPoll = copy.nextPoll
+		}
 		if valid && copy.deviceCode == "" {
-			// The device exchange consumed the code. Fail closed if validation,
-			// activation, or cleanup scheduling failed.
-			journalErr := service.transitionLocked(cleanupCtx, current, Invalidated, eventFor(Invalidated))
-			remove = journalErr == nil
+			// The device code is no longer usable. Withdraw the session even
+			// if writing its lifecycle event fails.
+			state := Invalidated
+			if copy.State == Expired {
+				state = Expired
+			}
+			current.deviceCode = ""
+			journalErr := service.transitionLocked(cleanupCtx, current, state, eventFor(state))
+			remove = journalErr == nil && state != Expired
 			err = errors.Join(err, journalErr)
 		}
 		service.mu.Unlock()
@@ -810,9 +843,9 @@ func (service *Service) Credential(ctx context.Context, subject, id string) (Cre
 		return Credential{}, err
 	}
 	if err := service.rememberCredential(ctx, session.ID, profile, session.accessToken, secret, session.ExpiresAt); err != nil {
-		_ = service.issuer.Revoke(context.WithoutCancel(ctx), profile.Namespace, secret)
 		service.mu.Unlock()
-		return Credential{}, err
+		cleanupErr := service.issuer.Revoke(context.WithoutCancel(ctx), profile.Namespace, secret)
+		return Credential{}, errors.Join(err, cleanupErr)
 	}
 	session.boundSecret = secret
 	if session.ExpiresAt.Before(expiresAt) {
@@ -989,14 +1022,20 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		return fmt.Errorf("poll GitHub device flow: %w", err)
 	}
 	if token.AccessToken == "" {
-		if token.Error != "" && token.Error != "authorization_pending" && token.Error != "slow_down" {
-			return fmt.Errorf("GitHub device flow: %s", token.Error)
-		}
-		if token.Error == "slow_down" {
+		switch token.Error {
+		case "authorization_pending":
+			return nil
+		case "slow_down":
 			session.pollEvery += 5 * time.Second
+			return nil
+		case "expired_token", "token_expired":
+			session.deviceCode = ""
+			session.State = Expired
+		case "access_denied", "incorrect_device_code", "incorrect_client_credentials",
+			"unsupported_grant_type", "device_flow_disabled":
+			session.deviceCode = ""
 		}
-		session.nextPoll = service.now().Add(session.pollEvery)
-		return nil
+		return errors.New("GitHub device flow did not issue a token")
 	}
 	session.deviceCode = ""
 	// Stage cleanup with the identity read before the exchange. The record
@@ -1008,11 +1047,17 @@ func (service *Service) pollGitHub(ctx context.Context, session *Session, profil
 		return fmt.Errorf("persist credential cleanup: %w", err)
 	}
 	session.accessToken = token.AccessToken
-	if len(session.Scopes) > 0 {
+	if profile.Provider == "github_user" {
+		expected := session.Scopes
+		if len(expected) == 0 {
+			expected = slices.Clone(profile.Scopes)
+			slices.Sort(expected)
+			expected = slices.Compact(expected)
+		}
 		granted := strings.FieldsFunc(token.Scope, func(r rune) bool { return r == ',' || r == ' ' })
 		slices.Sort(granted)
 		granted = slices.Compact(granted)
-		if !slices.Equal(granted, session.Scopes) {
+		if !slices.Equal(granted, expected) {
 			return errScopeMismatch
 		}
 	}
@@ -1109,14 +1154,18 @@ func (service *Service) revokeCredential(ctx context.Context, credential revoked
 				result = errors.Join(result, err)
 			} else {
 				defer func() { _ = response.Body.Close() }()
-				if response.StatusCode != http.StatusNotFound && (response.StatusCode < 200 || response.StatusCode >= 300) {
+				if response.StatusCode != http.StatusNotFound && response.StatusCode != http.StatusNoContent {
 					result = errors.Join(result, fmt.Errorf("revoke GitHub token: HTTP %d", response.StatusCode))
 				}
 			}
 		}
 	}
-	if credential.secret != "" && service.issuer != nil {
-		result = errors.Join(result, service.issuer.Revoke(ctx, credential.profile.Namespace, credential.secret))
+	if credential.secret != "" {
+		if service.issuer == nil {
+			result = errors.Join(result, errors.New("Kubernetes issuer unavailable for credential cleanup"))
+		} else {
+			result = errors.Join(result, service.issuer.Revoke(ctx, credential.profile.Namespace, credential.secret))
+		}
 	}
 	if result == nil && credential.id != "" {
 		result = service.cleanup.remove(ctx, credential.id)

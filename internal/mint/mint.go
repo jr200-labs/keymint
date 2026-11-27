@@ -393,7 +393,7 @@ func doExchangeForInstallationToken(ctx context.Context, appJWT string, req Requ
 			req.OnExchange(apiBase, status, time.Since(started))
 		}
 	}()
-	resp, err := tracing.HTTPClient(client).Do(httpReq)
+	resp, err := tracing.ExternalHTTPClient(client).Do(httpReq)
 	if err != nil {
 		return exchangeResult{}, fmt.Errorf("mint: POST access_tokens: %w", err)
 	}

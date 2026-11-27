@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 
 	"github.com/jr200-labs/keymint/internal/config"
 )
@@ -114,17 +115,17 @@ func parseAttributes(r io.Reader) (map[string]string, error) {
 }
 
 // reconstructURL builds an HTTPS-style URL from the credential
-// attributes git sent. Returns empty string if host is missing.
+// attributes git sent. Returns empty string if host is missing or malformed.
 func reconstructURL(attrs map[string]string) string {
 	host := attrs["host"]
-	if host == "" {
+	if host == "" || strings.ContainsAny(host, "/?#@\\") || strings.IndexFunc(host, unicode.IsSpace) >= 0 {
 		return ""
 	}
 	protocol := attrs["protocol"]
 	if protocol == "" {
 		protocol = "https"
 	}
-	path := attrs["path"]
+	path := strings.TrimLeft(attrs["path"], "/")
 	if path == "" {
 		return fmt.Sprintf("%s://%s", protocol, host)
 	}

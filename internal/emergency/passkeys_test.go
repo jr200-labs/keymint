@@ -14,12 +14,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/jr200-labs/keymint/internal/config"
 )
 
@@ -183,21 +183,21 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	}
 	_, approvalToken, _ := strings.Cut(approval.VerificationURI, "#")
 	options, err := service.PasskeyOptions("caller", approvalToken)
-	if err != nil || !reflect.DeepEqual(options["approval_duration_minutes"], []int{5, 15, 30, 60}) || options["default_approval_duration_minutes"] != 5 {
-		t.Fatalf("approval duration options = %v, error = %v", options["approval_duration_minutes"], err)
+	if err != nil || options["expires_at"] != approval.ExpiresAt || options["approval_duration_minutes"] != nil {
+		t.Fatalf("approval options = %v, error = %v", options, err)
 	}
 	approvalRequest := passkeyResponse(t, service, approvalToken, key, false, "https://keys.example", 3)
-	approvalRequest.Header.Set(ApprovalDurationHeader, "90")
-	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err == nil {
-		t.Fatal("accepted a duration above the profile maximum")
-	}
 	approvalRequest.Header.Set(ApprovalDurationHeader, "30")
+	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err == nil {
+		t.Fatal("accepted a duration different from the session TTL")
+	}
+	approvalRequest.Header.Set(ApprovalDurationHeader, "5")
 	if err := service.VerifyPasskey("caller", approvalToken, approvalRequest); err != nil {
 		t.Fatal(err)
 	}
 	active, err := service.Get(ctx, "caller", approval.ID)
-	if err != nil || active.State != Active || !active.ExpiresAt.Equal(service.now().Add(30*time.Minute)) || active.ApprovalDigest != digest {
-		t.Fatalf("owner-selected approval = %v, error = %v", active, err)
+	if err != nil || active.State != Active || !active.ExpiresAt.Equal(approval.ExpiresAt) || active.ApprovalDigest != digest {
+		t.Fatalf("fixed-duration approval = %v, error = %v", active, err)
 	}
 	enrollment, err = service.BeginPasskeyEnrollment("caller", proof.ID)
 	if err != nil {
@@ -208,7 +208,7 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = service.VerifyPasskey("caller", token, httptest.NewRequest("POST", "/verify", nil))
-	if err == nil || !strings.Contains(err.Error(), "proof is no longer active") {
+	if err == nil || !strings.Contains(err.Error(), "ceremony not found or expired") {
 		t.Fatalf("revoked enrollment proof: %v", err)
 	}
 
@@ -248,7 +248,11 @@ func TestPasskeyEnrollmentAuthenticationAndOriginRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.passkeys.finishLogin(laterData, afterRestartRequest, allowed.PasskeyCredentials); err == nil {
+	assertion, err := protocol.ParseCredentialRequestResponse(afterRestartRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.passkeys.finishLogin(laterData, assertion, allowed.PasskeyCredentials); err == nil {
 		t.Error("flagged credential accepted after restart")
 	}
 	if err := restarted.Close(); err != nil {

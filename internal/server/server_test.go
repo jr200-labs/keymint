@@ -830,7 +830,8 @@ func TestClientIP_TrustsXFFOnlyFromConfiguredCIDRs(t *testing.T) {
 				r.Header.Set("X-Forwarded-For", tc.xff)
 			}
 			if tc.realIP != "" {
-				r.Header.Set("X-Real-IP", tc.realIP)
+				r.Header.Add("X-Real-IP", "203.0.113.1")
+				r.Header.Add("X-Real-IP", tc.realIP)
 			}
 			if got := clientIP(r, tc.trusted); got != tc.want {
 				t.Errorf("clientIP = %q, want %q", got, tc.want)

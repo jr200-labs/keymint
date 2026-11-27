@@ -29,9 +29,12 @@ func activeEmergency(t *testing.T, cfg *config.Config, apiBase ...string) (*emer
 	}
 	cfg.Allowlist[0].EmergencyProfiles = []string{"human"}
 	client := &http.Client{Transport: emergencyTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+		}
 		body := `{"device_code":"test","user_code":"test","verification_uri":"https://github.com/login/device","interval":5}`
 		if strings.HasSuffix(r.URL.Path, "access_token") {
-			body = `{"access_token":"synthetic"}`
+			body = `{"access_token":"synthetic","scope":"admin:org,repo"}`
 		}
 		if strings.HasSuffix(r.URL.Path, "/user") {
 			body = `{"id":1}`

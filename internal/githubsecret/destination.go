@@ -85,7 +85,6 @@ func Resolve(ctx context.Context, client *http.Client, base, token string, targe
 	if bounded.Timeout == 0 {
 		bounded.Timeout = 15 * time.Second
 	}
-	bounded.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	path := "/orgs/" + url.PathEscape(target.Owner)
 	if target.Scope == Repository {
 		path = "/repos/" + url.PathEscape(target.Owner) + "/" + url.PathEscape(target.Repository)
@@ -96,7 +95,7 @@ func Resolve(ctx context.Context, client *http.Client, base, token string, targe
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Accept", "application/vnd.github+json")
-	response, err := tracing.HTTPClient(&bounded).Do(request)
+	response, err := tracing.ExternalHTTPClient(&bounded).Do(request)
 	if err != nil {
 		return Destination{}, fmt.Errorf("resolve Actions encryption key: %w", err)
 	}
