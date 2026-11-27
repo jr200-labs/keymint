@@ -66,6 +66,13 @@ func (service *Service) transitionLocked(ctx context.Context, session *Session, 
 	if err == nil || state != Active {
 		session.State = state
 		session.withdrawalEventPending = err != nil
+		if state != Active {
+			for token, ceremony := range service.ceremonies {
+				if ceremony.sessionID == session.ID || ceremony.proofSessionID == session.ID {
+					delete(service.ceremonies, token)
+				}
+			}
+		}
 	}
 	return err
 }

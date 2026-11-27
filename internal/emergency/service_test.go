@@ -266,9 +266,21 @@ func TestGitHubCredentialIsRevokedRemotely(t *testing.T) {
 	}
 }
 
-func TestRestrictedGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
-	for _, granted := range []string{"repo,workflow", "admin:org,repo,workflow", "repo", ""} {
-		t.Run(granted, func(t *testing.T) {
+func TestGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name, granted, expected string
+		request                 []string
+		allowed                 bool
+	}{
+		{"restricted exact", "repo,workflow", "repo workflow", []string{"workflow", "repo"}, true},
+		{"restricted extra", "admin:org,repo,workflow", "repo workflow", []string{"workflow", "repo"}, false},
+		{"restricted missing", "repo", "repo workflow", []string{"workflow", "repo"}, false},
+		{"restricted empty", "", "repo workflow", []string{"workflow", "repo"}, false},
+		{"profile exact", "admin:org,repo,workflow", "repo workflow admin:org", nil, true},
+		{"profile extra", "admin:org,repo,workflow,gist", "repo workflow admin:org", nil, false},
+		{"profile missing", "repo,workflow", "repo workflow admin:org", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			requested, revoked := "", false
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -277,7 +289,7 @@ func TestRestrictedGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
 					requested = r.Form.Get("scope")
 					_ = json.NewEncoder(w).Encode(map[string]any{"device_code": "device", "user_code": "ABCD-EFGH", "verification_uri": "https://github.com/login/device", "interval": 5})
 				case "/login/oauth/access_token":
-					_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "test-token", "scope": granted})
+					_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "test-token", "scope": tc.granted})
 				case "/user":
 					_ = json.NewEncoder(w).Encode(map[string]int64{"id": 42})
 				case "/applications/client/token":
@@ -305,17 +317,17 @@ func TestRestrictedGitHubSessionChecksRequestedAndGrantedScopes(t *testing.T) {
 			if _, err = service.CreateWithScopes(ctx, "allowed", "operator", time.Minute, []string{"delete_repo"}); err == nil || requested != "" {
 				t.Fatal("scope escalation reached OAuth")
 			}
-			session, err := service.CreateWithScopes(ctx, "allowed", "operator", time.Minute, []string{"workflow", "repo"})
+			session, err := service.CreateWithScopes(ctx, "allowed", "operator", time.Minute, tc.request)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if requested != "repo workflow" {
+			if requested != tc.expected {
 				t.Fatalf("requested excessive scopes: %q", requested)
 			}
 			result, err := service.Get(ctx, "allowed", session.ID)
-			if granted == "repo,workflow" {
+			if tc.allowed {
 				if err != nil || result.State != Active || revoked {
-					t.Fatalf("restricted auth failed: %v %+v", err, result)
+					t.Fatalf("device flow failed: %v %+v", err, result)
 				}
 				credential, err := service.Credential(ctx, "allowed", session.ID)
 				if err != nil || credential.Token != "test-token" {
@@ -430,5 +442,53 @@ func TestGitHubDeviceRejectsOAuthErrorsAndIncompleteChallenges(t *testing.T) {
 		if err != nil || len(page.Events) != 0 || len(service.sessions) != 0 || len(service.creating) != 0 {
 			t.Fatalf("malformed response left session, events, or reservation: %+v, %v", page, err)
 		}
+	}
+}
+
+func TestGitHubDevicePollingTransitionsAfterTransientFailure(t *testing.T) {
+	ctx := context.Background()
+	polls := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/login/device/code" {
+			body := `{"device_code":"code","user_code":"user","verification_uri":"https://github.com/login/device","interval":5}`
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
+		polls++
+		if polls == 1 {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"error":"expired_token"}`))}, nil
+	})}
+	cfg := &config.Config{
+		EmergencyProfiles: map[string]config.EmergencyProfile{"human": {Provider: "github_user", ClientID: "client", ClientSecret: "secret", AllowedUserIDs: []int64{1}}},
+		Allowlist:         []config.AllowEntry{{Subject: "caller", EmergencyProfiles: []string{"human"}}},
+	}
+	service, err := New(cfg, client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	now := time.Now()
+	service.now = func() time.Time { return now }
+	session, err := service.Create(ctx, "caller", "human", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Get(ctx, "caller", session.ID); err == nil {
+		t.Fatal("upstream failure was not reported")
+	}
+	if current, err := service.Get(ctx, "caller", session.ID); err != nil || current.State != AwaitingGitHub || polls != 1 {
+		t.Fatalf("poll backoff: state=%s polls=%d err=%v", current.State, polls, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := service.Get(ctx, "caller", session.ID); err == nil {
+		t.Fatal("device code expiry was not reported")
+	}
+	if current, err := service.Get(ctx, "caller", session.ID); err != nil || current.State != Expired || polls != 2 {
+		t.Fatalf("terminal poll: state=%s polls=%d err=%v", current.State, polls, err)
+	}
+	page, err := service.Events(ctx, "caller", "", 0)
+	if err != nil || len(page.Events) != 2 || page.Events[1].Type != "session.expired" {
+		t.Fatalf("expiry journal: events=%+v err=%v", page.Events, err)
 	}
 }

@@ -14,6 +14,16 @@ import (
 // HTTPClient copies the client and instruments its transport. It never records
 // URLs, headers or payloads, which may contain credential or ceremony material.
 func HTTPClient(client *http.Client) *http.Client {
+	return instrumentHTTPClient(client, false)
+}
+
+// ExternalHTTPClient restricts GitHub requests to the original endpoint and
+// propagates trace context without forwarding baggage.
+func ExternalHTTPClient(client *http.Client) *http.Client {
+	return instrumentHTTPClient(client, true)
+}
+
+func instrumentHTTPClient(client *http.Client, external bool) *http.Client {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -22,18 +32,32 @@ func HTTPClient(client *http.Client) *http.Client {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	if _, ok := transport.(*httpTransport); !ok {
-		copy.Transport = &httpTransport{next: transport}
+	if existing, ok := transport.(*httpTransport); ok {
+		transport = existing.next
+		external = external || existing.external
+	}
+	copy.Transport = &httpTransport{next: transport, external: external}
+	if external {
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
 	return &copy
 }
 
-type httpTransport struct{ next http.RoundTripper }
+type httpTransport struct {
+	next     http.RoundTripper
+	external bool
+}
 
 func (transport *httpTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	ctx, span := otel.Tracer("keymint/http").Start(request.Context(), "HTTP "+request.Method, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.String("http.request.method", request.Method), attribute.String("server.address", request.URL.Hostname())))
 	copy := request.Clone(ctx)
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(copy.Header))
+	carrier := propagation.HeaderCarrier(copy.Header)
+	if transport.external {
+		copy.Header.Del("Baggage")
+		propagation.TraceContext{}.Inject(ctx, carrier)
+	} else {
+		otel.GetTextMapPropagator().Inject(ctx, carrier)
+	}
 	response, err := transport.next.RoundTrip(copy)
 	if err != nil {
 		span.SetStatus(codes.Error, "transport failure")

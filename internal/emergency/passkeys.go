@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -154,11 +153,11 @@ func (manager *passkeys) beginLogin(allowed []string) (any, *webauthn.SessionDat
 	return manager.web.BeginLogin(&user, webauthn.WithUserVerification(protocol.VerificationRequired))
 }
 
-func (manager *passkeys) finishLogin(session webauthn.SessionData, request *http.Request, allowed []string) error {
+func (manager *passkeys) finishLogin(session webauthn.SessionData, assertion *protocol.ParsedCredentialAssertionData, allowed []string) error {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	user := manager.loginUser(allowed)
-	credential, err := manager.web.FinishLogin(&user, session, request)
+	credential, err := manager.web.ValidateLogin(&user, session, assertion)
 	if err != nil {
 		return err
 	}
@@ -190,10 +189,10 @@ func (manager *passkeys) beginRegistration() (any, *webauthn.SessionData, error)
 	)
 }
 
-func (manager *passkeys) finishRegistration(session webauthn.SessionData, request *http.Request, label string) (*webauthn.Credential, error) {
+func (manager *passkeys) finishRegistration(session webauthn.SessionData, attestation *protocol.ParsedCredentialCreationData, label string) (*webauthn.Credential, error) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	credential, err := manager.web.FinishRegistration(&manager.user, session, request)
+	credential, err := manager.web.CreateCredential(&manager.user, session, attestation)
 	if err != nil {
 		return nil, err
 	}

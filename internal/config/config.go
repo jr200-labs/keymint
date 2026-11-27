@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -566,7 +567,7 @@ func (c *Config) ParsedTrustedProxies() ([]*net.IPNet, error) {
 
 // FindByGitHubURL returns the Key whose GitHubOwner matches the owner
 // segment parsed from the given git remote URL. Returns the key name,
-// the Key, and a hit flag.
+// the Key, and a hit flag. Ties use the first key name in lexical order.
 //
 // Used by the git credential helper to route remotes to the right
 // App. Handles HTTPS and SCP-style / ssh:// URL forms.
@@ -597,7 +598,8 @@ func (c *Config) FindByGitHubURL(gitURL string) (string, *Key, bool) {
 	if owner == "" {
 		return "", nil, false
 	}
-	for name, k := range c.Keys {
+	for _, name := range slices.Sorted(maps.Keys(c.Keys)) {
+		k := c.Keys[name]
 		expectedHost, expectedPort := "github.com", ""
 		if k.APIBaseURL != "" {
 			endpoint, err := url.Parse(k.APIBaseURL)

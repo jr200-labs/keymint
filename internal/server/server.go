@@ -1016,8 +1016,10 @@ func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 		}
 	}
 	// Fall back to X-Real-IP if XFF was absent or all-trusted.
-	if real := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); real != nil && !ipInCIDRs(real.String(), trustedProxies) {
-		return real.String()
+	if values := r.Header.Values("X-Real-IP"); len(values) > 0 {
+		if real := net.ParseIP(strings.TrimSpace(values[len(values)-1])); real != nil && !ipInCIDRs(real.String(), trustedProxies) {
+			return real.String()
+		}
 	}
 	return host
 }
