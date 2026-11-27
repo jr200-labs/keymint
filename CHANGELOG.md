@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.1](https://github.com/jr200-labs/keymint/compare/v1.14.0...v1.14.1) (2026-11-27)
+
+
+### Bug Fixes
+
+* harden keymint emergency credential handling ([#154](https://github.com/jr200-labs/keymint/issues/154)) ([45153b1](https://github.com/jr200-labs/keymint/commit/45153b1b23e8a0c8146fe4807b569081f3d0100a))
+
 ## [1.14.0](https://github.com/jr200-labs/keymint/compare/v1.13.2...v1.14.0) (2026-11-26)
 
 
