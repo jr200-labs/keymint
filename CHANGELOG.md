@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.0.0](https://github.com/jr200-labs/keymint/compare/v1.14.1...v2.0.0) (2026-11-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* Keymint now builds with Cargo. The Go source, module, and build tooling have been removed.
+
+### Features
+
+* migrate Keymint to Rust ([#159](https://github.com/jr200-labs/keymint/issues/159)) ([9a38a97](https://github.com/jr200-labs/keymint/commit/9a38a9705a346c45cf31b6cc34fb980597e779eb))
+
+
+### Bug Fixes
+
+* **deps:** update github-actions ([#156](https://github.com/jr200-labs/keymint/issues/156)) ([def0fc7](https://github.com/jr200-labs/keymint/commit/def0fc772b717df3b9a77e6a8a56ff341f8b5d8e))
+* **deps:** update github-actions ([#158](https://github.com/jr200-labs/keymint/issues/158)) ([41cc2c1](https://github.com/jr200-labs/keymint/commit/41cc2c143887a30ec03bd21f1fa7e621c8292b9f))
+* **release:** synchronize the generated release config ([#160](https://github.com/jr200-labs/keymint/issues/160)) ([911e084](https://github.com/jr200-labs/keymint/commit/911e08427a14e79e7122471c7bb0624229386fe1))
+
 ## [1.14.1](https://github.com/jr200-labs/keymint/compare/v1.14.0...v1.14.1) (2026-11-27)
 
 
