@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/jr200-labs/keymint/compare/v2.0.0...v2.0.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* accept null scopes in emergency session requests ([#162](https://github.com/jr200-labs/keymint/issues/162)) ([ab24c58](https://github.com/jr200-labs/keymint/commit/ab24c5862e0d3cb5865239d6489fae607fdf8e61))
+
 ## [2.0.0](https://github.com/jr200-labs/keymint/compare/v1.14.1...v2.0.0) (2026-11-28)
 
 
