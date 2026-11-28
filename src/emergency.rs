@@ -422,12 +422,19 @@ struct Ceremony {
 pub struct CreateSession {
     pub profile: String,
     pub ttl_seconds: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_scopes")]
     pub scopes: Vec<String>,
     #[serde(default)]
     pub approval_digest: String,
     #[serde(default)]
     pub approval_label: String,
+}
+
+// Go clients encode an omitted scope request as a null JSON slice.
+fn deserialize_scopes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 fn label_control(ch: char) -> bool {
