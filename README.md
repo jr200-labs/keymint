@@ -34,7 +34,7 @@ ciphertext for CLI and in-cluster callers.
   releases the session wrapping key only to the dedicated relay identity.
   See the [operator interface](docs/adr/0005-control-telegram-owner-enrollment.md).
 
-The two modes share the same Go binary, the same config schema, and
+The two modes share the same Rust binary, the same config schema, and
 the same JWT/HTTP signing logic — so you can adopt CLI-only for solo
 dev and bolt on the service later (or vice versa) without rewriting
 anything.
@@ -70,9 +70,8 @@ This repo follows the jr200-labs convention:
 
 ## Development setup
 
-Install pre-commit hooks once after cloning. Hooks run `gofmt`, `go vet`,
-`golangci-lint` (with the same shared config CI uses) on staged Go files
-and `commitlint` on commit messages:
+Install pre-commit hooks after cloning to run Rust formatting and lint checks
+and validate commit messages.
 
 ```sh
 make hooks-install
@@ -94,13 +93,14 @@ or `uv tool install pre-commit`.
 make build
 ```
 
-Produces `build/keymint-$(GOOS)-$(GOARCH)` — static, CGO-disabled.
+Produces `build/keymint-<os>-<arch>` for the host. Cargo uses the toolchain
+pinned in `rust-toolchain.toml` and the dependencies in `Cargo.lock`.
 
 ## Test
 
 ```sh
-make test       # unit tests
-make test-race  # with race detector + coverage
+make test
+make lint
 ```
 
 ## Service-mode security requirements
@@ -173,8 +173,7 @@ the deploy accordingly:
   values from right to left and uses the first valid IP outside the trusted
   ranges. A malformed hop encountered during the walk falls back to the peer IP.
   When the chain is absent or all its hops are trusted, Keymint uses a valid
-  untrusted IP from the last `X-Real-IP` header, then the peer IP. Both limiters keep buckets
-  in maps without a fixed capacity and sweep fully refilled buckets every
+  untrusted IP from the last `X-Real-IP` header, then the peer IP. Both limiters keep up to 8,192 buckets and sweep fully refilled buckets every
   30 seconds.
 
 - **Single-flight token caching.** When a cached installation token
@@ -187,11 +186,8 @@ the deploy accordingly:
   Enterprise base URL configured per key. A sick GHE clock cannot
   poison signing for unrelated endpoints.
 
-- **Hot key rotation.** Operators rotating the kubernetes Secret
-  carrying an App PEM are picked up automatically — keymint
-  caches the parsed RSA key by PEM path and checks file identity,
-  modification time, size, and watcher generation before reusing it.
-  Reloading unrelated configuration preserves cached installation tokens.
+- **Hot key rotation.** Keymint reads the mounted PEM for each mint request
+  and uses a content hash to isolate tokens issued for different key versions.
 
 - **TokenReview circuit breaker.** Calls to the kubernetes API are
   guarded by a circuit breaker that opens for 30s when failure
@@ -218,14 +214,10 @@ the deploy accordingly:
 
 - **Split liveness / readiness probes.** `/livez` returns 200 immediately with no I/O — the right thing for a liveness probe (a transient FS hiccup won't kill the pod). `/readyz` performs the deeper config + projected-volume `os.Stat` checks — the right thing for a readiness probe. `/healthz` is kept as a back-compat alias for `/readyz`.
 
-- **Debounced config reloads.** The fsnotify-driven reload coalesces a 500ms quiet-period of events before invoking `srv.Reload`, so the kubelet's flurry of symlink-swap / permission events on a ConfigMap or Secret update collapses to a single reload against the fully-settled new state.
-
-- **Hot config reload.** keymint watches `--config` via fsnotify.
-  When the file changes (operator updates Keys / Allowlist) the new
-  config is validated and the in-process snapshot is swapped
-  atomically. Pod restarts are not required for routine admin
-  changes. (Note: `expected_audiences` is read at startup only —
-  changes there require a restart, as do passkey and emergency journal settings; reload rejects such changes.)
+- **Hot config reload.** Keymint checks the file passed to `--config` for
+  changes, validates the candidate, and updates the active policy. Existing
+  emergency sessions lose authority if their profile or workload binding
+  changes. Audience, passkey, and emergency database changes require a restart.
 
 - **GitHub API circuit breaker.** Calls to
   `/app/installations/<id>/access_tokens` are wrapped in a circuit
@@ -235,13 +227,10 @@ the deploy accordingly:
 
 - **Per-endpoint isolation.** The GitHub circuit breaker, egress concurrency semaphore, and rate-limit metrics are partitioned by API base URL. A degraded GHE host cannot trip a breaker shared with public github.com, exhaust the egress slots for an unrelated endpoint, or be charged against another host's rate-limit gauge. `429 Too Many Requests` is treated as an infra failure (not a 4xx caller error) so the breaker actually opens against secondary rate-limits and avoids escalating bans.
 
-- **Lock-free per-key rate limiter.** Both pre-auth (per-IP) and post-auth (per-subject) limiters use `sync.Map.LoadOrStore`; there is no global mutex on the miss path. A flood of unique spoofed source IPs cannot serialise the HTTP ingest pipeline behind one lock.
-
 - **Case-insensitive Bearer scheme.** Per RFC 7235 §2.1, `Authorization: bearer ...` and `BEARER ...` are accepted alongside `Bearer ...`, so callers behind proxies that normalise the scheme are not spuriously rejected.
 
-- **Bounded token / key caches.** Both the parsed-key and minted-token caches are `expirable.LRU` instances (256 / 1024 entries; 24h / 70min TTL respectively). PEM rotations and config reloads no longer accumulate stale generation entries indefinitely.
-
-- **Cryptographic audit fingerprint.** Each minted installation token is hashed with SHA-256 and the hex digest is emitted as a `token_fingerprint` field on the structured log line and as a `keymint.token_fingerprint` OpenTelemetry span attribute. If a token ever leaks (in CI logs, a screenshot, etc.), security teams can hash it locally and grep audit logs to pinpoint the exact pod, ServiceAccount, and minute that issued it — without ever persisting the raw token.
+- **Bounded token cache.** Keymint caches up to 1,024 installation tokens.
+  It keys cached tokens by normalized scope and the mounted PEM's content hash.
 
 - **RSA App private keys.** GitHub App JWTs require RS256. PKCS#1 and PKCS#8 RSA keys are accepted; other App key types are rejected. Sparkle release signing continues to use Ed25519.
 
@@ -266,55 +255,22 @@ the deploy accordingly:
   back the cached token instead of failing the request. Callers
   get a usable token; the next call retries the refresh.
 
-- **GitHub rate-limit observability.** Each `/access_tokens`
-  response's `X-RateLimit-Remaining` and `X-RateLimit-Reset`
-  headers update the Prometheus gauges
-  `keymint_github_ratelimit_remaining{api_base_url}` and
-  `keymint_github_ratelimit_reset_unix{api_base_url}`. A missing or invalid
-  remaining-quota header leaves both gauges unchanged. The reset gauge
-  updates when the reset timestamp is also valid. Breaker
-  state is exposed as `keymint_github_breaker_state` (0 closed,
-  1 half-open, 2 open).
-
 ## Observability
 
-Service mode emits structured (zap) logs, OpenTelemetry traces, and
-Prometheus metrics.
+Service mode emits JSON request logs by default. Use `--log-level` to adjust
+verbosity and `--log-human` for human-readable output. Installation-token
+logs identify issued credentials by SHA-256 fingerprint.
 
-- **Logs** — unsampled JSON by default, with trace/span IDs on request logs. Control via `--log-level` and
-  `--log-human` flags.
-- **Tracing** — opt in by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP
-  gRPC) or `OTEL_TRACES_EXPORTER=console` (stdout, dev). Disabled if
-  neither is set. `OTEL_DEPLOYMENT_ENVIRONMENT` adds a deployment
-  environment resource attribute. All HTTP routes extract incoming trace context;
-  authentication and GitHub/Kubernetes/OAuth calls create child spans and
-  propagate context. Dependency attributes omit URLs, headers and bodies.
-- **Metrics** — scrapeable on a separate listener (default `:9100`,
-  configurable via `--metrics-listen`). Exported series:
-  - `keymint_mint_requests_total{outcome,key}`
-  - `keymint_mint_duration_seconds{key}` (histogram)
-  - `keymint_mint_in_flight`
-  - `keymint_tokenreviews_total{result}`
-  - `keymint_github_api_latency_seconds{status,api_base_url}` (histogram)
-  - `keymint_jwt_clock_offset_seconds{api_base_url}`
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` for OTLP gRPC tracing or
+`OTEL_TRACES_EXPORTER=console` for local inspection. Incoming HTTP trace
+context is carried into outbound requests without forwarding baggage.
 
-Additional route metrics are `keymint_http_requests_total{route,method,status}`,
-`keymint_http_duration_seconds{route}` and `keymint_http_in_flight`. Routes use
-registered patterns, with a fixed unmatched label. Internal operations expose
-`keymint_operations_total{operation,outcome}` and
-`keymint_operation_duration_seconds{operation}` for authentication, cache/refresh,
-revocation, journal writes and reloads. Cleanup gauges are
-`keymint_credential_cleanup_records`, `keymint_credential_cleanup_due`, and
-`keymint_credential_cleanup_oldest_overdue_seconds`. Alert on sustained due work,
-increasing overdue age, journal errors and failed reloads. Per-endpoint breaker
-state is `keymint_github_endpoint_breaker_state{api_base_url}`.
-
-Dashboards using the exchange latency or clock offset metrics must account for
-the new `api_base_url` label. These signals cover the service's application paths;
-cluster scrape, exporter delivery and alert routing still require deployment checks.
-
-The metrics listener should be reachable only from your monitoring
-namespace; use a NetworkPolicy to lock it down.
+Scrape Prometheus metrics from the separate listener configured with
+`--metrics-listen` (default `:9100`). The HTTP metric series record bounded
+route labels, method, status, latency and in-flight requests. Additional metrics
+cover installation-token exchanges, TokenReview, temporary credential cleanup,
+and Telegram enrollment. Scope the
+metrics listener to your monitoring namespace with a NetworkPolicy.
 
 ## Using as a git credential helper
 
