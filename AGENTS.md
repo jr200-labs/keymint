@@ -1,48 +1,16 @@
-# keymint — agent notes
+# Keymint
 
-## What this is
+Keymint brokers short-lived GitHub and Kubernetes credentials and seals release
+signing keys for explicitly authorized GitHub Actions destinations. Read
+[CONTEXT.md](CONTEXT.md) when changing credential or session semantics.
 
-Single Go binary that brokers short-lived credentials and destination-bound
-release-signing ciphertext.
-Two modes:
-
-- **CLI** (`keymint mint <key>`, `keymint helper`) — laptop dev tool, reads
-  SOPS-encrypted PEM on demand
-- **Service** (`keymint serve`) — in-cluster HTTP broker, validates
-  Kubernetes ServiceAccount tokens via TokenReview, mints for callers
-  in the configured allowlist, and seals recoverable release keys after
-  human authentication
-
-## Project conventions
-
-- **Language**: Go 1.26+
-- **Module**: `github.com/jr200-labs/keymint`
-- **Layout**: Cobra wiring in cmd/keymint; installation-token cache/refresh/watchers
-  in internal/broker; shared request authentication in internal/server; emergency
-  state transitions, cleanup and passkeys in internal/emergency. Other modules
-  cover minting, configuration, release-key sealing, logging, metrics and tracing.
-- **CLI framework**: cobra root + per-subcommand `new<Name>Cmd()` constructors
-- **Logging**: zap; `internal/logging.Setup(level, humanReadable)` at startup
-- **Version**: `internal/version.Version` injected via ldflags from
-  `.release-please-manifest.json` at build time
-- **Build**: `make build` produces `build/keymint-$(GOOS)-$(GOARCH)`,
-  static, CGO-disabled
-- **Lint**: `make lint` downloads shared `.golangci.yml` from
-  `jr200-labs/github-action-templates` (sync-shared pattern)
-- Run `make test` for the Go tests and `make test-race` for race detection.
-
-## Release flow
-
-- release-please drives all releases
-- Conventional commits required (`commitlint` enforced in CI)
-- Squash-merge enforced at org level (jr200-labs)
-- Merging the release-please PR cuts a tag + GitHub Release
-- Release dispatches docker build → publishes
-  `ghcr.io/jr200-labs/keymint:vX.Y.Z`
-
-## What this repo does NOT contain
-
-- Helm chart — consumers deploy via stakater/application or their own chart
-- Project-specific config — keymint is generic, no caller-specific data
-- Webhook receiver — HTTP endpoints serve minting, emergency sessions and
-  release-key sealing
+- Verify Rust changes with `make lint` and `make test`. Use `make build` to
+  produce the native release binary.
+- For changes to emergency authentication, cleanup, or storage formats, read
+  the relevant [ADR](docs/adr) and exercise both successful authorization and
+  denied access after expiry, revocation, or restart.
+- Configure shared workflows in `.github/.shared-config.yaml` and regenerate
+  them with `scripts/sync-shared`. Use the strict drift check to verify the
+  generated files.
+- Use Conventional Commits. Release Please advances the version and the
+  shared Docker workflow publishes the image to `ghcr.io/jr200-labs/keymint`.

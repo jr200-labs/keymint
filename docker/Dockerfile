@@ -1,24 +1,15 @@
-# renovate: datasource=docker depName=golang versioning=docker
-ARG GOVERSION=1.27
-FROM golang:${GOVERSION}-alpine AS builder
+# renovate: datasource=docker depName=rust
+ARG RUST_VERSION=1.100.0
+FROM rust:${RUST_VERSION}-alpine AS builder
 
-ARG BUILD_ARCH
-ARG BUILD_OS
-
-RUN apk update && apk add --no-cache git bash curl jq make
-
+RUN apk add --no-cache build-base
 WORKDIR /usr/src/app
 
-# Pre-download dependencies for cached layer
-COPY go.sum go.mod ./
-RUN go mod download
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .release-please-manifest.json build.rs ./
+COPY src ./src
+RUN cargo build --release --locked
 
-COPY . .
-
-RUN make build && \
-    ln -s /usr/src/app/build/keymint-${BUILD_OS}-${BUILD_ARCH} /usr/local/bin/keymint
-
-# Minimal runtime image
 FROM alpine:3
 
 LABEL org.opencontainers.image.source="https://github.com/jr200-labs/keymint"
@@ -28,10 +19,8 @@ LABEL org.opencontainers.image.licenses="MIT"
 RUN apk add --no-cache ca-certificates && \
     addgroup -S keymint && adduser -S keymint -G keymint
 
-COPY --from=builder /usr/local/bin/keymint /usr/local/bin/keymint
+COPY --from=builder /usr/src/app/target/release/keymint /usr/local/bin/keymint
 
 USER keymint
-
-# Default to service mode; override with `keymint <subcommand>`
 ENTRYPOINT ["/usr/local/bin/keymint"]
 CMD ["serve"]
