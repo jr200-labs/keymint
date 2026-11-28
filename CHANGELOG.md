@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.14.2](https://github.com/jr200-labs/keymint/compare/v1.14.1...v1.14.2) (2026-11-28)
+
+
+### Bug Fixes
+
+* **deps:** update github-actions ([#156](https://github.com/jr200-labs/keymint/issues/156)) ([def0fc7](https://github.com/jr200-labs/keymint/commit/def0fc772b717df3b9a77e6a8a56ff341f8b5d8e))
+* **deps:** update github-actions ([#158](https://github.com/jr200-labs/keymint/issues/158)) ([41cc2c1](https://github.com/jr200-labs/keymint/commit/41cc2c143887a30ec03bd21f1fa7e621c8292b9f))
+
 ## [1.14.1](https://github.com/jr200-labs/keymint/compare/v1.14.0...v1.14.1) (2026-11-27)
 
 
