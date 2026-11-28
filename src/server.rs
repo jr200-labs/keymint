@@ -1623,7 +1623,7 @@ mod tests {
         let session: Value = client
             .post(format!("{root}/sessions"))
             .bearer_auth("owner")
-            .json(&json!({"profile":"fixture","ttl_seconds":120}))
+            .json(&json!({"profile":"fixture","ttl_seconds":120,"scopes":null}))
             .send()
             .await?
             .error_for_status()?
